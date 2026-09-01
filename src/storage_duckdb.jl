@@ -281,12 +281,16 @@ function save_simulation_run!(
         ""
     end
 
-    # Delete existing records for run_id if re-saving
-    DBInterface.execute(db, "DELETE FROM simulation_runs WHERE run_id = '$(run_id)';")
-    DBInterface.execute(db, "DELETE FROM particle_trajectories WHERE run_id = '$(run_id)';")
-    DBInterface.execute(db, "DELETE FROM recruitment_metrics WHERE run_id = '$(run_id)';")
-    DBInterface.execute(db, "DELETE FROM connectivity_transitions WHERE run_id = '$(run_id)';")
-    DBInterface.execute(db, "DELETE FROM gridded_dispersal_summary WHERE run_id = '$(run_id)';")
+    # Delete existing records for run_id if re-saving (parameterized to avoid injection)
+    for table in ("simulation_runs", "particle_trajectories",
+                  "recruitment_metrics", "connectivity_transitions",
+                  "gridded_dispersal_summary")
+        DBInterface.execute(
+            db,
+            "DELETE FROM $(table) WHERE run_id = ?;",
+            [String(run_id)]
+        )
+    end
 
     # 1. Insert simulation run metadata
     stmt_meta = DBInterface.prepare(db, """
@@ -324,28 +328,54 @@ function save_simulation_run!(
     df_alive = Vector{Bool}(undef, total_rows)
     df_settle = Vector{String}(undef, total_rows)
 
-    has_temp = hasproperty(trajectories, :temperatures) && !isnothing(trajectories.temperatures)
-    has_dd_ts = hasproperty(trajectories, :degree_days_timeseries) && !isnothing(trajectories.degree_days_timeseries)
-    has_surv = hasproperty(trajectories, :survival_probability) && !isnothing(trajectories.survival_probability)
+    # Normalize trajectory fields to canonical types before accessing them.
+    # Symbols and Strings may be mixed depending on how cohort was built.
+    _sym(x) = Symbol(lowercase(string(x)))
+
+    has_temp  = hasproperty(trajectories, :temperatures) &&
+                !isnothing(trajectories.temperatures)
+    has_dd_ts = hasproperty(trajectories, :degree_days_timeseries) &&
+                !isnothing(trajectories.degree_days_timeseries)
+    has_surv  = hasproperty(trajectories, :survival_probability) &&
+                !isnothing(trajectories.survival_probability)
+
+    # Resolve degree_days to 2D (n_p, n_t) matrix for uniform indexing.
+    dd_matrix = if has_dd_ts && ndims(trajectories.degree_days_timeseries) == 2
+        Float64.(trajectories.degree_days_timeseries)
+    elseif hasproperty(trajectories, :degree_days)
+        dd_raw = trajectories.degree_days
+        if ndims(dd_raw) == 2 && size(dd_raw) == (n_p, n_t)
+            Float64.(dd_raw)
+        elseif length(dd_raw) == n_p
+            # Broadcast scalar-per-particle to full time series
+            repeat(reshape(Float64.(dd_raw), n_p, 1), 1, n_t)
+        else
+            fill(NaN, n_p, n_t)
+        end
+    else
+        fill(NaN, n_p, n_t)
+    end
 
     idx = 1
     for p in 1:n_p
-        p_id = hasproperty(trajectories, :ids) ? trajectories.ids[p] : p
-        p_alive = hasproperty(trajectories, :alive) ? trajectories.alive[p] : true
-        p_settle = hasproperty(trajectories, :settlement_status) ? string(trajectories.settlement_status[p]) : "pelagic"
+        p_id     = hasproperty(trajectories, :ids) ? trajectories.ids[p] : p
+        p_alive  = hasproperty(trajectories, :alive) ? trajectories.alive[p] : true
+        p_settle = hasproperty(trajectories, :settlement_status) ?
+                   lowercase(string(trajectories.settlement_status[p])) : "pelagic"
 
         for s in 1:n_t
             df_p_id[idx] = p_id
             df_step[idx] = s
             df_time[idx] = Float64(trajectories.times[s])
-            df_lon[idx] = Float64(trajectories.lons[p, s])
-            df_lat[idx] = Float64(trajectories.lats[p, s])
-            df_depth[idx] = Float64(trajectories.depths[p, s])
-            df_temp[idx] = has_temp ? Float64(trajectories.temperatures[p, s]) : 4.0
-            df_dd[idx] = has_dd_ts ? Float64(trajectories.degree_days_timeseries[p, s]) : Float64(trajectories.degree_days[p])
-            df_surv[idx] = has_surv ? Float64(trajectories.survival_probability[p, s]) : (p_alive ? 1.0 : 0.0)
-            df_stage[idx] = string(trajectories.stages[p, s])
-            df_alive[idx] = p_alive
+            df_lon[idx]  = Float64(trajectories.lons[p, s])
+            df_lat[idx]  = Float64(trajectories.lats[p, s])
+            df_depth[idx]  = Float64(trajectories.depths[p, s])
+            df_temp[idx]   = has_temp ? Float64(trajectories.temperatures[p, s]) : 4.0
+            df_dd[idx]     = Float64(dd_matrix[p, s])
+            df_surv[idx]   = has_surv ? Float64(trajectories.survival_probability[p, s]) :
+                             (p_alive ? 1.0 : 0.0)
+            df_stage[idx]  = lowercase(string(trajectories.stages[p, s]))
+            df_alive[idx]  = p_alive
             df_settle[idx] = p_settle
             idx += 1
         end
@@ -383,16 +413,20 @@ function save_simulation_run!(
     ]
     mean_disp = mean(displacements)
 
-    tot_settled_succ = count(==(Symbol("settled_successful")), trajectories.settlement_status)
-    tot_settled_unsuit = count(==(Symbol("settled_unsuitable")), trajectories.settlement_status)
-    tot_dead = count(==(:dead), trajectories.stages[:, end])
+    tot_settled_succ  = count(x -> lowercase(string(x)) == "settled_successful",
+                              trajectories.settlement_status)
+    tot_settled_unsuit = count(x -> lowercase(string(x)) == "settled_unsuitable",
+                               trajectories.settlement_status)
+    tot_dead    = count(x -> lowercase(string(x)) == "dead",
+                        trajectories.stages[:, end])
     tot_pelagic = n_p - tot_settled_succ - tot_settled_unsuit - tot_dead
-    succ_rate = n_p > 0 ? (tot_settled_succ / n_p) : 0.0
+    succ_rate   = n_p > 0 ? (tot_settled_succ / n_p) : 0.0
 
-    mean_pld = hasproperty(trajectories, :settlement_age) ?
-               mean([age / 86400.0 for age in trajectories.settlement_age if age < duration]) :
-               (duration / 86400.0)
-    mean_pld = isnan(mean_pld) ? (duration / 86400.0) : mean_pld
+    # Safe mean PLD: mean([]) throws; guard with isempty check.
+    ages_valid = hasproperty(trajectories, :settlement_age) ?
+                 [age / 86400.0 for age in trajectories.settlement_age
+                  if age < duration] : Float64[]
+    mean_pld = isempty(ages_valid) ? (duration / 86400.0) : mean(ages_valid)
 
     mean_dd = mean(trajectories.degree_days)
     mean_t = has_temp ? mean(trajectories.temperatures) : 4.0
@@ -423,12 +457,20 @@ function save_simulation_run!(
         s_names = connectivity.strata_names
         n_strata = length(s_names)
         mat = connectivity.matrix
-        c_mat = hasproperty(connectivity, :counts_matrix) ? connectivity.counts_matrix : round.(Int, mat .* n_p)
+        c_mat = if hasproperty(connectivity, :counts_unweighted)
+            # Prefer raw integer counts for the particle_count DB column
+            connectivity.counts_unweighted
+        elseif hasproperty(connectivity, :counts_matrix)
+            # Fallback: round float-weighted counts to nearest integer
+            round.(Int, connectivity.counts_matrix)
+        else
+            round.(Int, mat .* n_p)
+        end
 
         for i in 1:n_strata, j in 1:n_strata
             src_name = s_names[i]
             dst_name = s_names[j]
-            p_count = Int(c_mat[i, j])
+            p_count  = Int(c_mat[i, j])
             t_prob = Float64(mat[i, j])
             DBInterface.execute(stmt_conn, [run_id, src_name, dst_name, p_count, t_prob])
         end

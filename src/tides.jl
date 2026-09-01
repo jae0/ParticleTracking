@@ -64,8 +64,17 @@ F_u(x, y, z, t) = \\sum_k U_k \\omega_k \\cos(\\omega_k t + \\phi_k)
 ```math
 F_v(x, y, z, t) = \\sum_k V_k \\omega_k \\sin(\\omega_k t + \\phi_k)
 ```
-where \$\\omega_k\$ is the astronomical tidal frequency and \$(U_k, V_k)\$ are velocity
-amplitudes.
+where \$\\omega_k\$ is the astronomical tidal frequency (rad s⁻¹) and \$(U_k, V_k)\$ are
+velocity amplitudes (m s⁻¹).
+
+The factor \$\\omega_k\$ is intentional: \$F_u = U_k \\omega_k \\cos(\\omega_k t)\$ is the
+time derivative \$\\partial_t[U_k \\sin(\\omega_k t)]\$, making it dimensionally an
+acceleration (m s⁻²), the correct unit for an Oceananigans body force. The
+amplitude \$U_k\$ therefore represents the target tidal velocity amplitude in m s⁻¹;
+calibrate it against TPXO/FES tidal prediction or observed current meter ellipses.
+For M₂ (\$\\omega = 1.405 \\times 10^{-4}\$ rad s⁻¹) and \$U = 0.25\$ m s⁻¹, the
+resulting body force amplitude is \$\\approx 3.5 \\times 10^{-5}\$ m s⁻², consistent
+with observed tidal acceleration magnitudes on the Scotian Shelf.
 
 # Inputs
 - `constituents::Vector{Symbol}`: List of constituents to include (e.g. `[:M2, :S2]`).

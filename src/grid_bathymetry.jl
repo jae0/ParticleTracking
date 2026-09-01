@@ -45,9 +45,9 @@ z \\in [z_{\\text{bottom}}, z_{\\text{surface}}]
 """
 function build_shelf_grid(;
     architecture = :cpu,
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0),
-    lat_range::Tuple{Real, Real} = (42.0, 47.0),
-    z_range::Tuple{Real, Real} = (-1000.0, 0.0),
+    lon_range::Tuple{Real, Real} = (-71.0, -53.0),
+    lat_range::Tuple{Real, Real} = (40.0, 48.5),
+    z_range::Tuple{Real, Real} = (-3500.0, 0.0),
     grid_size::Tuple{Int, Int, Int} = (50, 50, 10),
     topology::Tuple = (Bounded, Bounded, Bounded),
     fallback_to_cpu::Bool = false
@@ -89,6 +89,11 @@ Extract a 2D bathymetry matrix and coordinate vectors from a NetCDF dataset.
 
 # Outputs
 - `NamedTuple`: `(elevation = Matrix{Float64}, lon = Vector{Float64}, lat = Vector{Float64})`
+
+The returned `elevation` matrix always has shape `(n_lon, n_lat)` (i.e.,
+indexed as `elev[i_lon, j_lat]`), regardless of the on-disk dimension order.
+CF-compliant and ERDDAP files typically store arrays as `(lat, lon)`, detected
+via `dimnames` and corrected with `permutedims`.
 """
 function load_bathymetry_from_netcdf(
     filepath::AbstractString,
@@ -103,16 +108,18 @@ function load_bathymetry_from_netcdf(
         actual_var = if haskey(ds, varname)
             varname
         else
-            candidates = ["elevation", "altitude", "topo", "z", "bedrock_altitude", "Band1"]
+            candidates = ["elevation", "altitude", "topo", "z",
+                          "bedrock_altitude", "Band1"]
             found = findfirst(c -> haskey(ds, c), candidates)
             if isnothing(found)
                 available = collect(keys(ds))
-                error("Elevation variable '$(varname)' not found in $(filepath). Available: $(available)")
+                error("Elevation variable '$(varname)' not found in " *
+                      "$(filepath). Available: $(available)")
             end
             candidates[found]
         end
 
-        elevation_data = Array{Float64}(ds[actual_var][:, :])
+        raw_elev = Array{Float64}(ds[actual_var][:, :])
 
         # Detect longitude coordinate variable
         lon_candidates = ["lon", "longitude", "x", "nav_lon"]
@@ -130,6 +137,25 @@ function load_bathymetry_from_netcdf(
             collect(Float64, ds[lat_candidates[lat_var]][:])
         else
             Float64[]
+        end
+
+        # Guarantee elevation layout is (n_lon, n_lat): CF-compliant and ERDDAP
+        # files store arrays as (lat, lon) — first dimension is latitude.
+        # Detect this via dimnames and apply permutedims when necessary.
+        dim_names = NCDatasets.dimnames(ds[actual_var])
+        lat_like  = ["lat", "latitude", "y", "nav_lat"]
+        needs_transpose = (length(dim_names) >= 1 &&
+                           lowercase(string(dim_names[1])) in lat_like)
+        elevation_data = needs_transpose ? permutedims(raw_elev, (2, 1)) : raw_elev
+
+        if !isempty(lon_coords) && !isempty(lat_coords)
+            expected = (length(lon_coords), length(lat_coords))
+            if size(elevation_data) != expected
+                @warn "load_bathymetry_from_netcdf: elevation matrix " *
+                      "size $(size(elevation_data)) does not match coordinate " *
+                      "lengths $(expected) after transposition. " *
+                      "Verify file dimension ordering." _file = filepath
+            end
         end
 
         return (
@@ -420,8 +446,12 @@ end
     REGIONAL_COASTLINE
 
 Canonical multi-polygon boundary definitions for major landmasses across the
-Scotian Shelf and Canadian Atlantic region (Nova Scotia mainland, Cape Breton,
-Prince Edward Island, New Brunswick / Maine, Southern Newfoundland, Sable Island).
+Scotian Shelf, Gulf of St. Lawrence, and northwestern Atlantic region.
+Covers the expanded simulation domain [-71, -53]°E / [40, 48.5]°N.
+
+Polygons are closed (first == last vertex) and listed clockwise as viewed
+from above (standard GIS convention for exterior rings). Used by
+`is_point_on_land` and `is_marine_water` for ocean masking.
 """
 const REGIONAL_COASTLINE = [
     # 1. Nova Scotia Mainland (clockwise closed perimeter)
@@ -469,35 +499,75 @@ const REGIONAL_COASTLINE = [
             46.25,  46.38,  46.62
         ]
     ),
-    # 4. New Brunswick & Continental Mainland (clockwise from Chignecto)
+    # 4. New Brunswick, Quebec & Maine Continental Mainland
+    # Extended west to -71°E and north to 48.5°N to cover the expanded domain.
     (
-        name = "New Brunswick & Continental Mainland",
+        name = "NB-Quebec-Maine Continental Mainland",
         code = :new_brunswick_mainland,
         lons = [
             -64.21, -64.35, -64.79, -65.53, -66.00, -66.47, -67.05, -67.00,
-            -67.45, -68.50, -68.50, -65.50, -65.00, -64.85, -64.50, -64.10,
+            -67.45, -67.80, -68.50, -69.10, -69.80, -70.20, -70.60, -71.00,
+            -71.00, -70.50, -70.00, -69.50, -69.00, -68.50, -68.00, -67.60,
+            -67.00, -66.50, -66.00, -65.50, -65.00, -64.85, -64.50, -64.10,
             -64.21
         ],
         lats = [
             45.83,  45.75,  45.60,  45.35,  45.20,  45.06,  45.08,  44.88,
-            44.65,  44.30,  47.90,  47.90,  47.10,  46.68,  46.25,  46.00,
+            44.65,  44.45,  44.30,  44.10,  43.80,  43.58,  43.50,  43.00,
+            48.50,  48.50,  48.50,  48.50,  48.50,  48.50,  48.50,  48.50,
+            48.50,  48.50,  48.50,  47.90,  47.10,  46.68,  46.25,  46.00,
             45.83
         ]
     ),
-    # 5. Southern Newfoundland (clockwise from Cape Ray)
+    # 5. Southern & Western Newfoundland
+    # Expanded to cover both Avalon Peninsula and western Newfoundland coasts
+    # visible in the domain north of 46.5°N and east of -60°W.
     (
-        name = "Southern Newfoundland",
+        name = "Southern-Western Newfoundland",
         code = :newfoundland_south,
         lons = [
-            -59.30, -59.30, -52.70, -52.70, -53.05, -53.40, -54.20, -55.20,
-            -56.00, -57.60, -58.70, -59.13, -59.30
+            -59.13, -58.70, -57.60, -56.00, -55.20, -54.20, -53.40, -53.05,
+            -52.70, -53.00, -53.50, -54.10, -54.80, -55.60, -56.40, -57.30,
+            -58.00, -58.40, -58.80, -59.13
         ],
         lats = [
-            47.60,  48.00,  48.00,  47.55,  46.65,  46.70,  46.80,  47.10,
-            47.55,  47.61,  47.61,  47.57,  47.60
+            47.57,  47.61,  47.61,  47.55,  47.10,  46.80,  46.70,  46.65,
+            47.55,  48.00,  48.30,  48.50,  48.50,  48.50,  48.50,  48.50,
+            48.50,  48.30,  48.00,  47.57
         ]
     ),
-    # 6. Sable Island (closed perimeter)
+    # 6. Newfoundland Avalon Peninsula (eastern Newfoundland protruding into domain)
+    (
+        name = "Newfoundland Avalon Peninsula",
+        code = :newfoundland_avalon,
+        lons = [
+            -52.70, -52.70, -53.30, -53.60, -53.20, -52.90, -52.80, -52.70
+        ],
+        lats = [
+            47.55,  48.00,  48.00,  47.50,  46.65,  46.80,  47.10,  47.55
+        ]
+    ),
+    # 7. Anticosti Island (Gulf of St. Lawrence)
+    (
+        name = "Anticosti Island",
+        code = :anticosti,
+        lons = [
+            -63.60, -64.20, -64.30, -63.60, -62.80, -62.00, -61.60, -61.80,
+            -62.30, -62.80, -63.60
+        ],
+        lats = [
+            49.90,  49.85,  49.45,  49.10,  49.20,  49.35,  49.60,  49.90,
+            49.95,  50.00,  49.90
+        ]
+    ),
+    # 8. Magdalen Islands (Îles-de-la-Madeleine) — clustered archipelago
+    (
+        name = "Magdalen Islands",
+        code = :magdalen_islands,
+        lons = [-62.00, -61.60, -61.50, -61.80, -62.10, -62.40, -62.00],
+        lats = [ 47.30,  47.20,  47.50,  47.65,  47.55,  47.35,  47.30]
+    ),
+    # 9. Sable Island (closed perimeter)
     (
         name = "Sable Island",
         code = :sable_island,
@@ -1063,9 +1133,17 @@ function build_immersed_grid_from_real_data(
             error("Cannot auto-detect latitude variable. Keys in file: $(keys(ds))")
         end
 
-        elev = Array{Float64}(ds[vname][:, :])
+        raw_elev = Array{Float64}(ds[vname][:, :])
         lons = collect(Float64, ds[xname][:])
         lats = collect(Float64, ds[yname][:])
+
+        # Guarantee (n_lon, n_lat) layout — same logic as load_bathymetry_from_netcdf.
+        dim_names   = NCDatasets.dimnames(ds[vname])
+        lat_like    = ["lat", "latitude", "y", "nav_lat"]
+        needs_tp    = (length(dim_names) >= 1 &&
+                       lowercase(string(dim_names[1])) in lat_like)
+        elev = needs_tp ? permutedims(raw_elev, (2, 1)) : raw_elev
+
         (elev, lons, lats)
     end
 

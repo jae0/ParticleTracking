@@ -212,7 +212,7 @@ end
 
 """
     compare_scenario_dispersal(
-        scenario_dict::AbstractDict{Symbol, <:NamedTuple};
+        scenario_dict::Union{AbstractDict, NamedTuple};
         title::AbstractString = "Larval Dispersal Across Climate Scenarios",
         output_path::Union{Nothing, AbstractString} = "outputs/scenario_comparison.png"
     )
@@ -220,10 +220,18 @@ end
 Compare spatial trajectories and final dispersion centroids across multiple
 climate forcing scenarios (e.g. `:historical`, `:ssp245`, `:ssp585`).
 
+# Mathematical Formulations
+- **Centroid Center of Mass**:
+  ```math
+  \\bar{\\lambda} = \\frac{1}{N_p} \\sum_{p=1}^{N_p} \\lambda_p(t_{\\text{end}}), \\quad
+  \\bar{\\phi} = \\frac{1}{N_p} \\sum_{p=1}^{N_p} \\phi_p(t_{\\text{end}})
+  ```
+
 # Inputs
-- `scenario_dict::AbstractDict{Symbol, <:NamedTuple}`: Mapping scenario names to trajectory NamedTuples.
+- `scenario_dict::Union{AbstractDict, NamedTuple}`: Mapping of scenario names or keys
+  to trajectory NamedTuples (or data containers holding a `.trajectories` field).
 - `title::AbstractString`: Comparison figure title.
-- `output_path::Union{Nothing, AbstractString}`: Filepath to save output.
+- `output_path::Union{Nothing, AbstractString}`: Destination filepath to save output.
 
 # Outputs
 - `Figure`: CairoMakie figure object.
@@ -232,7 +240,7 @@ climate forcing scenarios (e.g. `:historical`, `:ssp245`, `:ssp585`).
 - Brickman, D., et al. (2018). *Progress in Oceanography*, 164, 49-64.
 """
 function compare_scenario_dispersal(
-    scenario_dict::AbstractDict{Symbol, <:NamedTuple};
+    scenario_dict::Union{AbstractDict, NamedTuple};
     title::AbstractString = "Larval Dispersal Across Climate Scenarios",
     output_path::Union{Nothing, AbstractString} = "outputs/scenario_comparison.png"
 )
@@ -241,7 +249,7 @@ function compare_scenario_dispersal(
     n_rows = ceil(Int, n_scenarios / 3)
     fig = Figure(size = (450 * n_cols, 420 * n_rows), fontsize = 12)
 
-    scenario_keys = collect(keys(scenario_dict))
+    scenario_keys = scenario_dict isa NamedTuple ? keys(scenario_dict) : collect(keys(scenario_dict))
     colors = Dict(
         :historical => :royalblue,
         :baseline => :royalblue,
@@ -256,8 +264,10 @@ function compare_scenario_dispersal(
         row = div(s_idx - 1, 3) + 1
         col = mod(s_idx - 1, 3) + 1
 
-        traj = scenario_dict[s_key]
-        c = get(colors, s_key, :dodgerblue)
+        raw_val = scenario_dict isa NamedTuple ? getproperty(scenario_dict, s_key) : scenario_dict[s_key]
+        traj = hasproperty(raw_val, :trajectories) ? raw_val.trajectories : raw_val
+        s_sym = Symbol(s_key)
+        c = get(colors, s_sym, :dodgerblue)
 
         ax = Axis(
             fig[row, col],
@@ -675,8 +685,8 @@ and bathymetry) for visualization and Leaflet layer serialization.
 """
 function extract_hydrodynamic_dataset(
     hydro_input::Any;
-    domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
-    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0),
+    domain_lon::Tuple{<:Real, <:Real} = (-71.0, -53.0),
+    domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
     grid_size::Tuple{Int, Int} = (35, 30)
 )
     nx, ny = grid_size
@@ -843,6 +853,23 @@ function extract_hydrodynamic_dataset(
     end
 
     spd_mat = hypot.(u_mat, v_mat)
+
+    # Mask all ocean fields to NaN over land so quivers and heatmaps do not
+    # render over coastal landmasses. is_point_on_land uses polygon ray-casting.
+    for i in 1:nx, j in 1:ny
+        if is_point_on_land(lons_vec[i], lats_vec[j])
+            for k in 1:nz
+                u_mat[i, j, k]   = NaN
+                v_mat[i, j, k]   = NaN
+                w_mat[i, j, k]   = NaN
+                spd_mat[i, j, k] = NaN
+                t_mat[i, j, k]   = NaN
+                s_mat[i, j, k]   = NaN
+            end
+            elev_mat[i, j]  = NaN
+            bathy_mat[i, j] = NaN
+        end
+    end
 
     return (
         lons = lons_vec,

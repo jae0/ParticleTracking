@@ -36,8 +36,11 @@ julia --project=. ParticleTrackingRun.jl --viz
 ```
 """
 
-# Load unified project environment and dependencies (includes HydrodynamicOptions and configuration)
-include(joinpath(@__DIR__, "src", "init.jl"))
+# Load the ParticleTracking module
+import Pkg
+Pkg.activate(@__DIR__, io = devnull)
+using ParticleTracking
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment 1: Data Ingestion & Benchmark Generation
@@ -488,16 +491,44 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         rng = rng
     )
 
-    # Background Eulerian flow velocity function (with offshore and along-shelf component)
+    # Scotian Shelf alongshore current: flows southwestward along the shelf edge.
+    # u ≈ -0.08 to -0.12 m/s (westward), v ≈ -0.03 to -0.06 m/s (southward/offshore).
+    # Tidal oscillation superimposed with ~6 h period at quarter-amplitude.
+    # Reference: Loder, J. W. & Petrie, B. (1991), CJFAS.
     flow_field_fn(lon, lat, z, t) = begin
-        u_mean = 0.06 + 0.02 * sin(2.0 * π * t / 86400.0) # Along-shelf jet
-        v_mean = -0.02 + 0.01 * cos(2.0 * π * t / 86400.0) # Offshore export
-        w_mean = 0.0001 * sin(lat)
+        tidal_phase = 2.0 * π * t / 44712.0  # M2 period ≈ 12.42 h
+        depth_decay  = exp(z / 120.0)          # velocity decays with depth
+        # Depth-dependent cross-shelf position modulates jet speed
+        lon_norm = clamp((lon - opts.domain_lon[1]) /
+                         (opts.domain_lon[2] - opts.domain_lon[1]), 0.0, 1.0)
+        jet_factor = 0.5 + 0.8 * exp(-((lon_norm - 0.3)^2) / 0.04)
+        u_mean = (-0.10 * jet_factor + 0.02 * sin(tidal_phase)) * depth_decay
+        v_mean = (-0.04 * jet_factor + 0.01 * cos(tidal_phase)) * depth_decay
+        w_mean = 0.00020 * sin(2.0 * π * lon_norm) * depth_decay
         (u_mean, v_mean, w_mean)
     end
 
-    # In-situ vertical temperature profile
-    temp_field_fn(lon, lat, z, t) = max(0.5, 6.0 + 0.02 * z)
+    # 3D Scotian Shelf thermal structure: surface mixed layer + CIL + slope water.
+    # Consistent with set_initial_stratification! in hydrodynamic_model.jl.
+    temp_field_fn(lon, lat, z, t) = begin
+        lon_min, lon_max = opts.domain_lon
+        lat_min, lat_max = opts.domain_lat
+        x_norm = clamp((lon - lon_min) / (lon_max - lon_min), 0.0, 1.0)
+        y_norm = clamp((lat - lat_min) / (lat_max - lat_min), 0.0, 1.0)
+        T_surf   = 14.0 + 8.0 * x_norm - 5.0 * y_norm   # surface mixed layer
+        T_cil_min = 1.5
+        T_slope   = 8.5
+        if z > -20.0
+            frac = (z + 20.0) / 20.0
+            clamp(T_cil_min + frac * (T_surf - T_cil_min), -1.5, 22.0)
+        elseif z > -80.0
+            centre_frac = (z + 50.0) / 30.0
+            clamp(T_cil_min + 2.5 * centre_frac^2, -1.5, T_surf)
+        else
+            depth_factor = (abs(z) - 80.0) / 100.0
+            clamp(T_cil_min + depth_factor * (T_slope - T_cil_min), T_cil_min, T_slope)
+        end
+    end
 
     # Seabed bathymetric elevation
     bathy_field_fn = if isfile(target_bathy_path)

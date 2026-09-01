@@ -104,26 +104,25 @@ function estimate_empirical_movement(
                 continue
             end
 
-            # Find spatial bin index for initial position
-            i_lon = searchsortedlast(lon_bins, x0)
-            j_lat = searchsortedlast(lat_bins, y0)
+            # Binning index logic: Clamp x0, y0 to bins.
+            # Using max(1, min(n, index)) ensures indices stay within [1, n_bins]
+            i_lon = clamp(searchsortedlast(lon_bins, x0), 1, n_lon)
+            j_lat = clamp(searchsortedlast(lat_bins, y0), 1, n_lat)
+            
+            # Metric spherical displacements
+            mean_lat_rad = deg2rad(0.5 * (y0 + y1))
+            dx_m = r_earth * cos(mean_lat_rad) * deg2rad(x1 - x0)
+            dy_m = r_earth * deg2rad(y1 - y0)
 
-            if 1 <= i_lon <= n_lon && 1 <= j_lat <= n_lat
-                # Metric spherical displacements
-                mean_lat_rad = deg2rad(0.5 * (y0 + y1))
-                dx_m = r_earth * cos(mean_lat_rad) * deg2rad(x1 - x0)
-                dy_m = r_earth * deg2rad(y1 - y0)
+            u_inst = dx_m / dt
+            v_inst = dy_m / dt
 
-                u_inst = dx_m / dt
-                v_inst = dy_m / dt
-
-                u_accum[i_lon, j_lat] += u_inst
-                v_accum[i_lon, j_lat] += v_inst
-                u_sq_accum[i_lon, j_lat] += u_inst^2
-                v_sq_accum[i_lon, j_lat] += v_inst^2
-                dt_accum[i_lon, j_lat] += dt
-                counts[i_lon, j_lat] += 1
-            end
+            u_accum[i_lon, j_lat] += u_inst
+            v_accum[i_lon, j_lat] += v_inst
+            u_sq_accum[i_lon, j_lat] += u_inst^2
+            v_sq_accum[i_lon, j_lat] += v_inst^2
+            dt_accum[i_lon, j_lat] += dt
+            counts[i_lon, j_lat] += 1
         end
     end
 
@@ -146,6 +145,7 @@ function estimate_empirical_movement(
             mean_dt = dt_accum[i, j] / n_c
 
             # Taylor dispersion formulation D = 0.25 * (var_u + var_v) * mean_dt
+            # Note: Ensure mean_dt satisfies CFL condition at grid resolution scale
             diffusivity[i, j] = 0.25 * (var_u + var_v) * mean_dt
         else
             u_mean[i, j] = NaN
@@ -226,9 +226,6 @@ function compute_gridded_recruitment_metrics(
 
         i_start = searchsortedlast(lon_bins, lon_start)
         j_start = searchsortedlast(lat_bins, lat_start)
-        if 1 <= i_start <= n_lon && 1 <= j_start <= n_lat
-            release_density[i_start, j_start] += 1
-        end
 
         i_end = searchsortedlast(lon_bins, lon_end)
         j_end = searchsortedlast(lat_bins, lat_end)
@@ -741,8 +738,13 @@ function compute_empirical_connectivity(
         ["Stratum 1", "Stratum 2", "Stratum 3", "Offshore"]
     end
 
-    n_strata = length(strata_names)
-    counts = zeros(Int, n_strata, n_strata)
+    n_strata   = length(strata_names)
+    # Weighted connectivity: each particle contributes its final survival
+    # probability so P_ij reflects effective recruitment flux, not raw counts.
+    has_surv_prob = hasproperty(trajectories, :survival_probability) &&
+                    !isnothing(trajectories.survival_probability)
+    counts          = zeros(Float64, n_strata, n_strata)
+    counts_unweighted = zeros(Int, n_strata, n_strata)
 
     lons = trajectories.lons
     lats = trajectories.lats
@@ -750,13 +752,16 @@ function compute_empirical_connectivity(
 
     for p in 1:n_particles
         lon_start, lat_start = lons[p, 1], lats[p, 1]
-        lon_end, lat_end = lons[p, end], lats[p, end]
+        lon_end, lat_end     = lons[p, end], lats[p, end]
 
         idx_src = classify_fn(lon_start, lat_start)
         idx_dst = classify_fn(lon_end, lat_end)
 
         if 1 <= idx_src <= n_strata && 1 <= idx_dst <= n_strata
-            counts[idx_src, idx_dst] += 1
+            weight = has_surv_prob ?
+                     Float64(trajectories.survival_probability[p, end]) : 1.0
+            counts[idx_src, idx_dst]           += weight
+            counts_unweighted[idx_src, idx_dst] += 1
         end
     end
 
@@ -791,7 +796,8 @@ function compute_empirical_connectivity(
 
     return (
         matrix = out_matrix,
-        counts_matrix = counts,
+        counts_matrix = counts,                   # survival-probability-weighted
+        counts_unweighted = counts_unweighted,    # raw particle counts
         strata_names = strata_names,
         self_retention = self_retention,
         export_fraction = export_fraction

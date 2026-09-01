@@ -43,6 +43,7 @@ using Dates
 using Statistics
 using LinearAlgebra
 using TOML
+using JLD2
 
 # Sub-components
 include("configuration.jl")
@@ -76,6 +77,7 @@ export
     # Open real-world data and regridding
     fetch_open_bathymetry,
     fetch_open_surface_winds,
+    fetch_open_woa_climatology,
     wind_speed_to_kinematic_stress,
     regrid_2d_field,
 

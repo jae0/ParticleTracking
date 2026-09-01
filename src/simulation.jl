@@ -295,23 +295,110 @@ function create_flow_interpolator_from_jld2(
         error("Simulation output file not found at: $(jld2_filepath)")
     end
 
-    file = jldopen(jld2_filepath, "r")
-    # Extract available iteration or time keys
-    time_keys = if haskey(file, "timeseries/t")
-        file["timeseries/t"]
-    else
-        # Collect iteration numbers
-        iters = sort([parse(Int, k) for k in keys(file["timeseries/u"]) if tryparse(Int, k) !== nothing])
-        iters
+    # Load all grid coordinates and field arrays into local arrays.
+    # The file is closed after this block; the closure captures in-memory arrays.
+    local lons_vec, lats_vec, deps_vec, t_vec
+    local u_arr, v_arr, w_arr, T_arr
+
+    jldopen(jld2_filepath, "r") do file
+        # Extract time vector
+        t_vec = if haskey(file, "timeseries/t")
+            collect(Float64, file["timeseries/t"])
+        else
+            iters = sort([parse(Int, k)
+                          for k in keys(file["timeseries/u"])
+                          if tryparse(Int, k) !== nothing])
+            if isempty(iters)
+                error("Cannot find time data in JLD2 file: $(jld2_filepath)")
+            end
+            Float64.(iters)
+        end
+
+        # Extract grid coordinate vectors from stored metadata or infer from data shape
+        first_key = string(first(keys(file["timeseries/u"])))
+        sample_u  = file["timeseries/u/$(first_key)"]
+        nx, ny, nz = size(sample_u)
+
+        # Oceananigans stores grid info in the output file
+        if haskey(file, "grid")
+            g = file["grid"]
+            lons_vec = haskey(g, "λᶜᵃᵃ") ? collect(Float64, g["λᶜᵃᵃ"][1:nx]) :
+                       collect(range(-68.0, -57.0, length = nx))
+            lats_vec = haskey(g, "φᵃᶜᵃ") ? collect(Float64, g["φᵃᶜᵃ"][1:ny]) :
+                       collect(range(42.0, 47.0, length = ny))
+            deps_vec = haskey(g, "zᵃᵃᶜ") ? collect(Float64, g["zᵃᵃᶜ"][1:nz]) :
+                       collect(range(-1000.0, 0.0, length = nz))
+        else
+            @warn "No 'grid' key in JLD2 file; using uniform coordinate fallback."
+            lons_vec = collect(range(-68.0, -57.0, length = nx))
+            lats_vec = collect(range(42.0, 47.0, length = ny))
+            deps_vec = collect(range(-1000.0, 0.0, length = nz))
+        end
+
+        # Load all time snapshots for each variable into 4D arrays (nx, ny, nz, nt)
+        nt = length(t_vec)
+        u_arr = Array{Float64}(undef, nx, ny, nz, nt)
+        v_arr = Array{Float64}(undef, nx, ny, nz, nt)
+        w_arr = Array{Float64}(undef, nx, ny, nz, nt)
+        T_arr = Array{Float64}(undef, nx, ny, nz, nt)
+
+        for (m, key) in enumerate(string.(sort(parse.(Int, keys(file["timeseries/u"])))))
+            u_arr[:, :, :, m] = Float64.(file["timeseries/u/$(key)"])
+            v_arr[:, :, :, m] = Float64.(file["timeseries/v/$(key)"])
+            w_arr[:, :, :, m] = haskey(file["timeseries"], "w") ?
+                                 Float64.(file["timeseries/w/$(key)"]) : zeros(nx, ny, nz)
+            T_arr[:, :, :, m] = haskey(file["timeseries"], "T") ?
+                                 Float64.(file["timeseries/T/$(key)"]) : fill(4.5, nx, ny, nz)
+        end
     end
 
-    # Return a closure querying the loaded datasets
+    nx, ny, nz, nt = size(u_arr)
+
     function flow_interpolator(lon::Real, lat::Real, z::Real, t::Real)
-        # Standard fallback if file has single time snapshot
-        return (u = 0.05, v = 0.02, w = 0.0, T = 4.5)
+        # Find spatial indices via binary search
+        i_f = searchsortedlast(lons_vec, Float64(lon))
+        j_f = searchsortedlast(lats_vec, Float64(lat))
+        k_f = searchsortedlast(deps_vec, Float64(z))
+        i = clamp(i_f, 1, nx - 1)
+        j = clamp(j_f, 1, ny - 1)
+        k = clamp(k_f, 1, nz - 1)
+
+        # Spatial fractional coordinates
+        sx = (lons_vec[i+1] - lons_vec[i]) != 0.0 ?
+             clamp((Float64(lon) - lons_vec[i]) / (lons_vec[i+1] - lons_vec[i]), 0.0, 1.0) : 0.0
+        sy = (lats_vec[j+1] - lats_vec[j]) != 0.0 ?
+             clamp((Float64(lat) - lats_vec[j]) / (lats_vec[j+1] - lats_vec[j]), 0.0, 1.0) : 0.0
+        sz = (deps_vec[k+1] - deps_vec[k]) != 0.0 ?
+             clamp((Float64(z) - deps_vec[k])  / (deps_vec[k+1]  - deps_vec[k]),  0.0, 1.0) : 0.0
+
+        # Find temporal bracket
+        m_f = searchsortedlast(t_vec, Float64(t))
+        m   = clamp(m_f, 1, nt - 1)
+        θ   = (t_vec[m+1] - t_vec[m]) != 0.0 ?
+              clamp((Float64(t) - t_vec[m]) / (t_vec[m+1] - t_vec[m]), 0.0, 1.0) : 0.0
+
+        function interp(arr)
+            v0 = arr[i,   j,   k,   m] * (1-sx)*(1-sy)*(1-sz) +
+                 arr[i+1, j,   k,   m] * sx*(1-sy)*(1-sz) +
+                 arr[i,   j+1, k,   m] * (1-sx)*sy*(1-sz) +
+                 arr[i+1, j+1, k,   m] * sx*sy*(1-sz) +
+                 arr[i,   j,   k+1, m] * (1-sx)*(1-sy)*sz +
+                 arr[i+1, j,   k+1, m] * sx*(1-sy)*sz +
+                 arr[i,   j+1, k+1, m] * (1-sx)*sy*sz +
+                 arr[i+1, j+1, k+1, m] * sx*sy*sz
+            v1 = arr[i,   j,   k,   m+1] * (1-sx)*(1-sy)*(1-sz) +
+                 arr[i+1, j,   k,   m+1] * sx*(1-sy)*(1-sz) +
+                 arr[i,   j+1, k,   m+1] * (1-sx)*sy*(1-sz) +
+                 arr[i+1, j+1, k,   m+1] * sx*sy*(1-sz) +
+                 arr[i,   j,   k+1, m+1] * (1-sx)*(1-sy)*sz +
+                 arr[i+1, j,   k+1, m+1] * sx*(1-sy)*sz +
+                 arr[i,   j+1, k+1, m+1] * (1-sx)*sy*sz +
+                 arr[i+1, j+1, k+1, m+1] * sx*sy*sz
+            return (1 - θ) * v0 + θ * v1
+        end
+
+        return (interp(u_arr), interp(v_arr), interp(w_arr), interp(T_arr))
     end
 
-    close(file)
     return flow_interpolator
 end
-

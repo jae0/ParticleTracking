@@ -3,7 +3,7 @@
 
 Centralized configuration manager for `ParticleTracking.jl`.
 Provides robust parsing, serialization, validation, and conversion between
-structured TOML/INI configuration files (such as `inputs/ParticalTracking.config`),
+structured TOML/INI configuration files (such as `inputs/ParticleTracking.config`),
 nested dictionaries, metadata records, and runtime `HydrodynamicOptions` structs.
 """
 
@@ -28,7 +28,7 @@ function find_default_config_path()::String
             return p
         end
     end
-    return joinpath("inputs", "ParticalTracking.config")
+    return joinpath("inputs", "ParticleTracking.config")
 end
 
 """
@@ -108,9 +108,9 @@ struct HydrodynamicOptions
 end
 
 function HydrodynamicOptions(;
-    domain_lon       :: Tuple{Real, Real} = (-68.0, -57.0),
-    domain_lat       :: Tuple{Real, Real} = (42.0, 47.0),
-    domain_z         :: Tuple{Real, Real} = (-1000.0, 0.0),
+    domain_lon       :: Tuple{Real, Real} = (-71.0, -53.0),
+    domain_lat       :: Tuple{Real, Real} = (40.0, 48.5),
+    domain_z         :: Tuple{Real, Real} = (-3500.0, 0.0),
     grid_size        :: Tuple{Int, Int, Int} = (50, 50, 10),
     data_mode        :: Symbol = :synthetic,
     enable_tides     :: Bool = true,
@@ -239,11 +239,11 @@ Generate a comprehensive dictionary of all default parameters across all modelin
 function get_default_configuration()::Dict{String, Any}
     return Dict{String, Any}(
         "domain" => Dict{String, Any}(
-            "lon_min" => -68.0,
-            "lon_max" => -57.0,
-            "lat_min" => 42.0,
-            "lat_max" => 47.0,
-            "z_min" => -1000.0,
+            "lon_min" => -71.0,
+            "lon_max" => -53.0,
+            "lat_min" => 40.0,
+            "lat_max" => 48.5,
+            "z_min" => -3500.0,
             "z_max" => 0.0,
             "buffer_km" => 100.0
         ),
@@ -354,11 +354,11 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         return default_val
     end
 
-    lon_min = Float64(get_val("domain", "lon_min", -68.0))
-    lon_max = Float64(get_val("domain", "lon_max", -57.0))
-    lat_min = Float64(get_val("domain", "lat_min", 42.0))
-    lat_max = Float64(get_val("domain", "lat_max", 47.0))
-    z_min   = Float64(get_val("domain", "z_min", -1000.0))
+    lon_min = Float64(get_val("domain", "lon_min", -71.0))
+    lon_max = Float64(get_val("domain", "lon_max", -53.0))
+    lat_min = Float64(get_val("domain", "lat_min", 40.0))
+    lat_max = Float64(get_val("domain", "lat_max", 48.5))
+    z_min   = Float64(get_val("domain", "z_min", -3500.0))
     z_max   = Float64(get_val("domain", "z_max", 0.0))
 
     buffer_km = Float64(get_val("domain", "buffer_km", get_val("biology", "buffer_km", 100.0)))

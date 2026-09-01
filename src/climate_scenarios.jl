@@ -218,9 +218,14 @@ function temperature_dependent_pld(
     temperature_celsius::Real;
     a::Real = 135.0,
     b::Real = 0.75,
-    t_ref::Real = 1.0
+    t_ref::Real = 1.0,
+    t_min_dev::Real = -1.5
 )
-    t_effective = max(0.0, Float64(temperature_celsius)) + t_ref
+    # Clamp to minimum development temperature (C. opilio larvae enter diapause
+    # below ~-1.5°C; Kuhn & Choi 2011), then add reference offset before
+    # applying power-law. This preserves the physiologically correct baseline
+    # without artificially collapsing -1°C and 0°C to the same PLD.
+    t_effective = max(Float64(t_min_dev), Float64(temperature_celsius)) + t_ref
     pld_days = a * (t_effective)^(-b)
     return Float64(pld_days)
 end
@@ -229,38 +234,60 @@ end
     larval_thermal_mortality_rate(
         temperature_celsius::Real;
         base_mortality::Real = 0.02,
-        thermal_threshold::Real = 10.0,
-        thermal_sensitivity::Real = 0.015
+        thermal_threshold::Real = 7.0,
+        thermal_sensitivity::Real = 0.015,
+        cold_threshold::Real = -1.5,
+        cold_sensitivity::Real = 0.01
     )
 
 Compute the instantaneous daily mortality rate \$\\mu(T)\$ (day⁻¹) for snow crab larvae
-accounting for thermal stress when temperatures exceed tolerance thresholds.
+accounting for both upper warm-water and lower cold-water thermal stress.
 
 # Mathematical Formulation
 ```math
-\\mu(T) = \\mu_{\\text{base}} + \\mu_{\\text{thermal}} \\max(0, T - T_{\\text{crit}})^2
+\\mu(T) = \\mu_{\\text{base}}
+        + \\mu_{\\text{warm}} \\max(0, T - T_{\\text{warm,crit}})^2
+        + \\mu_{\\text{cold}} \\max(0, T_{\\text{cold,crit}} - T)
 ```
+
+# Calibration Notes
+- **Warm stress threshold** \$T_{\\text{warm,crit}} = 7.0^\\circ\\text{C}\$: sub-lethal
+  warm-water stress initiates at ≥7°C in *C. opilio* larvae
+  (Kuhn & Choi, 2011; Epifanio & Cohen, 2016). Upper lethal limit ≈9°C.
+  The quadratic form captures increasing sensitivity with warming.
+- **Cold stress threshold** \$T_{\\text{cold,crit}} = -1.5^\\circ\\text{C}\$: larvae
+  enter dormancy / diapause below ~-1.5°C (Kuhn & Choi, 2011). Linear
+  penalty applied to avoid discontinuity at the threshold.
 
 # Inputs
 - `temperature_celsius::Real`: Water temperature in °C.
 - `base_mortality::Real`: Baseline natural daily mortality rate (default 0.02 day⁻¹).
-- `thermal_threshold::Real`: Upper thermal stress threshold \$T_{\\text{crit}}\$ (default 10.0 °C).
-- `thermal_sensitivity::Real`: Thermal penalty coefficient (default 0.015 day⁻¹ °C⁻²).
+- `thermal_threshold::Real`: Upper warm-stress onset threshold \$T_{\\text{warm,crit}}\$ (default 7.0 °C).
+- `thermal_sensitivity::Real`: Warm-stress quadratic coefficient (default 0.015 day⁻¹ °C⁻²).
+- `cold_threshold::Real`: Lower cold-stress onset threshold \$T_{\\text{cold,crit}}\$ (default -1.5 °C).
+- `cold_sensitivity::Real`: Cold-stress linear coefficient (default 0.01 day⁻¹ °C⁻¹).
 
 # Outputs
 - `Float64`: Instantaneous daily mortality rate in \$\\text{day}^{-1}\$.
 
 # References
-- Epifanio, C. E., & Cohen, J. H. (2016). *Journal of Experimental Marine Biology
-  and Ecology*, 482, 85-105.
+- Kuhn, P. S., & Choi, J. S. (2011). *Fisheries Research*, 107(1-3), 81-87.
+  DOI: 10.1016/j.fishres.2010.10.011
+- Epifanio, C. E., & Cohen, J. H. (2016). *JEMBE*, 482, 85-105.
 """
 function larval_thermal_mortality_rate(
     temperature_celsius::Real;
     base_mortality::Real = 0.02,
-    thermal_threshold::Real = 10.0,
-    thermal_sensitivity::Real = 0.015
+    thermal_threshold::Real = 7.0,
+    thermal_sensitivity::Real = 0.015,
+    cold_threshold::Real = -1.5,
+    cold_sensitivity::Real = 0.01
 )
-    excess_t = max(0.0, Float64(temperature_celsius) - thermal_threshold)
-    mortality = base_mortality + thermal_sensitivity * (excess_t^2)
+    T = Float64(temperature_celsius)
+    excess_warm = max(0.0, T - thermal_threshold)
+    excess_cold = max(0.0, cold_threshold - T)
+    mortality = base_mortality +
+                thermal_sensitivity * excess_warm^2 +
+                cold_sensitivity * excess_cold
     return Float64(mortality)
 end

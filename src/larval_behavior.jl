@@ -87,7 +87,11 @@ function diel_vertical_migration_velocity(
     z_day, z_night, w_max = if stage == :zoea1
         (Float64(day_depth), Float64(night_depth), Float64(max_swim_speed))
     elseif stage == :zoea2
-        (Float64(day_depth * zoea2_depth_factor), Float64(night_depth * zoea2_depth_factor),
+        # Zoea II deepens preferentially during the day (ontogenetic descent toward
+        # the CIL boundary) while nighttime ascent is only slightly greater than Zoea I.
+        # Day depth factor 1.3, night depth factor 1.05 (Sainte-Marie & Sainte-Marie 1999).
+        (Float64(day_depth   * 1.3),
+         Float64(night_depth * 1.05),
          Float64(max_swim_speed * zoea2_depth_factor))
     elseif stage == :megalopa
         (Float64(megalopa_day_depth), Float64(megalopa_night_depth),
@@ -98,8 +102,11 @@ function diel_vertical_migration_velocity(
 
     diurnal_phase = 2.0 * π * (mod(t, 86400.0)) / 86400.0
     z_mean = 0.5 * (z_day + z_night)
-    z_amp  = 0.5 * (z_night - z_day)
-    z_target = z_mean + z_amp * cos(diurnal_phase)
+    # Amplitude is positive: z_day < z_night (deeper during day).
+    # At phase=0 (noon): z_target = z_mean - z_amp = z_day   (deep) ✓
+    # At phase=π (midnight): z_target = z_mean + z_amp = z_night (shallow) ✓
+    z_amp    = 0.5 * (z_day - z_night)
+    z_target = z_mean - z_amp * cos(diurnal_phase)
 
     dz = z_target - z
     w_swim = w_max * tanh(dz / relaxation_depth)
@@ -132,7 +139,7 @@ where \$T_{M2} \\approx 12.42\\text{ hours} = 44712\\text{ s}\$.
 # Inputs
 - `u_mean, v_mean::Real`: Background Eulerian flow velocities in \$m s^{-1}\$.
 - `t::Real`: Current time in seconds.
-- `u_amp, v_amp::Real`: Semi-major and semi-minor tidal velocity amplitudes.
+- `u_amp, v_amp::Real`: Semi-major and semi-minor tidal velocity amplitudes (m s⁻¹).
 - `period::Real`: Tidal constituent period in seconds (default 44712.0 s for \$M_2\$).
 - `phase::Real`: Initial phase offset in radians.
 
@@ -167,11 +174,12 @@ Determine the current ontogenetic development stage based on cumulative thermal 
 
 # Mathematical Formulation
 Degree-days (\$DD = \\int \\max(0, T - T_0) dt\$) accumulate in situ. Molting occurs
-at stage-specific thermal thresholds (Kuhn & Choi, 2011; Sainte-Marie & Sainte-Marie, 1999):
-- \$0 \\le DD < 150\$: **Zoea I**
-- \$150 \\le DD < 310\$: **Zoea II**
-- \$310 \\le DD < 510\$: **Megalopa**
-- \$DD \\ge 510\$: **Instar I (Settled)**
+at stage-specific thermal thresholds calibrated from rearing experiments at 2°C
+(Kuhn & Choi, 2011; Sainte-Marie & Sainte-Marie, 1999):
+- \$0 \\le DD < 65\$: **Zoea I** (~32 days at T=2°C)
+- \$65 \\le DD < 130\$: **Zoea II** (~65 days cumulative)
+- \$130 \\le DD < 200\$: **Megalopa** (~100 days cumulative)
+- \$DD \\ge 200\$: **Instar I (Settled)** (~130 days cumulative)
 
 # Inputs
 - `current_stage::Symbol`: Present developmental stage.
@@ -183,9 +191,9 @@ at stage-specific thermal thresholds (Kuhn & Choi, 2011; Sainte-Marie & Sainte-M
 function update_larval_stage(
     current_stage::Symbol,
     degree_days::Real;
-    dd_zoea1_to_zoea2::Real = 150.0,
-    dd_zoea2_to_megalopa::Real = 310.0,
-    dd_megalopa_to_settle::Real = 510.0
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0
 )
     if current_stage == :dead || current_stage == :instar1_settled
         return current_stage
@@ -329,12 +337,27 @@ function larval_transport_step(
     end
     z_new = z + dz_meters
 
-    # Enforce vertical boundary conditions
-    if z_new > z_surface
-        z_new = 2.0 * z_surface - z_new
-    end
-    if z_new < z_bottom
-        z_new = 2.0 * z_bottom - z_new
+    # Absorbing vertical boundaries: larvae cannot exit surface or seabed.
+    # Elastic reflection at the bottom is unphysical — it would impart an upward
+    # velocity impulse. Instead, clamp to the boundary and let settlement
+    # evaluation handle benthic contact.
+    z_new = clamp(z_new, z_bottom, z_surface)
+
+    # Land rejection: polygon-based ray-casting via is_point_on_land.
+    # Priority: (1) accept new position, (2) reflect displacement and retry,
+    # (3) stick to previous position (absorbing coastline).
+    if is_lat_lon && is_point_on_land(x_new, y_new)
+        # Specular reflection: reverse the net horizontal displacement vector
+        x_refl = x - dx_meters * deg_per_meter_lon
+        y_refl = y - dy_meters * deg_per_meter_lat
+        if is_point_on_land(x_refl, y_refl)
+            # Both candidate positions are on land: remain at current location
+            x_new = Float64(x)
+            y_new = Float64(y)
+        else
+            x_new = x_refl
+            y_new = y_refl
+        end
     end
 
     return (Float64(x_new), Float64(y_new), Float64(z_new))
@@ -614,13 +637,15 @@ function track_larval_cohort(
     enable_molting::Bool = true,
     default_temperature::Real = 4.0,
     default_bottom_depth::Real = -1000.0,
-    t_base::Real = 0.0,
-    dd_zoea1_to_zoea2::Real = 150.0,
-    dd_zoea2_to_megalopa::Real = 310.0,
-    dd_megalopa_to_settle::Real = 510.0,
+    t_base::Real = -1.5,
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0,
     mortality_base::Real = 0.02,
-    mortality_thermal_threshold::Real = 10.0,
+    mortality_thermal_threshold::Real = 7.0,
     mortality_thermal_sensitivity::Real = 0.015,
+    mortality_cold_threshold::Real = -1.5,
+    mortality_cold_sensitivity::Real = 0.01,
     settlement_min_depth::Real = -250.0,
     settlement_max_depth::Real = -50.0,
     settlement_max_temp::Real = 6.0,
@@ -628,6 +653,7 @@ function track_larval_cohort(
     tidal_v_amp::Real = 0.12,
     tidal_period::Real = 44712.0,
     tidal_phase::Real = 0.0,
+    min_survival_prob::Real = 0.01,
     rng::AbstractRNG = Random.default_rng()
 )
     n_particles = length(larvae.lon)
@@ -705,9 +731,11 @@ function track_larval_cohort(
             # Degree-day accumulation, survival rate, and molting
             mort_rate = larval_thermal_mortality_rate(
                 cur_T,
-                base_mortality = mortality_base,
-                thermal_threshold = mortality_thermal_threshold,
-                thermal_sensitivity = mortality_thermal_sensitivity
+                base_mortality       = mortality_base,
+                thermal_threshold    = mortality_thermal_threshold,
+                thermal_sensitivity  = mortality_thermal_sensitivity,
+                cold_threshold       = mortality_cold_threshold,
+                cold_sensitivity     = mortality_cold_sensitivity
             )
             traj_surv[p, s + 1] = max(0.0, traj_surv[p, s] * exp(-mort_rate * dt_days))
             traj_temp[p, s + 1] = cur_T
@@ -731,11 +759,18 @@ function track_larval_cohort(
                         max_depth = settlement_max_depth,
                         max_bottom_temp = settlement_max_temp
                     )
-                    current_settlement[p] = suit.suitable ? :settled_successful :
-                                            :settled_unsuitable
-                    current_settlement_age[p] = t_current
-                    if !suit.suitable
-                        current_alive[p] = false
+                    if suit.suitable
+                        current_settlement[p] = :settled_successful
+                        current_settlement_age[p] = t_current
+                    else
+                        # Unsuitable habitat: mark status but keep larva alive so
+                        # it can continue drifting to potentially settle elsewhere.
+                        # Real C. opilio megalopa can re-enter pelagic phase
+                        # (Sainte-Marie & Sainte-Marie, 1999).
+                        current_settlement[p] = :settled_unsuitable
+                        current_settlement_age[p] = t_current
+                        # Revert stage to megalopa so particle keeps moving
+                        new_stage = :megalopa
                     end
                 end
                 cur_stage = new_stage
@@ -751,18 +786,16 @@ function track_larval_cohort(
                 is_lat_lon = is_lat_lon, rng = rng
             )
 
-            # Coastal shoreline boundary condition: prevent larvae from drifting onto land
+            # Coastal shoreline boundary condition: absorbing boundary.
+            # Larvae that step onto land remain at their previous marine position.
+            # Note: larval_transport_step() already attempts specular reflection
+            # inside itself; this outer check catches cases where the post-step
+            # position still lands on the coast.
             if !isnothing(bathymetry_fn)
                 z_bed_new = bathymetry_fn(new_lon, new_lat)
                 if z_bed_new >= 0.0
-                    # Specular reflection away from coastline back into marine fluid
-                    new_lon = 2.0 * cur_lon - new_lon
-                    new_lat = 2.0 * cur_lat - new_lat
-                    if bathymetry_fn(new_lon, new_lat) >= 0.0
-                        # Stick to previous marine coordinate if corner reflection touches land
-                        new_lon = cur_lon
-                        new_lat = cur_lat
-                    end
+                    new_lon = cur_lon
+                    new_lat = cur_lat
                 end
             end
 
@@ -770,6 +803,11 @@ function track_larval_cohort(
             traj_lat[p, s + 1] = new_lat
             traj_depth[p, s + 1] = new_depth
             traj_stage[p, s + 1] = cur_stage
+
+            # Mark as dead when cumulative survival probability falls below threshold
+            if traj_surv[p, s + 1] < min_survival_prob
+                current_alive[p] = false
+            end
         end
     end
 
