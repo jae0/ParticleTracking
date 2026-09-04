@@ -18,10 +18,10 @@ Locate the default configuration file in the project workspace, checking
 """
 function find_default_config_path()::String
     candidates = [
-        joinpath("inputs", "ParticalTracking.config"),
         joinpath("inputs", "ParticleTracking.config"),
-        "ParticalTracking.config",
-        "ParticleTracking.config"
+        "ParticleTracking.config",
+        joinpath("inputs", "ParticalTracking.config"),
+        "ParticalTracking.config"
     ]
     for p in candidates
         if isfile(p)
@@ -61,7 +61,12 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `enable_dvm::Bool`: Whether larvae undergo active Diel Vertical Migration.
 - `enable_molting::Bool`: Whether degree-day accumulation triggers stage molting.
 - `min_seabed_depth::Float64`: Minimum bathymetric water depth for larval release (meters).
-- `buffer_km::Float64`: Spatial buffer distance in kilometers (default 100.0 km) extending beyond administrative CFAs.
+- `buffer_km::Float64`: Spatial buffer distance in km (default 100.0 km) extending beyond CFAs.
+- `release_depth_mode::Symbol`: Vertical release mode (:bottom, :range, :surface).
+- `bottom_release_offset::Tuple{Float64, Float64}`: Elevation range above seabed (meters).
+- `enable_initial_ascent::Bool`: Whether larvae perform active post-hatch vertical ascent.
+- `ascent_speed::Float64`: Directed upward swimming speed during ascent (m/s).
+- `ascent_target_depth::Float64`: Target epipelagic depth for ascent completion (meters).
 - `use_gpu::Bool`: Whether to run hydrodynamic equations on NVIDIA CUDA GPU.
 - `fallback_to_cpu::Bool`: Whether to fall back to CPU if CUDA GPU is not functional.
 - `interactive_map::Bool`: Whether to export interactive HTML5 Leaflet map.
@@ -71,75 +76,102 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `output_dir::String`: Directory for simulation artifacts and figures.
 - `input_dir::String`: Directory for raw and processed bathymetry/wind files.
 - `seed::Int`: Random number generator seed.
+- `hydro_model_file::String`: Target hydrodynamic JLD2 checkpoint path (input/output).
+- `hydro_only::Bool`: Run hydrodynamics only and persist to JLD2 checkpoint.
+- `track_only::Bool`: Track larvae only using flow fields from hydro_model_file.
+- `reuse_hydro::Bool`: Reuse existing hydro_model_file if present on disk; else run.
+- `run_id::String`: Unique cohort identifier for DuckDB persistence and figures.
 """
 struct HydrodynamicOptions
-    domain_lon        :: Tuple{Float64, Float64}
-    domain_lat        :: Tuple{Float64, Float64}
-    domain_z          :: Tuple{Float64, Float64}
-    grid_size         :: Tuple{Int, Int, Int}
-    data_mode         :: Symbol
-    enable_tides      :: Bool
-    tidal_u_amp       :: Float64
-    tidal_v_amp       :: Float64
-    scenario          :: Symbol
-    projection_year   :: Int
-    sim_dt            :: Float64
-    sim_duration      :: Float64
-    adaptive_cfl      :: Bool
-    target_cfl        :: Float64
-    n_particles       :: Int
-    track_duration    :: Float64
-    track_dt          :: Float64
-    diffusivity_h     :: Float64
-    diffusivity_v     :: Float64
-    enable_dvm        :: Bool
-    enable_molting    :: Bool
-    min_seabed_depth  :: Float64
-    buffer_km         :: Float64
-    use_gpu           :: Bool
-    fallback_to_cpu   :: Bool
-    interactive_map   :: Bool
-    enable_duckdb     :: Bool
-    duckdb_path       :: String
-    config_file       :: String
-    output_dir        :: String
-    input_dir         :: String
-    seed              :: Int
+    domain_lon            :: Tuple{Float64, Float64}
+    domain_lat            :: Tuple{Float64, Float64}
+    domain_z              :: Tuple{Float64, Float64}
+    grid_size             :: Tuple{Int, Int, Int}
+    data_mode             :: Symbol
+    enable_tides          :: Bool
+    tidal_u_amp           :: Float64
+    tidal_v_amp           :: Float64
+    scenario              :: Symbol
+    projection_year       :: Int
+    sim_dt                :: Float64
+    sim_duration          :: Float64
+    adaptive_cfl          :: Bool
+    target_cfl            :: Float64
+    surface_heat_flux     :: Float64
+    n_particles           :: Int
+    track_duration        :: Float64
+    track_dt              :: Float64
+    diffusivity_h         :: Float64
+    diffusivity_v         :: Float64
+    enable_dvm            :: Bool
+    enable_molting        :: Bool
+    min_seabed_depth      :: Float64
+    buffer_km             :: Float64
+    release_depth_mode    :: Symbol
+    bottom_release_offset :: Tuple{Float64, Float64}
+    enable_initial_ascent :: Bool
+    ascent_speed          :: Float64
+    ascent_target_depth   :: Float64
+    use_gpu               :: Bool
+    fallback_to_cpu       :: Bool
+    interactive_map       :: Bool
+    enable_duckdb         :: Bool
+    duckdb_path           :: String
+    config_file           :: String
+    output_dir            :: String
+    input_dir             :: String
+    seed                  :: Int
+    hydro_model_file      :: String
+    hydro_only            :: Bool
+    track_only            :: Bool
+    reuse_hydro           :: Bool
+    run_id                :: String
 end
 
 function HydrodynamicOptions(;
-    domain_lon       :: Tuple{Real, Real} = (-71.0, -53.0),
-    domain_lat       :: Tuple{Real, Real} = (40.0, 48.5),
-    domain_z         :: Tuple{Real, Real} = (-3500.0, 0.0),
-    grid_size        :: Tuple{Int, Int, Int} = (50, 50, 10),
-    data_mode        :: Symbol = :synthetic,
-    enable_tides     :: Bool = true,
-    tidal_u_amp      :: Real = 0.25,
-    tidal_v_amp      :: Real = 0.12,
-    scenario         :: Symbol = :ssp245,
-    projection_year  :: Int = 2050,
-    sim_dt           :: Real = 120.0,
-    sim_duration     :: Real = 43200.0,
-    adaptive_cfl     :: Bool = true,
-    target_cfl       :: Real = 0.2,
-    n_particles      :: Int = 100,
-    track_duration   :: Real = 86400.0 * 5,
-    track_dt         :: Real = 300.0,
-    diffusivity_h    :: Real = 10.0,
-    diffusivity_v    :: Real = 1e-4,
-    enable_dvm       :: Bool = true,
-    enable_molting   :: Bool = true,
-    min_seabed_depth :: Real = 100.0,
-    buffer_km        :: Real = 100.0,
-    use_gpu          :: Bool = false,
-    fallback_to_cpu  :: Bool = false,
-    interactive_map  :: Bool = true,
-    enable_duckdb    :: Bool = true,
-    duckdb_path      :: AbstractString = joinpath("outputs", "particle_tracking.duckdb"),
-    config_file      :: AbstractString = find_default_config_path(),
-    output_dir       :: AbstractString = "outputs",
-    input_dir        :: AbstractString = "inputs",
-    seed             :: Int = 42
+    domain_lon            :: Tuple{Real, Real} = (-71.0, -53.0),
+    domain_lat            :: Tuple{Real, Real} = (40.0, 48.5),
+    domain_z              :: Tuple{Real, Real} = (-3500.0, 0.0),
+    grid_size             :: Tuple{Int, Int, Int} = (50, 50, 10),
+    data_mode             :: Symbol = :synthetic,
+    enable_tides          :: Bool = true,
+    tidal_u_amp           :: Real = 0.25,
+    tidal_v_amp           :: Real = 0.12,
+    scenario              :: Symbol = :ssp245,
+    projection_year       :: Int = 2050,
+    sim_dt                :: Real = 120.0,
+    sim_duration          :: Real = 43200.0,
+    adaptive_cfl          :: Bool = true,
+    target_cfl            :: Real = 0.2,
+    surface_heat_flux     :: Real = 50.0,
+    n_particles           :: Int = 100,
+    track_duration        :: Real = 86400.0 * 5,
+    track_dt              :: Real = 300.0,
+    diffusivity_h         :: Real = 10.0,
+    diffusivity_v         :: Real = 1e-4,
+    enable_dvm            :: Bool = true,
+    enable_molting        :: Bool = true,
+    min_seabed_depth      :: Real = 100.0,
+    buffer_km             :: Real = 100.0,
+    release_depth_mode    :: Symbol = :bottom,
+    bottom_release_offset :: Tuple{Real, Real} = (0.5, 3.0),
+    enable_initial_ascent :: Bool = true,
+    ascent_speed          :: Real = 0.010,
+    ascent_target_depth   :: Real = -10.0,
+    use_gpu               :: Bool = false,
+    fallback_to_cpu       :: Bool = false,
+    interactive_map       :: Bool = true,
+    enable_duckdb         :: Bool = true,
+    duckdb_path           :: AbstractString = joinpath("outputs", "particle_tracking.duckdb"),
+    config_file           :: AbstractString = find_default_config_path(),
+    output_dir            :: AbstractString = "outputs",
+    input_dir             :: AbstractString = "inputs",
+    seed                  :: Int = 42,
+    hydro_model_file      :: AbstractString = "",
+    hydro_only            :: Bool = false,
+    track_only            :: Bool = false,
+    reuse_hydro           :: Bool = false,
+    run_id                :: AbstractString = ""
 )
     return HydrodynamicOptions(
         (Float64(domain_lon[1]), Float64(domain_lon[2])),
@@ -156,6 +188,7 @@ function HydrodynamicOptions(;
         Float64(sim_duration),
         adaptive_cfl,
         Float64(target_cfl),
+        Float64(surface_heat_flux),
         n_particles,
         Float64(track_duration),
         Float64(track_dt),
@@ -165,6 +198,11 @@ function HydrodynamicOptions(;
         enable_molting,
         Float64(min_seabed_depth),
         Float64(buffer_km),
+        release_depth_mode,
+        (Float64(bottom_release_offset[1]), Float64(bottom_release_offset[2])),
+        enable_initial_ascent,
+        Float64(ascent_speed),
+        Float64(ascent_target_depth),
         use_gpu,
         fallback_to_cpu,
         interactive_map,
@@ -173,7 +211,12 @@ function HydrodynamicOptions(;
         String(config_file),
         String(output_dir),
         String(input_dir),
-        seed
+        seed,
+        String(hydro_model_file),
+        hydro_only,
+        track_only,
+        reuse_hydro,
+        String(run_id)
     )
 end
 
@@ -195,17 +238,17 @@ function load_configuration(config_path::AbstractString = find_default_config_pa
             return TOML.parsefile(config_path)
         catch err
             @warn "Failed to parse configuration file at $(config_path): $(err). Using defaults."
-            return get_default_configuration()
+            return occursin("snowcrab", lowercase(config_path)) ? get_snowcrab_configuration() : get_default_configuration()
         end
     else
-        return get_default_configuration()
+        return occursin("snowcrab", lowercase(config_path)) ? get_snowcrab_configuration() : get_default_configuration()
     end
 end
 
 """
     save_configuration(
         config_dict::AbstractDict,
-        config_path::AbstractString = joinpath("inputs", "ParticalTracking.config")
+        config_path::AbstractString = joinpath("inputs", "ParticleTracking.config")
     ) -> String
 
 Serialize a nested configuration dictionary to a centralized `.config` file in TOML format.
@@ -219,7 +262,7 @@ Serialize a nested configuration dictionary to a centralized `.config` file in T
 """
 function save_configuration(
     config_dict::AbstractDict,
-    config_path::AbstractString = joinpath("inputs", "ParticalTracking.config")
+    config_path::AbstractString = joinpath("inputs", "ParticleTracking.config")
 )::String
     out_dir = dirname(abspath(config_path))
     if !isdir(out_dir)
@@ -289,7 +332,12 @@ function get_default_configuration()::Dict{String, Any}
             "min_seabed_depth" => 100.0,
             "buffer_km" => 100.0,
             "diffusivity_h" => 10.0,
-            "diffusivity_v" => 1e-4
+            "diffusivity_v" => 1e-4,
+            "release_depth_mode" => "bottom",
+            "bottom_release_offset" => [0.5, 3.0],
+            "enable_initial_ascent" => true,
+            "ascent_speed" => 0.010,
+            "ascent_target_depth" => -10.0
         ),
         "dvm" => Dict{String, Any}(
             "enable_dvm" => true,
@@ -314,6 +362,132 @@ function get_default_configuration()::Dict{String, Any}
         "storage" => Dict{String, Any}(
             "enable_duckdb" => true,
             "duckdb_path" => "outputs/particle_tracking.duckdb",
+            "export_parquet" => false
+        ),
+        "hardware" => Dict{String, Any}(
+            "use_gpu" => false,
+            "fallback_to_cpu" => true
+        ),
+        "visualization" => Dict{String, Any}(
+            "interactive_map" => true,
+            "title" => "Scotian Shelf Snow Crab Larval Dispersal & Demographic Connectivity"
+        ),
+        "paths" => Dict{String, Any}(
+            "output_dir" => "outputs",
+            "input_dir" => "inputs",
+            "seed" => 42
+        )
+    )
+end
+
+"""
+    get_snowcrab_configuration() -> Dict{String, Any}
+
+Generate a configuration dictionary calibrated specifically for snow crab (*Chionoecetes opilio*)
+larval transport modeling across the Scotian Shelf and Northwest Atlantic.
+
+# Biophysical Calibration & Parameters
+- **Domain**: Scotian Shelf & continental slope (`lon`: [-68.0, -57.0] °E, `lat`: [42.0, 47.5] °N, `z`: [-3500.0, 0.0] m).
+- **Grid**: High-resolution 100 × 100 × 20 cells.
+- **Data**: Real bathymetry and atmospheric forcing (`data_mode`: "real").
+- **Tides**: M2 (0.25 m/s) + S2 (0.11 m/s) tidal current forcing with quadratic bottom drag.
+- **Biology**: 500 larvae released from commercial nursery depths (≥ 100 m) in benthic boundary layer ([0.5, 3.0] m off bed).
+- **Behaviors**: Active vertical ascent (10 mm/s to -10 m), stage-dependent DVM, and degree-day thermal molting
+  (base temperature \$T_{base} = -1.5\$ °C; stage thresholds: 65, 130, 200 DD).
+- **Duration**: 60.0 days pelagic larval duration (PLD) advected at 300 s time steps.
+- **Storage**: DuckDB target configured as `outputs/snowcrab_tracking.duckdb`.
+
+# Outputs
+- `Dict{String, Any}`: Nested dictionary containing snow crab calibrated parameters.
+"""
+function get_snowcrab_configuration()::Dict{String, Any}
+    return Dict{String, Any}(
+        "domain" => Dict{String, Any}(
+            "lon_min" => -68.0,
+            "lon_max" => -57.0,
+            "lat_min" => 42.0,
+            "lat_max" => 47.5,
+            "z_min" => -3500.0,
+            "z_max" => 0.0,
+            "buffer_km" => 100.0
+        ),
+        "grid" => Dict{String, Any}(
+            "nx" => 100,
+            "ny" => 100,
+            "nz" => 20
+        ),
+        "data" => Dict{String, Any}(
+            "data_mode" => "real",
+            "bathy_dataset_id" => "etopo180",
+            "wind_dataset_id" => "erdBSwinds1day",
+            "wind_time_iso" => "2020-06-01T00:00:00Z",
+            "inshore_depth" => -100.0,
+            "shelf_slope" => 500.0
+        ),
+        "tides" => Dict{String, Any}(
+            "enable_tides" => true,
+            "constituents" => ["M2", "S2"],
+            "tidal_u_amp" => 0.25,
+            "tidal_v_amp" => 0.12,
+            "s2_u_amp" => 0.11,
+            "s2_v_amp" => 0.05,
+            "tidal_period" => 44712.0,
+            "tidal_phase" => 0.0
+        ),
+        "climate" => Dict{String, Any}(
+            "scenario" => "historical",
+            "projection_year" => 2020,
+            "baseline_year" => 2020,
+            "horizon_year" => 2050
+        ),
+        "hydrodynamics" => Dict{String, Any}(
+            "sim_duration_hours" => 120.0,
+            "sim_dt_seconds" => 120.0,
+            "adaptive_cfl" => true,
+            "target_cfl" => 0.2,
+            "divergence_velocity_limit" => 20.0,
+            "coriolis_latitude" => 44.5,
+            "surface_heat_flux" => 50.0
+        ),
+        "biology" => Dict{String, Any}(
+            "n_particles" => 500,
+            "track_duration_days" => 60.0,
+            "track_dt_seconds" => 300.0,
+            "min_seabed_depth" => 100.0,
+            "buffer_km" => 100.0,
+            "diffusivity_h" => 10.0,
+            "diffusivity_v" => 1e-4,
+            "release_depth_mode" => "bottom",
+            "bottom_release_offset" => [0.5, 3.0],
+            "enable_initial_ascent" => true,
+            "ascent_speed" => 0.010,
+            "ascent_target_depth" => -10.0
+        ),
+        "dvm" => Dict{String, Any}(
+            "enable_dvm" => true,
+            "megalopa_day_depth" => -120.0,
+            "megalopa_night_depth" => -60.0,
+            "zoea2_depth_factor" => 1.2,
+            "megalopa_swim_factor" => 1.5
+        ),
+        "molting_and_settlement" => Dict{String, Any}(
+            "enable_molting" => true,
+            "t_base" => -1.5,
+            "dd_zoea1_to_zoea2" => 65.0,
+            "dd_zoea2_to_megalopa" => 130.0,
+            "dd_megalopa_to_settle" => 200.0,
+            "mortality_base" => 0.02,
+            "mortality_thermal_threshold" => 7.0,
+            "mortality_thermal_sensitivity" => 0.35,
+            "mortality_cold_threshold" => -1.5,
+            "mortality_cold_sensitivity" => 0.02,
+            "settlement_min_depth" => -250.0,
+            "settlement_max_depth" => -50.0,
+            "settlement_max_temp" => 6.0
+        ),
+        "storage" => Dict{String, Any}(
+            "enable_duckdb" => true,
+            "duckdb_path" => "outputs/snowcrab_tracking.duckdb",
             "export_parquet" => false
         ),
         "hardware" => Dict{String, Any}(
@@ -380,6 +554,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     sim_dt    = Float64(get_val("hydrodynamics", "sim_dt_seconds", 120.0))
     adapt_cfl = Bool(get_val("hydrodynamics", "adaptive_cfl", true))
     tgt_cfl   = Float64(get_val("hydrodynamics", "target_cfl", 0.2))
+    heat_flux = Float64(get_val("hydrodynamics", "surface_heat_flux", 50.0))
 
     n_parts   = Int(get_val("biology", "n_particles", 100))
     track_days = Float64(get_val("biology", "track_duration_days", 5.0))
@@ -387,6 +562,20 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     min_depth = Float64(get_val("biology", "min_seabed_depth", 100.0))
     diff_h    = Float64(get_val("biology", "diffusivity_h", 10.0))
     diff_v    = Float64(get_val("biology", "diffusivity_v", 1e-4))
+
+    rel_mode_str = String(get_val("biology", "release_depth_mode", "bottom"))
+    rel_mode = Symbol(lowercase(rel_mode_str))
+    raw_offset = get_val("biology", "bottom_release_offset", [0.5, 3.0])
+    b_offset = if raw_offset isa Vector && length(raw_offset) >= 2
+        (Float64(raw_offset[1]), Float64(raw_offset[2]))
+    elseif raw_offset isa Tuple && length(raw_offset) >= 2
+        (Float64(raw_offset[1]), Float64(raw_offset[2]))
+    else
+        (0.5, 3.0)
+    end
+    init_ascent = Bool(get_val("biology", "enable_initial_ascent", true))
+    asc_spd     = Float64(get_val("biology", "ascent_speed", 0.010))
+    asc_target  = Float64(get_val("biology", "ascent_target_depth", -10.0))
 
     enable_dvm = Bool(get_val("dvm", "enable_dvm", true))
     enable_molting = Bool(get_val("molting_and_settlement", "enable_molting", true))
@@ -401,6 +590,9 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     output_dir = String(get_val("paths", "output_dir", "outputs"))
     input_dir  = String(get_val("paths", "input_dir", "inputs"))
     seed       = Int(get_val("paths", "seed", 42))
+
+    hydro_file = String(get_val("hydrodynamics", "hydro_model_file", ""))
+    run_id_val = String(get_val("storage", "run_id", ""))
 
     # Construct HydrodynamicOptions with overrides applied
     return HydrodynamicOptions(;
@@ -418,6 +610,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         sim_duration = sim_hours * 3600.0,
         adaptive_cfl = adapt_cfl,
         target_cfl = tgt_cfl,
+        surface_heat_flux = heat_flux,
         n_particles = n_parts,
         track_duration = track_days * 86400.0,
         track_dt = track_dt,
@@ -427,6 +620,11 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         enable_molting = enable_molting,
         min_seabed_depth = min_depth,
         buffer_km = buffer_km,
+        release_depth_mode = rel_mode,
+        bottom_release_offset = b_offset,
+        enable_initial_ascent = init_ascent,
+        ascent_speed = asc_spd,
+        ascent_target_depth = asc_target,
         use_gpu = use_gpu,
         fallback_to_cpu = fallback_cpu,
         interactive_map = interactive,
@@ -435,6 +633,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         output_dir = output_dir,
         input_dir = input_dir,
         seed = seed,
+        hydro_model_file = hydro_file,
+        run_id = run_id_val,
         overrides...
     )
 end
@@ -478,7 +678,9 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "sim_duration_hours" => opts.sim_duration / 3600.0,
             "sim_dt_seconds" => opts.sim_dt,
             "adaptive_cfl" => opts.adaptive_cfl,
-            "target_cfl" => opts.target_cfl
+            "target_cfl" => opts.target_cfl,
+            "surface_heat_flux" => opts.surface_heat_flux,
+            "hydro_model_file" => opts.hydro_model_file
         ),
         "biology" => Dict{String, Any}(
             "n_particles" => opts.n_particles,
@@ -487,7 +689,12 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "min_seabed_depth" => opts.min_seabed_depth,
             "buffer_km" => opts.buffer_km,
             "diffusivity_h" => opts.diffusivity_h,
-            "diffusivity_v" => opts.diffusivity_v
+            "diffusivity_v" => opts.diffusivity_v,
+            "release_depth_mode" => string(opts.release_depth_mode),
+            "bottom_release_offset" => [opts.bottom_release_offset[1], opts.bottom_release_offset[2]],
+            "enable_initial_ascent" => opts.enable_initial_ascent,
+            "ascent_speed" => opts.ascent_speed,
+            "ascent_target_depth" => opts.ascent_target_depth
         ),
         "dvm" => Dict{String, Any}(
             "enable_dvm" => opts.enable_dvm
@@ -497,7 +704,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "storage" => Dict{String, Any}(
             "enable_duckdb" => opts.enable_duckdb,
-            "duckdb_path" => opts.duckdb_path
+            "duckdb_path" => opts.duckdb_path,
+            "run_id" => opts.run_id
         ),
         "hardware" => Dict{String, Any}(
             "use_gpu" => opts.use_gpu,
@@ -513,3 +721,51 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         )
     )
 end
+
+"""
+    SnowCrabRunOptions(; kwargs...) -> HydrodynamicOptions
+
+Construct a `HydrodynamicOptions` instance pre-configured with calibrated physical
+and biophysical parameters for snow crab (*Chionoecetes opilio*) larval transport
+across the Scotian Shelf and Northwest Atlantic continental slope.
+
+# Mathematical & Biophysical Formulations
+Snow crab larvae hatch from benthic nurseries (\$z_{\\text{bed}} \\le -100\\text{ m}\$)
+and actively ascend to the epipelagic zone:
+- **Larval Cohort**: 500 larvae tracked for 60.0 days pelagic larval duration (PLD)
+  at \$\\Delta t = 300\\text{ s}\$.
+- **Spatial Domain**: Scotian Shelf & slope (\$\\lambda \\in [-68.0, -57.0]^\\circ\\text{E}\$,
+  \$\\phi \\in [42.0, 47.5]^\\circ\\text{N}\$, \$z \\in [-3500.0, 0.0]\\text{ m}\$).
+- **Grid Resolution**: \$100 \\times 100 \\times 20\$ grid cells with \$100\\text{ km}\$
+  CFA buffer.
+- **Benthic Release & Active Ascent**: Initial placement in near-bottom boundary layer
+  ([0.5, 3.0] m off bed) with directed upward swimming (\$w = 0.010\\text{ m/s}\$)
+  relaxing toward \$-10.0\\text{ m}\$, smoothly transitioning to stage-dependent DVM.
+- **Degree-Day Thermal Molting**: Base temperature \$T_{\\text{base}} = -1.5^\\circ\\text{C}\$
+  with cumulative degree-day thresholds (Zoea I \$\\to\$ Zoea II: 65 DD,
+  Zoea II \$\\to\$ Megalopa: 130 DD, Megalopa \$\\to\$ Benthic Settlement: 200 DD).
+- **Environmental Forcing & Storage**: Real bathymetry and winds, \$M_2 + S_2\$ tidal
+  harmonics, summer heat flux (\$50\\text{ W/m}^2\$), and DuckDB storage
+  (`outputs/snowcrab_tracking.duckdb`).
+
+# Inputs
+- `kwargs...`: Optional keyword overrides for any field of `HydrodynamicOptions`
+  (e.g., `n_particles = 200`, `ascent_speed = 0.015`, `hydro_model_file = "..."`,
+  `track_only = true`, `run_id = "cohort_2020"`).
+
+# Outputs
+- `HydrodynamicOptions`: Validated runtime options instance with snow crab defaults.
+
+# References
+- Sainte-Marie, G., & Sainte-Marie, B. (1999). Hatching and larval release in the
+  snow crab, *Chionoecetes opilio*. *Journal of Crustacean Biology*, 19(4), 743-754.
+- Lovrich, G. A., & Sainte-Marie, B. (1997). Cannibalism in the snow crab:
+  implications for larval recruitment. *Marine Ecology Progress Series*, 148, 85-99.
+- Kuhn, P. S., & Choi, J. S. (2011). Influence of temperature on snow crab larval
+  development. *ICES Journal of Marine Science*, 68(8), 1673-1681.
+"""
+function SnowCrabRunOptions(; kwargs...)::HydrodynamicOptions
+    cfg = get_snowcrab_configuration()
+    return configuration_to_options(cfg; kwargs...)
+end
+

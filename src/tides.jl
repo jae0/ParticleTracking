@@ -77,10 +77,15 @@ resulting body force amplitude is \$\\approx 3.5 \\times 10^{-5}\$ m s⁻², con
 with observed tidal acceleration magnitudes on the Scotian Shelf.
 
 # Inputs
+# Inputs
 - `constituents::Vector{Symbol}`: List of constituents to include (e.g. `[:M2, :S2]`).
 - `u_amplitudes::Dict{Symbol, Float64}`: Zonal tidal velocity amplitudes in \$m s^{-1}\$.
 - `v_amplitudes::Dict{Symbol, Float64}`: Meridional tidal velocity amplitudes in \$m s^{-1}\$.
 - `phases::Dict{Symbol, Float64}`: Tidal phase offsets in radians.
+- `bottom_drag_linear::Real`: Linear bottom drag rate \$r_{\\text{drag}}\$ in \$s^{-1}\$.
+  When \$r_{\\text{drag}} > 0\$, the acceleration amplitude is calibrated to
+  \$U_k \\sqrt{\\omega_k^2 + r_{\\text{drag}}^2}\$ to compensate for frictional damping
+  and maintain the target velocity amplitude \$U_k\$.
 
 # Outputs
 - `NamedTuple`: `(u = Fu, v = Fv)` forcing functions.
@@ -92,19 +97,26 @@ with observed tidal acceleration magnitudes on the Scotian Shelf.
 """
 function build_tidal_body_forcing(;
     constituents::Vector{Symbol} = [:M2],
-    u_amplitudes::Dict{Symbol, Float64} = Dict(:M2 => 0.25),
-    v_amplitudes::Dict{Symbol, Float64} = Dict(:M2 => 0.12),
-    phases::Dict{Symbol, Float64} = Dict(:M2 => 0.0)
+    u_amplitudes::AbstractDict{Symbol, <:Real} = Dict(:M2 => 0.25),
+    v_amplitudes::AbstractDict{Symbol, <:Real} = Dict(:M2 => 0.12),
+    phases::AbstractDict{Symbol, <:Real} = Dict(:M2 => 0.0),
+    bottom_drag_linear::Real = 0.0,
+    bottom_drag::Union{Nothing, Real} = nothing
 )
     freqs = [get_tidal_frequency(c) for c in constituents]
-    u_amps = [get(u_amplitudes, c, 0.0) for c in constituents]
-    v_amps = [get(v_amplitudes, c, 0.0) for c in constituents]
-    phs = [get(phases, c, 0.0) for c in constituents]
+    u_amps = [Float64(get(u_amplitudes, c, 0.0)) for c in constituents]
+    v_amps = [Float64(get(v_amplitudes, c, 0.0)) for c in constituents]
+    phs = [Float64(get(phases, c, 0.0)) for c in constituents]
+    r_linear = !isnothing(bottom_drag) ? Float64(bottom_drag) : Float64(bottom_drag_linear)
+
+    # Scaling factor: sqrt(ω² + r²) compensates for linear bottom drag damping
+    # In the absence of drag (r = 0), this simplifies to ω.
+    scales = [sqrt(ω^2 + r_linear^2) for ω in freqs]
 
     F_u(x, y, z, t) = begin
         val = 0.0
         for i in eachindex(constituents)
-            val += u_amps[i] * freqs[i] * cos(freqs[i] * t + phs[i])
+            val += u_amps[i] * scales[i] * cos(freqs[i] * t + phs[i])
         end
         val
     end
@@ -112,7 +124,7 @@ function build_tidal_body_forcing(;
     F_v(x, y, z, t) = begin
         val = 0.0
         for i in eachindex(constituents)
-            val += v_amps[i] * freqs[i] * sin(freqs[i] * t + phs[i])
+            val += v_amps[i] * scales[i] * sin(freqs[i] * t + phs[i])
         end
         val
     end
@@ -145,17 +157,17 @@ at time \$t\$ from multi-constituent harmonic synthesis.
 function tidal_velocity_vector(
     t::Real;
     constituents::Vector{Symbol} = [:M2],
-    u_amplitudes::Dict{Symbol, Float64} = Dict(:M2 => 0.25),
-    v_amplitudes::Dict{Symbol, Float64} = Dict(:M2 => 0.12),
-    phases::Dict{Symbol, Float64} = Dict(:M2 => 0.0)
+    u_amplitudes::AbstractDict{Symbol, <:Real} = Dict(:M2 => 0.25),
+    v_amplitudes::AbstractDict{Symbol, <:Real} = Dict(:M2 => 0.12),
+    phases::AbstractDict{Symbol, <:Real} = Dict(:M2 => 0.0)
 )
     u_tot = 0.0
     v_tot = 0.0
     for c in constituents
         omega = get_tidal_frequency(c)
-        u_a = get(u_amplitudes, c, 0.0)
-        v_a = get(v_amplitudes, c, 0.0)
-        phi = get(phases, c, 0.0)
+        u_a = Float64(get(u_amplitudes, c, 0.0))
+        v_a = Float64(get(v_amplitudes, c, 0.0))
+        phi = Float64(get(phases, c, 0.0))
 
         u_tot += u_a * cos(omega * t + phi)
         v_tot += v_a * sin(omega * t + phi)
@@ -166,17 +178,22 @@ end
 """
     simpson_hunter_parameter(
         water_depth::Real,
-        u_tidal_amplitude::Real
+        u_tidal_amplitude::Real;
+        u_wind_speed::Real = 0.0,
+        cd::Real = 2.5e-3,
+        buoyancy_flux::Union{Nothing, Real} = nothing
     )
 
 Compute the Simpson-Hunter tidal mixing front parameter \$\\chi = \\log_{10}(h / U^3)\$
-to identify where tidal dissipation overcomes buoyancy stratification.
+or generalized shear-buoyancy index to identify where tidal and wind dissipation overcomes stratification.
 
 # Mathematical Formulation
 ```math
-\\chi = \\log_{10}\\left( \\frac{h}{U_{\\text{tide}}^3} \\right)
+\\chi = \\log_{10}\\left( \\frac{h}{U_{\\text{tide}}^3 + \\gamma U_{\\text{wind}}^3} \\right)
 ```
-where \$h\$ is water column depth in meters and \$U_{\\text{tide}}\$ is peak tidal current speed.
+where \$h\$ is water column depth in meters, \$U_{\\text{tide}}\$ is tidal velocity amplitude,
+and \$U_{\\text{wind}}\$ represents surface wind shear dissipation
+(Garrett, Keeley & Greenberg 1978; Loder & Greenberg 1986).
 - \$\\chi < 1.5\$: Well-mixed water column (e.g. shallow banks, Georges Bank, Bay of Fundy).
 - \$\\chi > 2.0\$: Thermally stratified shelf waters.
 - \$\\chi \\approx 1.5 - 2.0\$: Tidal mixing front (nursery retention zone).
@@ -184,20 +201,33 @@ where \$h\$ is water column depth in meters and \$U_{\\text{tide}}\$ is peak tid
 # Inputs
 - `water_depth::Real`: Water column thickness in meters (\$h > 0\$).
 - `u_tidal_amplitude::Real`: Peak tidal current amplitude in \$m s^{-1}\$.
+- `u_wind_speed::Real`: Optional 10-meter wind speed in \$m s^{-1}\$ (default 0.0).
+- `cd::Real`: Bottom drag friction coefficient (default \$2.5 \\times 10^{-3}\$).
+- `buoyancy_flux::Union{Nothing, Real}`: Optional surface buoyancy flux \$B\$ in \$m^2 s^{-3}\$.
 
 # Outputs
 - `Float64`: Simpson-Hunter parameter \$\\chi\$.
 
 # References
-- Simpson, J. H., & Hunter, J. R. (1974). Fronts in the Irish Sea. *Nature*,
-  250(5465), 404-406. DOI: 10.1038/250404a0
+- Simpson, J. H., & Hunter, J. R. (1974). Fronts in the Irish Sea. *Nature*, 250, 404-406.
+- Garrett, C. J. R., Keeley, J. R., & Greenberg, D. A. (1978). *Continental Shelf Research*, 18(1), 17-33.
+- Loder, J. W., & Greenberg, D. A. (1986). *Continental Shelf Research*, 5(6), 679-704.
 """
 function simpson_hunter_parameter(
     water_depth::Real,
-    u_tidal_amplitude::Real
+    u_tidal_amplitude::Real;
+    u_wind_speed::Real = 0.0,
+    cd::Real = 2.5e-3,
+    buoyancy_flux::Union{Nothing, Real} = nothing
 )
     h = max(1.0, abs(Float64(water_depth)))
-    u = max(1e-3, abs(Float64(u_tidal_amplitude)))
-    chi = log10(h / (u^3))
-    return Float64(chi)
+    u_tide = max(1e-3, abs(Float64(u_tidal_amplitude)))
+    u_wind = max(0.0, abs(Float64(u_wind_speed)))
+    # Energy dissipation: ε ~ ρ * (U_tide³ + 0.05 * U_wind³)
+    dissipation_u3 = u_tide^3 + 0.05 * u_wind^3
+    if !isnothing(buoyancy_flux) && buoyancy_flux > 0.0
+        return Float64(log10(buoyancy_flux * h / (cd * dissipation_u3)))
+    else
+        return Float64(log10(h / dissipation_u3))
+    end
 end

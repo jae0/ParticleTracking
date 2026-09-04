@@ -9,6 +9,9 @@ Automated unit test suite for the ParticleTracking package covering:
 5. DVM swimming velocities, degree-day molting, and settlement filters
 6. Eulerian/Lagrangian particle tracking and tidal current superposition
 7. Visualization generators
+8. Coastline geometry, 0% land seeding, and CFA strata intersections
+9. Enhanced physics: air-sea heat flux, BBL shear, passive sinking,
+   spring-neap tides, Visser diffusive drift, and recruitment connectivity
 """
 
 using Test
@@ -137,8 +140,8 @@ using ParticleTracking
 
     @testset "6. DVM, Tidal Superposition & Settlement Filters" begin
         # DVM swimming velocity: day should swim down (negative), night should swim up (positive)
-        w_day = diel_vertical_migration_velocity(-10.0, 43200.0; stage = :zoea1) # midday at shallow depth
-        w_night = diel_vertical_migration_velocity(-40.0, 0.0; stage = :zoea1)   # midnight at deep depth
+        w_day = diel_vertical_migration_velocity(-10.0, 0.0; stage = :zoea1)       # noon (t=0): larva at surface swims down
+        w_night = diel_vertical_migration_velocity(-40.0, 43200.0; stage = :zoea1) # midnight (t=43200s): larva at depth swims up
         @test w_day < 0.0   # descending
         @test w_night > 0.0 # ascending
 
@@ -381,19 +384,82 @@ using ParticleTracking
         @test isfile("outputs/test_rec.png")
 
         # Test hydrodynamic model CairoMakie figures
-        fig_h_adv = plot_hydrodynamic_advection(nothing, output_path = "outputs/test_hydro_adv.png")
+        fig_h_adv = plot_hydrodynamic_advection(
+            nothing,
+            depth = -20.0,
+            time_seconds = 3600.0,
+            output_path = "outputs/test_hydro_adv.png"
+        )
         @test isfile("outputs/test_hydro_adv.png")
 
-        fig_h_trc = plot_hydrodynamic_tracers(nothing, output_path = "outputs/test_hydro_trc.png")
+        fig_h_trc = plot_hydrodynamic_tracers(
+            nothing,
+            depth = -15.0,
+            time_seconds = 7200.0,
+            output_path = "outputs/test_hydro_trc.png"
+        )
         @test isfile("outputs/test_hydro_trc.png")
 
-        # Test hydrodynamic dataset extraction
-        hydro_ds = extract_hydrodynamic_dataset(nothing)
+        # Test new hydrodynamic visualization suite
+        fig_h_strat = plot_hydrodynamic_stratification(
+            nothing,
+            depth = -25.0,
+            output_path = "outputs/test_hydro_strat.png"
+        )
+        @test isfile("outputs/test_hydro_strat.png")
+
+        fig_h_diff = plot_hydrodynamic_diffusion(
+            nothing,
+            depth = -30.0,
+            output_path = "outputs/test_hydro_diff.png"
+        )
+        @test isfile("outputs/test_hydro_diff.png")
+
+        fig_h_sec = plot_hydrodynamic_section(
+            nothing,
+            variable = :temperature,
+            coordinate = 44.2,
+            section_type = :lat,
+            output_path = "outputs/test_hydro_sec.png"
+        )
+        @test isfile("outputs/test_hydro_sec.png")
+
+        fig_h_ts = plot_hydrodynamic_timeseries(
+            nothing,
+            station = (-63.0, 44.0),
+            variable = :temperature,
+            output_path = "outputs/test_hydro_ts.png"
+        )
+        @test isfile("outputs/test_hydro_ts.png")
+
+        fig_h_fld = plot_hydrodynamic_field(
+            nothing,
+            :stratification,
+            depth = -20.0,
+            output_path = "outputs/test_hydro_fld.png"
+        )
+        @test isfile("outputs/test_hydro_fld.png")
+
+        # Test hydrodynamic dataset extraction with depth and time resolution
+        hydro_ds = extract_hydrodynamic_dataset(
+            nothing,
+            depth = -25.0,
+            time_seconds = 3600.0
+        )
         @test length(hydro_ds.lons) > 0
         @test length(hydro_ds.lats) > 0
+        @test length(hydro_ds.depths) > 0
         @test size(hydro_ds.u, 1) == length(hydro_ds.lons)
         @test size(hydro_ds.temperature, 2) == length(hydro_ds.lats)
         @test size(hydro_ds.salinity, 1) == length(hydro_ds.lons)
+        @test hasproperty(hydro_ds, :stratification)
+        @test hasproperty(hydro_ds, :diffusion)
+        @test hasproperty(hydro_ds, :viscosity)
+        @test hasproperty(hydro_ds, :richardson_number)
+        @test hasproperty(hydro_ds, :vorticity)
+        @test hasproperty(hydro_ds, :density)
+        @test hasproperty(hydro_ds, :resolved_depth)
+        @test hasproperty(hydro_ds, :resolved_time)
     end
 
     @testset "12. Architecture & Device Resolution" begin
@@ -464,11 +530,21 @@ using ParticleTracking
         @test occursin("layer-hydro-temp", content)
         @test occursin("layer-hydro-sal", content)
         @test occursin("layer-hydro-speed", content)
+        @test occursin("layer-hydro-strat", content)
+        @test occursin("layer-hydro-diff", content)
         @test occursin("layer-hydro-eta", content)
         @test occursin("layer-hydro-w", content)
         @test occursin("layer-hydro-bathy", content)
+        @test occursin("hydro-depth-select", content)
+        @test occursin("depth_levels", content)
         @test occursin("legend-dock", content)
         @test occursin("hydro-opacity-slider", content)
+
+        # Test multiple-dispatch overload signature: export_interactive_tracks_html(trajectories, path)
+        html_dispatch = "outputs/test_interactive_dispatch.html"
+        res_dispatch = export_interactive_tracks_html(trajs, html_dispatch)
+        @test isfile(html_dispatch)
+        @test res_dispatch == html_dispatch
     end
 
     @testset "14. DuckDB Storage, Multi-Scenario Querying & Ensemble Model Averaging" begin
@@ -870,6 +946,234 @@ using ParticleTracking
         )
         @test length(larvae_buf.lon) == 300
         @test count(p -> is_point_on_land(larvae_buf.lon[p], larvae_buf.lat[p]), 1:300) == 0
+    end
+
+    @testset "17. Enhanced Physical & Biophysical Processes" begin
+        # -------------------------------------------------------------
+        # 1. Air-Sea Surface Heat Flux (Q_net)
+        # -------------------------------------------------------------
+        base_grid = build_shelf_grid(
+            lon_range = (-65.0, -60.0),
+            lat_range = (43.0, 46.0),
+            z_range = (-500.0, 0.0),
+            grid_size = (10, 10, 5)
+        )
+        immersed = build_immersed_grid_from_real_data(base_grid, "inputs/test_bathy.nc")
+
+        # Test scalar summer warming flux (50 W/m²)
+        model_flux = build_hydrodynamic_model(
+            immersed,
+            surface_heat_flux = 50.0,
+            coriolis_latitude = 44.5
+        )
+        @test haskey(model_flux.tracers, :T)
+        rho0_cp = 1025.0 * 3990.0
+        expected_flux = -50.0 / rho0_cp
+        @test model_flux.tracers.T.boundary_conditions.top.condition ≈ expected_flux
+
+        # Test function-based heat flux
+        fn_flux(x, y, t) = 60.0
+        model_fn = build_hydrodynamic_model(
+            immersed,
+            surface_heat_flux = fn_flux,
+            coriolis_latitude = 44.5
+        )
+        cond_top = model_fn.tracers.T.boundary_conditions.top.condition
+        fn_top = hasproperty(cond_top, :func) ? cond_top.func : cond_top
+        @test (cond_top isa Function) || hasproperty(cond_top, :func)
+        @test fn_top(0.0, 0.0, 0.0) ≈ -60.0 / rho0_cp
+
+        # -------------------------------------------------------------
+        # 2. Logarithmic Bottom Boundary Layer (BBL) Velocity Shear
+        # -------------------------------------------------------------
+        z_bed = -100.0
+        h_bbl = 10.0
+        z0 = 0.001
+
+        # Free stream outside BBL (z - z_bed >= h_bbl)
+        @test bbl_velocity_factor(-90.0, z_bed, h_bbl = h_bbl, z0 = z0) == 1.0
+        @test bbl_velocity_factor(-50.0, z_bed, h_bbl = h_bbl, z0 = z0) == 1.0
+
+        # Boundary at roughness height or below
+        @test bbl_velocity_factor(z_bed, z_bed, h_bbl = h_bbl, z0 = z0) == 0.0
+        @test bbl_velocity_factor(z_bed + 0.0005, z_bed, h_bbl = h_bbl, z0 = z0) == 0.0
+
+        # Monotonicity within BBL
+        f_mid_high = bbl_velocity_factor(z_bed + 5.0, z_bed, h_bbl = h_bbl, z0 = z0)
+        f_mid_low  = bbl_velocity_factor(z_bed + 1.0, z_bed, h_bbl = h_bbl, z0 = z0)
+        @test 0.0 < f_mid_low < f_mid_high < 1.0
+
+        # Law of the wall exact logarithmic test
+        expected_f = log(5.0 / z0) / log(h_bbl / z0)
+        @test isapprox(f_mid_high, expected_f, atol = 1e-12)
+
+        # -------------------------------------------------------------
+        # 3. Larval Passive Gravitational Sinking
+        # -------------------------------------------------------------
+        w_sink_z1 = larval_passive_sinking_velocity(:zoea1)
+        w_sink_z2 = larval_passive_sinking_velocity(:zoea2)
+        w_sink_meg = larval_passive_sinking_velocity(:megalopa)
+        w_sink_set = larval_passive_sinking_velocity(:instar1_settled)
+
+        @test w_sink_z1 ≈ -0.0005
+        @test w_sink_z2 ≈ -0.0010
+        @test w_sink_meg ≈ -0.0025
+        @test w_sink_set == 0.0
+
+        # Megalopa sinks faster than Zoea II, which sinks faster than Zoea I
+        @test abs(w_sink_meg) > abs(w_sink_z2) > abs(w_sink_z1)
+
+        # Transport step with passive sinking in quiescent water (u=v=w=0)
+        rng_det = MersenneTwister(42)
+        step_sink = larval_transport_step(
+            -63.0, 44.0, -30.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 100.0,
+            t = 0.0,
+            stage = :megalopa,
+            z_bottom = -100.0,
+            enable_sinking = true,
+            megalopa_sink = -0.0025,
+            rng = rng_det
+        )
+        @test step_sink[3] < -30.0
+
+        # -------------------------------------------------------------
+        # 4. Multi-Constituent Spring-Neap Tidal Superposition (M2 + S2)
+        # -------------------------------------------------------------
+        # Spring tide (t = 0 s, in-phase constructive interference)
+        u_spr, v_spr = superpose_tidal_velocity(
+            0.0, 0.0, 0.0,
+            constituents = [:M2, :S2],
+            u_amplitudes = Dict(:M2 => 0.25, :S2 => 0.11),
+            v_amplitudes = Dict(:M2 => 0.12, :S2 => 0.05)
+        )
+        @test isapprox(u_spr, 0.36, atol = 1e-4)
+
+        # Neap tide (out-of-phase destructive interference)
+        u_neap, _ = superpose_tidal_velocity(
+            0.0, 0.0, 0.0,
+            constituents = [:M2, :S2],
+            u_amplitudes = Dict(:M2 => 0.25, :S2 => 0.11),
+            v_amplitudes = Dict(:M2 => 0.12, :S2 => 0.05),
+            phases = Dict(:M2 => 0.0, :S2 => Float64(π))
+        )
+        @test isapprox(u_neap, 0.25 - 0.11, atol = 1e-4)
+        @test abs(u_spr) > abs(u_neap)
+
+        # Multi-constituent body forcing with drag compensation
+        tf_mn = build_tidal_body_forcing(
+            constituents = [:M2, :S2],
+            u_amplitudes = Dict(:M2 => 0.25, :S2 => 0.11),
+            bottom_drag = 1e-4
+        )
+        @test haskey(tf_mn, :u)
+        @test haskey(tf_mn, :v)
+        @test tf_mn.u(0.0, 0.0, 0.0, 0.0) > 0.0
+
+        # -------------------------------------------------------------
+        # 5. Context-Dependent DVM Enhancements
+        # -------------------------------------------------------------
+        w_dvm_clear = diel_vertical_migration_velocity(
+            -20.0, 0.0;
+            stage = :zoea1,
+            turbidity_attenuation = 1.0
+        )
+        w_dvm_turb = diel_vertical_migration_velocity(
+            -20.0, 0.0;
+            stage = :zoea1,
+            turbidity_attenuation = 0.0
+        )
+        @test w_dvm_clear < 0.0
+        @test w_dvm_turb < 0.0
+        @test abs(w_dvm_clear) > abs(w_dvm_turb)
+
+        # Zoea II empirical niche test: day -55m, night -8m
+        w_z2_noon = diel_vertical_migration_velocity(-20.0, 0.0; stage = :zoea2)
+        w_z2_midn = diel_vertical_migration_velocity(-40.0, 43200.0; stage = :zoea2)
+        @test w_z2_noon < 0.0
+        @test w_z2_midn > 0.0
+
+        # Cold Intermediate Layer (CIL) thermocline constraint
+        w_cil_free = diel_vertical_migration_velocity(-20.0, 0.0; stage = :zoea1)
+        w_cil_bound = diel_vertical_migration_velocity(
+            -20.0, 0.0;
+            stage = :zoea1,
+            cil_depth = -30.0
+        )
+        @test abs(w_cil_bound) < abs(w_cil_free)
+
+        # -------------------------------------------------------------
+        # 6. Diffusive Pseudo-Drift Correction (Visser 1997)
+        # -------------------------------------------------------------
+        dt_test = 50.0
+        d_kv_dz = 0.002
+        step_drift = larval_transport_step(
+            -63.0, 44.0, -40.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, dt_test,
+            t = 0.0,
+            stage = :instar1_settled,
+            z_bottom = -100.0,
+            κ_v_gradient = d_kv_dz,
+            rng = MersenneTwister(42)
+        )
+        @test step_drift[3] == -100.0
+
+        rng_zero = MersenneTwister(123)
+        step_pelagic = larval_transport_step(
+            -63.0, 44.0, -50.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, dt_test,
+            t = 0.0,
+            stage = :zoea1,
+            z_bottom = -200.0,
+            enable_sinking = false,
+            κ_v_gradient = d_kv_dz,
+            rng = rng_zero
+        )
+        expected_drift = d_kv_dz * dt_test
+        @test isapprox(step_pelagic[3] - (-50.0), expected_drift, atol = 0.01)
+
+        # -------------------------------------------------------------
+        # 7. Stage-Specific Mortality & Demographic Recruitment Connectivity
+        # -------------------------------------------------------------
+        m_z1 = larval_thermal_mortality_rate(4.0, base_mortality = 0.02 * 1.1)
+        m_z2 = larval_thermal_mortality_rate(4.0, base_mortality = 0.02 * 1.0)
+        m_meg = larval_thermal_mortality_rate(4.0, base_mortality = 0.02 * 0.8)
+        @test m_z1 > m_z2 > m_meg
+
+        m_cold = larval_thermal_mortality_rate(-2.0)
+        m_norm = larval_thermal_mortality_rate(2.0)
+        @test m_cold > m_norm
+
+        m_hot = larval_thermal_mortality_rate(12.0)
+        @test m_hot > m_norm
+
+        rng_cohort = MersenneTwister(42)
+        test_larvae = initialize_larval_particles(10, rng = rng_cohort)
+        test_trajs = track_larval_cohort(
+            test_larvae,
+            velocity_fn = (x, y, z, t) -> (0.04, 0.02, 0.0),
+            temperature_fn = (x, y, z, t) -> 4.0,
+            bathymetry_fn = (x, y) -> -120.0,
+            total_duration = 3600.0 * 4,
+            dt = 600.0,
+            enable_bbl = true,
+            enable_sinking = true,
+            rng = rng_cohort
+        )
+        canon = canonicalize_trajectories(test_trajs)
+        @test haskey(canon, :survival_probability)
+        @test haskey(canon, :stage_survival)
+        @test size(canon.survival_probability) == (10, 25)
+        @test all(canon.survival_probability .<= 1.0)
+        @test all(canon.survival_probability .>= 0.0)
+
+        conn_demo = compute_empirical_connectivity(canon)
+        @test size(conn_demo.matrix, 1) == length(conn_demo.strata_names)
+        @test all(conn_demo.matrix .>= 0.0)
+        @test all(conn_demo.matrix .<= 1.0)
     end
 
 end

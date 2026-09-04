@@ -17,11 +17,21 @@ using Dates
 using Statistics
 using LinearAlgebra
 
+# Global session cache mapping canonical database paths to active DuckDB instances
+const _DUCKDB_SESSION_CACHE = Dict{String, DuckDB.DB}()
+
+const _DUCKDB_CACHE_LOCK = ReentrantLock()
+
+
+
+
 """
     open_duckdb_storage(
         db_path::AbstractString = joinpath("outputs", "particle_tracking.duckdb");
-        read_only::Bool = false
-    ) -> DuckDB.DB
+        read_only::Bool = false,
+        max_retries::Int = 5,
+        retry_delay::Real = 0.5
+    )::DuckDB.DB
 
 Open a connection to a DuckDB database file for particle tracking storage
 and analytics. Automatically creates parent directories if needed.
@@ -33,6 +43,19 @@ and analytics. Automatically creates parent directories if needed.
 # Outputs
 - `DuckDB.DB`: Active DuckDB database connection object.
 
+Open a connection to an embedded DuckDB database, maintaining a process-wide session
+cache so multiple pipeline stages (e.g. Segments 5, 6, 7, 8) share the same underlying
+database instance without triggering Windows multi-instance file lock conflicts.
+
+# Inputs
+- `db_path::AbstractString`: Path to the DuckDB database file.
+- `read_only::Bool`: Whether to open the database in read-only mode.
+- `max_retries::Int`: Maximum number of retries under transient file lock contention.
+- `retry_delay::Real`: Seconds to wait between retries.
+
+# Outputs
+- `DuckDB.DB`: Active DuckDB database connection object.
+
 # References
 - Raasveldt, M., & Mühleisen, H. (2019). DuckDB: an embeddable analytical
   database. *Proceedings of the 2019 International Conference on Management
@@ -40,26 +63,113 @@ and analytics. Automatically creates parent directories if needed.
 """
 function open_duckdb_storage(
     db_path::AbstractString = joinpath("outputs", "particle_tracking.duckdb");
-    read_only::Bool = false
-)
-    mkpath(dirname(abspath(db_path)))
-    db = DuckDB.DB(db_path; readonly = read_only)
-    if !read_only
-        initialize_duckdb_schema!(db)
+    read_only::Bool = false,
+    max_retries::Int = 5,
+    retry_delay::Real = 0.5
+)::DuckDB.DB
+
+    canon_path = abspath(db_path)
+    mkpath(dirname(canon_path))
+
+    lock(_DUCKDB_CACHE_LOCK) do
+        # 1. Reuse existing active database instance within this process if available
+        if haskey(_DUCKDB_SESSION_CACHE, canon_path)
+            cached_db = _DUCKDB_SESSION_CACHE[canon_path]
+            if isfile(canon_path)
+                try
+                    DBInterface.execute(cached_db, "SELECT 1;")
+                    return cached_db
+                catch
+                end
+            end
+            delete!(_DUCKDB_SESSION_CACHE, canon_path)
+        end
+
+        # 2. Open new database instance with retry loop for transient locks
+        db = nothing
+        for attempt in 1:max_retries
+            try
+                db = DuckDB.DB(canon_path; readonly = read_only)
+                break
+            catch err
+                err_msg = sprint(showerror, err)
+                is_locked = occursin("used by another process", err_msg) ||
+                            occursin("Cannot open file", err_msg)
+                if is_locked && attempt < max_retries
+                    sleep(Float64(retry_delay))
+                else
+                    rethrow(err)
+                end
+            end
+        end
+
+        if !isnothing(db)
+            _DUCKDB_SESSION_CACHE[canon_path] = db
+            if !read_only
+                initialize_duckdb_schema!(db)
+            end
+        end
+        return db
     end
-    return db
 end
 
 """
-    close_duckdb_storage(db::DuckDB.DB)
+    close_duckdb_storage(db::DuckDB.DB; force::Bool = false)
 
-Explicitly close the DuckDB database connection.
+Close the DuckDB database connection. Flushes pending write-ahead log (WAL) data
+via `CHECKPOINT;`. When `force = false` (default), the instance is kept in the
+process session cache so subsequent pipeline stages can access it without Windows
+file lock conflicts. Pass `force = true` to evict from cache and close the handle.
 
 # Inputs
 - `db::DuckDB.DB`: Database connection to close.
+- `force::Bool`: Whether to forcefully close and evict from cache.
 """
-function close_duckdb_storage(db::DuckDB.DB)
-    DuckDB.close(db)
+function close_duckdb_storage(db::DuckDB.DB; force::Bool = false)
+    try
+        DBInterface.execute(db, "CHECKPOINT;")
+    catch
+    end
+
+    if !force
+        return nothing
+    end
+
+    lock(_DUCKDB_CACHE_LOCK) do
+        for (path, cached_db) in _DUCKDB_SESSION_CACHE
+            if cached_db === db
+                delete!(_DUCKDB_SESSION_CACHE, path)
+                break
+            end
+        end
+    end
+
+    try
+        DuckDB.close(db)
+    catch
+    end
+    GC.gc()
+    return nothing
+end
+
+"""
+    close_all_duckdb_storage!()
+
+Explicitly checkpoint, close, and evict all active DuckDB database instances
+held in the process session cache.
+"""
+function close_all_duckdb_storage!()
+    lock(_DUCKDB_CACHE_LOCK) do
+        for (path, db) in _DUCKDB_SESSION_CACHE
+            try
+                DBInterface.execute(db, "CHECKPOINT;")
+                DuckDB.close(db)
+            catch
+            end
+        end
+        empty!(_DUCKDB_SESSION_CACHE)
+    end
+    GC.gc()
     return nothing
 end
 
@@ -218,7 +328,7 @@ end
         gridded_dispersal::Union{Nothing, NamedTuple} = nothing,
         config::Union{Nothing, AbstractDict, AbstractString} = nothing,
         notes::AbstractString = ""
-    ) -> String
+    )::String
 
 Archive a complete simulation run including parameter metadata, full configuration dictionary,
 4D particle trajectory time series, recruitment metrics, demographic connectivity matrix,
@@ -248,13 +358,17 @@ function save_simulation_run!(
     gridded_dispersal::Union{Nothing, NamedTuple} = nothing,
     config::Union{Nothing, AbstractDict, AbstractString} = nothing,
     notes::AbstractString = ""
-)
+)::String
+
+    # Canonicalize trajectories immediately to guarantee uniform 2D/1D shapes, Symbols, and complete fields
+    canonical_trajs = canonicalize_trajectories(trajectories)
+
     # Extract metadata properties safely
     scenario = string(hasproperty(opts, :scenario) ? opts.scenario : :baseline)
     proj_year = Int(hasproperty(opts, :projection_year) ? opts.projection_year : 2050)
-    n_parts = Int(hasproperty(opts, :n_particles) ? opts.n_particles : size(trajectories.lons, 1))
-    duration = Float64(hasproperty(opts, :track_duration) ? opts.track_duration : (trajectories.times[end] - trajectories.times[1]))
-    dt_val = Float64(hasproperty(opts, :track_dt) ? opts.track_dt : (length(trajectories.times) > 1 ? trajectories.times[2] - trajectories.times[1] : 300.0))
+    n_parts = Int(hasproperty(opts, :n_particles) ? opts.n_particles : size(canonical_trajs.lons, 1))
+    duration = Float64(hasproperty(opts, :track_duration) ? opts.track_duration : (canonical_trajs.times[end] - canonical_trajs.times[1]))
+    dt_val = Float64(hasproperty(opts, :track_dt) ? opts.track_dt : (length(canonical_trajs.times) > 1 ? canonical_trajs.times[2] - canonical_trajs.times[1] : 300.0))
     tides = Bool(hasproperty(opts, :enable_tides) ? opts.enable_tides : false)
     dvm = Bool(hasproperty(opts, :enable_dvm) ? opts.enable_dvm : true)
     molt = Bool(hasproperty(opts, :enable_molting) ? opts.enable_molting : true)
@@ -311,7 +425,7 @@ function save_simulation_run!(
     )
 
     # 2. Insert particle trajectories via DataFrame batch append for high speed
-    n_p, n_t = size(trajectories.lons)
+    n_p, n_t = size(canonical_trajs.lons)
     total_rows = n_p * n_t
 
     df_run_id = fill(String(run_id), total_rows)
@@ -328,53 +442,23 @@ function save_simulation_run!(
     df_alive = Vector{Bool}(undef, total_rows)
     df_settle = Vector{String}(undef, total_rows)
 
-    # Normalize trajectory fields to canonical types before accessing them.
-    # Symbols and Strings may be mixed depending on how cohort was built.
-    _sym(x) = Symbol(lowercase(string(x)))
-
-    has_temp  = hasproperty(trajectories, :temperatures) &&
-                !isnothing(trajectories.temperatures)
-    has_dd_ts = hasproperty(trajectories, :degree_days_timeseries) &&
-                !isnothing(trajectories.degree_days_timeseries)
-    has_surv  = hasproperty(trajectories, :survival_probability) &&
-                !isnothing(trajectories.survival_probability)
-
-    # Resolve degree_days to 2D (n_p, n_t) matrix for uniform indexing.
-    dd_matrix = if has_dd_ts && ndims(trajectories.degree_days_timeseries) == 2
-        Float64.(trajectories.degree_days_timeseries)
-    elseif hasproperty(trajectories, :degree_days)
-        dd_raw = trajectories.degree_days
-        if ndims(dd_raw) == 2 && size(dd_raw) == (n_p, n_t)
-            Float64.(dd_raw)
-        elseif length(dd_raw) == n_p
-            # Broadcast scalar-per-particle to full time series
-            repeat(reshape(Float64.(dd_raw), n_p, 1), 1, n_t)
-        else
-            fill(NaN, n_p, n_t)
-        end
-    else
-        fill(NaN, n_p, n_t)
-    end
-
     idx = 1
     for p in 1:n_p
-        p_id     = hasproperty(trajectories, :ids) ? trajectories.ids[p] : p
-        p_alive  = hasproperty(trajectories, :alive) ? trajectories.alive[p] : true
-        p_settle = hasproperty(trajectories, :settlement_status) ?
-                   lowercase(string(trajectories.settlement_status[p])) : "pelagic"
+        p_id     = canonical_trajs.ids[p]
+        p_alive  = canonical_trajs.alive[p]
+        p_settle = string(canonical_trajs.settlement_status[p])
 
         for s in 1:n_t
-            df_p_id[idx] = p_id
-            df_step[idx] = s
-            df_time[idx] = Float64(trajectories.times[s])
-            df_lon[idx]  = Float64(trajectories.lons[p, s])
-            df_lat[idx]  = Float64(trajectories.lats[p, s])
-            df_depth[idx]  = Float64(trajectories.depths[p, s])
-            df_temp[idx]   = has_temp ? Float64(trajectories.temperatures[p, s]) : 4.0
-            df_dd[idx]     = Float64(dd_matrix[p, s])
-            df_surv[idx]   = has_surv ? Float64(trajectories.survival_probability[p, s]) :
-                             (p_alive ? 1.0 : 0.0)
-            df_stage[idx]  = lowercase(string(trajectories.stages[p, s]))
+            df_p_id[idx]   = p_id
+            df_step[idx]   = s
+            df_time[idx]   = canonical_trajs.times[s]
+            df_lon[idx]    = canonical_trajs.lons[p, s]
+            df_lat[idx]    = canonical_trajs.lats[p, s]
+            df_depth[idx]  = canonical_trajs.depths[p, s]
+            df_temp[idx]   = canonical_trajs.temperatures[p, s]
+            df_dd[idx]     = canonical_trajs.degree_days_timeseries[p, s]
+            df_surv[idx]   = canonical_trajs.survival_probability[p, s]
+            df_stage[idx]  = string(canonical_trajs.stages[p, s])
             df_alive[idx]  = p_alive
             df_settle[idx] = p_settle
             idx += 1
@@ -405,31 +489,28 @@ function save_simulation_run!(
     r_earth = 6371.0 # Earth radius in km
     displacements = [
         r_earth * acos(clamp(
-            sind(trajectories.lats[p, 1]) * sind(trajectories.lats[p, end]) +
-            cosd(trajectories.lats[p, 1]) * cosd(trajectories.lats[p, end]) * cosd(trajectories.lons[p, end] - trajectories.lons[p, 1]),
+            sind(canonical_trajs.lats[p, 1]) * sind(canonical_trajs.lats[p, end]) +
+            cosd(canonical_trajs.lats[p, 1]) * cosd(canonical_trajs.lats[p, end]) *
+            cosd(canonical_trajs.lons[p, end] - canonical_trajs.lons[p, 1]),
             -1.0, 1.0
         ))
         for p in 1:n_p
     ]
-    mean_disp = mean(displacements)
+    mean_disp = safe_mean(displacements; default = 0.0)
 
-    tot_settled_succ  = count(x -> lowercase(string(x)) == "settled_successful",
-                              trajectories.settlement_status)
-    tot_settled_unsuit = count(x -> lowercase(string(x)) == "settled_unsuitable",
-                               trajectories.settlement_status)
-    tot_dead    = count(x -> lowercase(string(x)) == "dead",
-                        trajectories.stages[:, end])
-    tot_pelagic = n_p - tot_settled_succ - tot_settled_unsuit - tot_dead
-    succ_rate   = n_p > 0 ? (tot_settled_succ / n_p) : 0.0
+    tot_settled_succ   = count(==( :settled_successful ), canonical_trajs.settlement_status)
+    tot_settled_unsuit = count(==( :settled_unsuitable ), canonical_trajs.settlement_status)
+    tot_dead           = count(==( :dead ), canonical_trajs.stages[:, end])
+    tot_pelagic        = max(0, n_p - tot_settled_succ - tot_settled_unsuit - tot_dead)
+    succ_rate          = n_p > 0 ? (tot_settled_succ / n_p) : 0.0
 
-    # Safe mean PLD: mean([]) throws; guard with isempty check.
-    ages_valid = hasproperty(trajectories, :settlement_age) ?
-                 [age / 86400.0 for age in trajectories.settlement_age
-                  if age < duration] : Float64[]
-    mean_pld = isempty(ages_valid) ? (duration / 86400.0) : mean(ages_valid)
+    # Safe mean PLD: guard against empty settlement set to prevent ArgumentError
+    ages_valid = hasproperty(canonical_trajs, :settlement_age) ?
+                 [age for age in canonical_trajs.settlement_age if age < duration] : Float64[]
+    mean_pld   = isempty(ages_valid) ? (duration / 86400.0) : (safe_mean(ages_valid) / 86400.0)
 
-    mean_dd = mean(trajectories.degree_days)
-    mean_t = has_temp ? mean(trajectories.temperatures) : 4.0
+    mean_dd = safe_mean(canonical_trajs.degree_days; default = 0.0)
+    mean_t  = safe_mean(canonical_trajs.temperatures; default = 4.0)
 
     stmt_rec = DBInterface.prepare(db, """
         INSERT INTO recruitment_metrics (
@@ -543,7 +624,7 @@ end
         db::DuckDB.DB;
         scenario::Union{Nothing, AbstractString, Symbol} = nothing,
         projection_year::Union{Nothing, Int} = nothing
-    ) -> DataFrame
+    )::DataFrame
 
 Query and return a summary `DataFrame` of all simulation runs archived in DuckDB,
 with optional filtering by climate scenario or projection year.
@@ -560,7 +641,8 @@ function list_simulation_runs(
     db::DuckDB.DB;
     scenario::Union{Nothing, AbstractString, Symbol} = nothing,
     projection_year::Union{Nothing, Int} = nothing
-)
+)::DataFrame
+
     query = """
         SELECT
             r.run_id,
@@ -601,7 +683,7 @@ end
         stage::Union{Nothing, Symbol, AbstractString} = nothing,
         time_range::Union{Nothing, Tuple{Real, Real}} = nothing,
         max_particles::Union{Nothing, Int} = nothing
-    ) -> DataFrame
+    )::DataFrame
 
 Retrieve particle trajectory records from DuckDB as a `DataFrame` with flexible
 spatial, temporal, developmental stage, and particle ID filtering.
@@ -624,30 +706,39 @@ function load_trajectories_df(
     stage::Union{Nothing, Symbol, AbstractString} = nothing,
     time_range::Union{Nothing, Tuple{Real, Real}} = nothing,
     max_particles::Union{Nothing, Int} = nothing
-)
+)::DataFrame
+
     query = """
         SELECT
             run_id, particle_id, step, time_seconds,
             lon, lat, depth, temperature, degree_days,
             survival_probability, stage, alive, settlement_status
         FROM particle_trajectories
-        WHERE run_id = '$(run_id)'
+        WHERE run_id = ?
     """
+    params = Any[String(run_id)]
+
     if !isnothing(particle_ids) && !isempty(particle_ids)
-        id_list = join(particle_ids, ", ")
-        query *= " AND particle_id IN ($(id_list))"
+        placeholders = join(fill("?", length(particle_ids)), ", ")
+        query *= " AND particle_id IN ($(placeholders))"
+        append!(params, particle_ids)
     elseif !isnothing(max_particles) && max_particles > 0
-        query *= " AND particle_id <= $(max_particles)"
+        query *= " AND particle_id <= ?"
+        push!(params, max_particles)
     end
     if !isnothing(stage)
-        query *= " AND stage = '$(string(stage))'"
+        query *= " AND stage = ?"
+        push!(params, string(stage))
     end
     if !isnothing(time_range)
-        query *= " AND time_seconds BETWEEN $(time_range[1]) AND $(time_range[2])"
+        query *= " AND time_seconds BETWEEN ? AND ?"
+        push!(params, Float64(time_range[1]))
+        push!(params, Float64(time_range[2]))
     end
     query *= " ORDER BY particle_id, step;"
 
-    return DataFrame(DBInterface.execute(db, query))
+    stmt = DBInterface.prepare(db, query)
+    return DataFrame(DBInterface.execute(stmt, params))
 end
 
 """
@@ -655,7 +746,7 @@ end
         db::DuckDB.DB,
         run_id::AbstractString;
         max_particles::Union{Nothing, Int} = nothing
-    ) -> NamedTuple
+    )::NamedTuple
 
 Retrieve Lagrangian particle tracking output from DuckDB and reconstruct the
 complete `NamedTuple` structure with fields `(lons, lats, depths, temperatures,
@@ -674,21 +765,25 @@ function load_trajectories_namedtuple(
     db::DuckDB.DB,
     run_id::AbstractString;
     max_particles::Union{Nothing, Int} = nothing
-)
+)::NamedTuple
+
     query = """
         SELECT
             particle_id, step, time_seconds,
             lon, lat, depth, temperature, degree_days,
             survival_probability, stage, alive, settlement_status
         FROM particle_trajectories
-        WHERE run_id = '$(run_id)'
+        WHERE run_id = ?
     """
+    params = Any[String(run_id)]
     if !isnothing(max_particles) && max_particles > 0
-        query *= " AND particle_id <= $(max_particles)"
+        query *= " AND particle_id <= ?"
+        push!(params, max_particles)
     end
     query *= " ORDER BY particle_id, step;"
 
-    df = DataFrame(DBInterface.execute(db, query))
+    stmt = DBInterface.prepare(db, query)
+    df = DataFrame(DBInterface.execute(stmt, params))
     if nrow(df) == 0
         error("No trajectory records found in DuckDB for run_id: '$(run_id)'")
     end
@@ -752,7 +847,7 @@ end
     load_all_scenario_trajectories(
         db::DuckDB.DB;
         projection_year::Union{Nothing, Int} = nothing
-    ) -> Dict{Symbol, NamedTuple}
+    )::Dict{Symbol, NamedTuple}
 
 Load trajectories for all distinct climate scenarios present in DuckDB.
 
@@ -766,7 +861,8 @@ Load trajectories for all distinct climate scenarios present in DuckDB.
 function load_all_scenario_trajectories(
     db::DuckDB.DB;
     projection_year::Union{Nothing, Int} = nothing
-)
+)::Dict{Symbol, NamedTuple}
+
     runs_df = list_simulation_runs(db; projection_year = projection_year)
     if nrow(runs_df) == 0
         return Dict{Symbol, NamedTuple}()
@@ -790,7 +886,7 @@ end
     load_connectivity_matrix(
         db::DuckDB.DB,
         run_id::AbstractString
-    ) -> NamedTuple
+    )::NamedTuple
 
 Retrieve the transition probability connectivity matrix \$P_{ij}\$ and stratum
 names for a designated run from DuckDB.
@@ -805,7 +901,8 @@ names for a designated run from DuckDB.
 function load_connectivity_matrix(
     db::DuckDB.DB,
     run_id::AbstractString
-)
+)::NamedTuple
+
     query = """
         SELECT source_stratum, destination_stratum, particle_count, transition_probability
         FROM connectivity_transitions
@@ -845,7 +942,7 @@ end
         db::DuckDB.DB;
         scenario_names::Union{Nothing, AbstractVector{<:AbstractString}} = nothing,
         projection_years::Union{Nothing, AbstractVector{Int}} = nothing
-    ) -> DataFrame
+    )::DataFrame
 
 Perform comparative aggregation across archived simulation runs, evaluating
 changes in recruitment success, pelagic larval duration (PLD), thermal mortality,
@@ -870,7 +967,8 @@ function compare_scenarios(
     db::DuckDB.DB;
     scenario_names::Union{Nothing, AbstractVector{<:AbstractString}} = nothing,
     projection_years::Union{Nothing, AbstractVector{Int}} = nothing
-)
+)::DataFrame
+
     query = """
         SELECT
             r.scenario,
@@ -909,7 +1007,7 @@ end
         db::DuckDB.DB,
         scenario_names::AbstractVector{<:AbstractString};
         weights::Union{Nothing, AbstractVector{<:Real}} = nothing
-    ) -> NamedTuple
+    )::NamedTuple
 
 Compute weighted ensemble model-averaged connectivity matrices and demographic
 metrics across multiple climate projections or multi-realization ensembles.
@@ -947,7 +1045,8 @@ function compute_ensemble_model_average(
     db::DuckDB.DB,
     scenario_names::AbstractVector{<:AbstractString};
     weights::Union{Nothing, AbstractVector{<:Real}} = nothing
-)
+)::NamedTuple
+
     n_scen = length(scenario_names)
     if n_scen == 0
         error("At least one scenario name must be provided for ensemble averaging.")
@@ -1040,7 +1139,7 @@ end
         salinity::Union{Nothing, AbstractArray{<:Real, 3}} = nothing,
         elevation::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
         time_seconds::Real = 0.0
-    ) -> String
+    )::String
 
 Archive a 3D Eulerian hydrodynamic velocity and tracer snapshot into DuckDB.
 
@@ -1076,7 +1175,8 @@ function save_hydrodynamic_field!(
     salinity::Union{Nothing, AbstractArray{<:Real, 3}} = nothing,
     elevation::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
     time_seconds::Real = 0.0
-)
+)::String
+
     scenario = string(hasproperty(opts, :scenario) ? opts.scenario : :baseline)
     proj_year = Int(hasproperty(opts, :projection_year) ? opts.projection_year : 2050)
 
@@ -1152,7 +1252,7 @@ end
         run_id::AbstractString;
         time_seconds::Union{Nothing, Real} = nothing,
         depth_level::Union{Nothing, Int} = nothing
-    ) -> NamedTuple
+    )::NamedTuple
 
 Retrieve 3D/2D hydrodynamic velocity and tracer field from DuckDB as structured arrays.
 
@@ -1170,7 +1270,8 @@ function load_hydrodynamic_field(
     run_id::AbstractString;
     time_seconds::Union{Nothing, Real} = nothing,
     depth_level::Union{Nothing, Int} = nothing
-)
+)::NamedTuple
+
     query = """
         SELECT
             grid_x, grid_y, depth_level, lon, lat, depth,
@@ -1238,7 +1339,7 @@ end
     load_gridded_dispersal(
         db::DuckDB.DB,
         run_id::AbstractString
-    ) -> NamedTuple
+    )::NamedTuple
 
 Retrieve 2D gridded dispersal, settlement density, empirical advection, and
 turbulent diffusivity fields for a run from DuckDB.
@@ -1254,7 +1355,8 @@ turbulent diffusivity fields for a run from DuckDB.
 function load_gridded_dispersal(
     db::DuckDB.DB,
     run_id::AbstractString
-)
+)::NamedTuple
+
     query = """
         SELECT
             lon, lat, empirical_u, empirical_v, empirical_diffusivity,
@@ -1315,7 +1417,7 @@ end
     export_duckdb_to_parquet(
         db::DuckDB.DB,
         output_dir::AbstractString = joinpath("outputs", "parquet")
-    ) -> Vector{String}
+    )::Vector{String}
 
 Export all relational tables from DuckDB into high-performance Apache Parquet
 files for seamless interoperability with Python, R, and BSTM modeling frameworks.
@@ -1330,7 +1432,8 @@ files for seamless interoperability with Python, R, and BSTM modeling frameworks
 function export_duckdb_to_parquet(
     db::DuckDB.DB,
     output_dir::AbstractString = joinpath("outputs", "parquet")
-)
+)::Vector{String}
+
     mkpath(output_dir)
     tables = [
         "simulation_runs",
@@ -1357,7 +1460,7 @@ function export_duckdb_to_parquet(
 end
 
 """
-    load_run_configuration(db::DuckDB.DB, run_id::AbstractString) -> Dict{String, Any}
+    load_run_configuration(db::DuckDB.DB, run_id::AbstractString)::Dict{String, Any}
 
 Extract and parse the archived TOML configuration dictionary associated with a simulation run.
 
@@ -1369,6 +1472,7 @@ Extract and parse the archived TOML configuration dictionary associated with a s
 - `Dict{String, Any}`: Parsed configuration dictionary.
 """
 function load_run_configuration(db::DuckDB.DB, run_id::AbstractString)::Dict{String, Any}
+
     stmt = DBInterface.prepare(db, "SELECT config_toml FROM simulation_runs WHERE run_id = ?;")
     cursor = DBInterface.execute(stmt, [run_id])
     df = DataFrame(cursor)
@@ -1381,4 +1485,5 @@ function load_run_configuration(db::DuckDB.DB, run_id::AbstractString)::Dict{Str
         @warn "Failed to parse archived configuration for run $(run_id): $(err)"
         return Dict{String, Any}()
     end
+
 end

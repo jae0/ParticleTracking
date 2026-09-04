@@ -58,6 +58,17 @@ function resolve_architecture(
 
     # Check CUDA availability
     cuda_functional = false
+    if !isdefined(Main, :CUDA)
+        try
+            # Attempt to dynamically import CUDA if installed in the environment
+            if Base.find_package("CUDA") !== nothing
+                @eval Main import CUDA
+            end
+        catch err
+            @debug "Dynamic CUDA import skipped: $(err)"
+        end
+    end
+
     try
         if isdefined(Main, :CUDA)
             cuda_functional = Main.CUDA.functional()
@@ -70,12 +81,10 @@ function resolve_architecture(
 
     if cuda_functional
         try
-            if isdefined(Main, :CUDA)
-                return Oceananigans.GPU(Main.CUDA.device())
-            elseif isdefined(Oceananigans, :CUDA)
-                return Oceananigans.GPU(Oceananigans.CUDA.device())
-            else
-                return Oceananigans.Architectures.GPU(0)
+            if isdefined(Oceananigans, :GPU)
+                return Oceananigans.GPU()
+            elseif isdefined(Oceananigans.Architectures, :GPU)
+                return Oceananigans.Architectures.GPU()
             end
         catch err
             @warn "Failed to construct Oceananigans.GPU device: $(err)"
@@ -83,7 +92,9 @@ function resolve_architecture(
     end
 
     if fallback_to_cpu
-        @warn "CUDA GPU hardware was requested, but no functional NVIDIA CUDA environment was detected. Falling back to CPU()."
+        @warn "CUDA GPU hardware was requested, but no functional NVIDIA CUDA environment " *
+              "was detected (ensure the CUDA.jl package is installed and NVIDIA drivers " *
+              "are accessible). Falling back to CPU()."
         return CPU()
     else
         error(

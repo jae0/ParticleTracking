@@ -84,12 +84,13 @@ function estimate_empirical_movement(
     v_accum = zeros(Float64, n_lon, n_lat)
     u_sq_accum = zeros(Float64, n_lon, n_lat)
     v_sq_accum = zeros(Float64, n_lon, n_lat)
-    counts = zeros(Int, n_lon, n_lat)
     dt_accum = zeros(Float64, n_lon, n_lat)
-
-    lons = trajectories.lons
-    lats = trajectories.lats
-    times = trajectories.times
+    counts = zeros(Int, n_lon, n_lat)
+    # Canonicalize trajectory dataset to guarantee uniform shapes
+    trajs = canonicalize_trajectories(trajectories)
+    lons = trajs.lons
+    lats = trajs.lats
+    times = trajs.times
 
     n_particles, n_times = size(lons)
     r_earth = 6.371e6
@@ -198,6 +199,9 @@ function compute_gridded_recruitment_metrics(
     lon_bins::AbstractVector{<:Real} = range(-68.0, -57.0, length = 30),
     lat_bins::AbstractVector{<:Real} = range(42.0, 47.0, length = 30)
 )
+    # Canonicalize trajectory dataset to guarantee uniform shapes and Symbols
+    trajs = canonicalize_trajectories(trajectories)
+
     n_lon = length(lon_bins) - 1
     n_lat = length(lat_bins) - 1
 
@@ -210,13 +214,11 @@ function compute_gridded_recruitment_metrics(
     retention_density = zeros(Int, n_lon, n_lat)
     settlement_duration_accum = zeros(Float64, n_lon, n_lat)
 
-    lons = trajectories.lons
-    lats = trajectories.lats
-    times = trajectories.times
-    statuses = trajectories.settlement_status
+    lons = trajs.lons
+    lats = trajs.lats
+    statuses = trajs.settlement_status
     n_particles = size(lons, 1)
-    ages = hasproperty(trajectories, :settlement_age) ?
-           trajectories.settlement_age : fill(times[end], n_particles)
+    ages = trajs.settlement_age
 
     for p in 1:n_particles
         lon_start, lat_start = lons[p, 1], lats[p, 1]
@@ -224,12 +226,18 @@ function compute_gridded_recruitment_metrics(
         stat = statuses[p]
         age_sec = ages[p]
 
-        i_start = searchsortedlast(lon_bins, lon_start)
-        j_start = searchsortedlast(lat_bins, lat_start)
+        if lon_bins[1] <= lon_start <= lon_bins[end] && lat_bins[1] <= lat_start <= lat_bins[end]
+            i_start = clamp(searchsortedlast(lon_bins, lon_start), 1, n_lon)
+            j_start = clamp(searchsortedlast(lat_bins, lat_start), 1, n_lat)
+            release_density[i_start, j_start] += 1
+        else
+            i_start = 0
+            j_start = 0
+        end
 
-        i_end = searchsortedlast(lon_bins, lon_end)
-        j_end = searchsortedlast(lat_bins, lat_end)
-        if 1 <= i_end <= n_lon && 1 <= j_end <= n_lat
+        if lon_bins[1] <= lon_end <= lon_bins[end] && lat_bins[1] <= lat_end <= lat_bins[end]
+            i_end = clamp(searchsortedlast(lon_bins, lon_end), 1, n_lon)
+            j_end = clamp(searchsortedlast(lat_bins, lat_end), 1, n_lat)
             settlement_density[i_end, j_end] += 1
             settlement_duration_accum[i_end, j_end] += (age_sec / 86400.0)
 
@@ -237,7 +245,7 @@ function compute_gridded_recruitment_metrics(
                 successful_settlement_density[i_end, j_end] += 1
             end
 
-            if (i_start == i_end) && (j_start == j_end)
+            if (i_start == i_end) && (j_start == j_end) && (i_start > 0)
                 retention_density[i_end, j_end] += 1
             end
         end
@@ -302,6 +310,8 @@ function compute_gridded_thermal_metrics(
     lon_bins::AbstractVector{<:Real} = range(-68.0, -57.0, length = 30),
     lat_bins::AbstractVector{<:Real} = range(42.0, 47.0, length = 30)
 )
+    # Canonicalize trajectory dataset to guarantee uniform shapes
+    trajs = canonicalize_trajectories(trajectories)
     n_lon = length(lon_bins) - 1
     n_lat = length(lat_bins) - 1
 
@@ -314,19 +324,13 @@ function compute_gridded_thermal_metrics(
     surv_accum = zeros(Float64, n_lon, n_lat)
     counts = zeros(Int, n_lon, n_lat)
 
-    lons = trajectories.lons
-    lats = trajectories.lats
+    lons = trajs.lons
+    lats = trajs.lats
     n_particles, n_times = size(lons)
 
-    temps = hasproperty(trajectories, :temperatures) ?
-            trajectories.temperatures : fill(4.0, n_particles, n_times)
-    dds = hasproperty(trajectories, :degree_days_timeseries) ?
-          trajectories.degree_days_timeseries :
-          (hasproperty(trajectories, :degree_days) && trajectories.degree_days isa AbstractMatrix ?
-           trajectories.degree_days :
-           repeat(hasproperty(trajectories, :degree_days) ? trajectories.degree_days : fill(40.0, n_particles), 1, n_times))
-    survs = hasproperty(trajectories, :survival_probability) ?
-            trajectories.survival_probability : fill(0.95, n_particles, n_times)
+    temps = trajs.temperatures
+    dds = trajs.degree_days_timeseries
+    survs = trajs.survival_probability
 
     for p in 1:n_particles
         for t in 1:n_times
@@ -340,10 +344,9 @@ function compute_gridded_thermal_metrics(
                 continue
             end
 
-            i = searchsortedlast(lon_bins, x)
-            j = searchsortedlast(lat_bins, y)
-
-            if 1 <= i <= n_lon && 1 <= j <= n_lat
+            if lon_bins[1] <= x <= lon_bins[end] && lat_bins[1] <= y <= lat_bins[end]
+                i = clamp(searchsortedlast(lon_bins, x), 1, n_lon)
+                j = clamp(searchsortedlast(lat_bins, y), 1, n_lat)
                 temp_accum[i, j] += temp
                 if temp > temp_max[i, j]
                     temp_max[i, j] = temp
@@ -739,15 +742,14 @@ function compute_empirical_connectivity(
     end
 
     n_strata   = length(strata_names)
-    # Weighted connectivity: each particle contributes its final survival
-    # probability so P_ij reflects effective recruitment flux, not raw counts.
-    has_surv_prob = hasproperty(trajectories, :survival_probability) &&
-                    !isnothing(trajectories.survival_probability)
+    # Canonicalize trajectory dataset to guarantee uniform shapes
+    trajs = canonicalize_trajectories(trajectories)
     counts          = zeros(Float64, n_strata, n_strata)
     counts_unweighted = zeros(Int, n_strata, n_strata)
 
-    lons = trajectories.lons
-    lats = trajectories.lats
+    lons = trajs.lons
+    lats = trajs.lats
+    survs = trajs.survival_probability
     n_particles = size(lons, 1)
 
     for p in 1:n_particles
@@ -758,8 +760,7 @@ function compute_empirical_connectivity(
         idx_dst = classify_fn(lon_end, lat_end)
 
         if 1 <= idx_src <= n_strata && 1 <= idx_dst <= n_strata
-            weight = has_surv_prob ?
-                     Float64(trajectories.survival_probability[p, end]) : 1.0
+            weight = Float64(survs[p, end])
             counts[idx_src, idx_dst]           += weight
             counts_unweighted[idx_src, idx_dst] += 1
         end
@@ -792,12 +793,21 @@ function compute_empirical_connectivity(
         end
     end
 
+    recruitment_connectivity = zeros(Float64, n_strata, n_strata)
+    for i in 1:n_strata
+        n_rel = sum(counts_unweighted[i, :])
+        if n_rel > 0
+            recruitment_connectivity[i, :] .= counts[i, :] ./ n_rel
+        end
+    end
+
     out_matrix = normalize_rows ? trans_prob : Float64.(counts)
 
     return (
         matrix = out_matrix,
-        counts_matrix = counts,                   # survival-probability-weighted
-        counts_unweighted = counts_unweighted,    # raw particle counts
+        counts_matrix = counts,                   # survival-probability-weighted counts
+        counts_unweighted = counts_unweighted,    # raw released particle counts
+        recruitment_connectivity = recruitment_connectivity, # P_ij = Σ(S_survived) / N_released
         strata_names = strata_names,
         self_retention = self_retention,
         export_fraction = export_fraction

@@ -124,20 +124,22 @@ function load_bathymetry_from_netcdf(
         # Detect longitude coordinate variable
         lon_candidates = ["lon", "longitude", "x", "nav_lon"]
         lon_var = findfirst(c -> haskey(ds, c), lon_candidates)
-        lon_coords = if !isnothing(lon_var)
-            collect(Float64, ds[lon_candidates[lon_var]][:])
-        else
-            Float64[]
+        if isnothing(lon_var)
+            available = collect(keys(ds))
+            error("Longitude coordinate variable not found in bathymetry file $(filepath). " *
+                  "Searched candidate names: $(lon_candidates). Available variables: $(available)")
         end
+        lon_coords = collect(Float64, ds[lon_candidates[lon_var]][:])
 
         # Detect latitude coordinate variable
         lat_candidates = ["lat", "latitude", "y", "nav_lat"]
         lat_var = findfirst(c -> haskey(ds, c), lat_candidates)
-        lat_coords = if !isnothing(lat_var)
-            collect(Float64, ds[lat_candidates[lat_var]][:])
-        else
-            Float64[]
+        if isnothing(lat_var)
+            available = collect(keys(ds))
+            error("Latitude coordinate variable not found in bathymetry file $(filepath). " *
+                  "Searched candidate names: $(lat_candidates). Available variables: $(available)")
         end
+        lat_coords = collect(Float64, ds[lat_candidates[lat_var]][:])
 
         # Guarantee elevation layout is (n_lon, n_lat): CF-compliant and ERDDAP
         # files store arrays as (lat, lon) — first dimension is latitude.
@@ -209,6 +211,11 @@ function get_bathymetry_interpolator(
         bathymetry
     end
 
+    if !hasproperty(bathy_data, :lon) || !hasproperty(bathy_data, :lat) || !hasproperty(bathy_data, :elevation)
+        error("Bathymetry data NamedTuple must contain :lon, :lat, and :elevation fields. " *
+              "Received keys: $(keys(bathy_data))")
+    end
+
     lons = Float64.(bathy_data.lon)
     lats = Float64.(bathy_data.lat)
     elev = Float64.(bathy_data.elevation)
@@ -217,7 +224,22 @@ function get_bathymetry_interpolator(
     n_lat = length(lats)
 
     if n_lon < 2 || n_lat < 2
-        error("Bathymetry grid requires >= 2x2 grid points. Found $(n_lon)x$(n_lat).")
+        error("Bathymetry grid requires >= 2x2 grid points. Found $(n_lon) longitudes x $(n_lat) latitudes. " *
+              "Check whether bathymetry coordinates are empty or corrupted.")
+    end
+
+    if size(elev) != (n_lon, n_lat)
+        if size(elev) == (n_lat, n_lon)
+            elev = permutedims(elev, (2, 1))
+        else
+            error("Bathymetry elevation matrix size $(size(elev)) does not match coordinate dimensions " *
+                  "(n_lon=$(n_lon), n_lat=$(n_lat)).")
+        end
+    end
+
+    if !issorted(lons) || !issorted(lats)
+        error("Bathymetry coordinates must be monotonically increasing for spatial interpolation. " *
+              "lons sorted: $(issorted(lons)), lats sorted: $(issorted(lats)).")
     end
 
     return function (lon::Real, lat::Real)
@@ -343,8 +365,9 @@ function buffer_distance_to_degrees(
     km_per_deg_lat = (π * r_earth_km) / 180.0 # ~111.195 km/deg
     dlat = Float64(buffer_km) / km_per_deg_lat
 
+    # Bounded cosine scaling with 85° Web Mercator cutoff to prevent division by near-zero at high latitudes
     cos_lat = cos(deg2rad(clamp(Float64(ref_lat), -85.0, 85.0)))
-    km_per_deg_lon = km_per_deg_lat * max(0.01, cos_lat)
+    km_per_deg_lon = km_per_deg_lat * max(cosd(85.0), cos_lat)
     dlon = Float64(buffer_km) / km_per_deg_lon
 
     return (dlon, dlat)
@@ -1160,5 +1183,48 @@ function build_immersed_grid_from_real_data(
                                      target_lons, target_lats)
 
     return build_immersed_grid(grid, regridded_topo)
+end
+
+"""
+    extract_grid_coordinates(grid) -> NamedTuple
+
+Extract 1D continuous cell-center spatial coordinates `(lons, lats, depths)`
+from an Oceananigans computational grid, supporting both `LatitudeLongitudeGrid`
+and `ImmersedBoundaryGrid`.
+
+# Mathematical Formulation
+Retrieves cell-center spatial nodes \$\\lambda_i = \\text{xnode}(i, \\text{grid}, \\text{Center}())\$,
+\$\\phi_j = \\text{ynode}(j, \\text{grid}, \\text{Center}())\$, and
+\$z_k = \\text{znode}(k, \\text{grid}, \\text{Center}())\$ along each spatial dimension.
+
+# Inputs
+- `grid`: `LatitudeLongitudeGrid` or `ImmersedBoundaryGrid`.
+
+# Outputs
+- `NamedTuple`: `(lons::Vector{Float64}, lats::Vector{Float64}, depths::Vector{Float64})`.
+"""
+function extract_grid_coordinates(grid)
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    nx, ny, nz = base_g.Nx, base_g.Ny, base_g.Nz
+
+    lons = try
+        [Float64(Oceananigans.Grids.xnode(i, base_g, Oceananigans.Grids.Center())) for i in 1:nx]
+    catch
+        collect(Float64, range(base_g.λᶠᵃᵃ[1], base_g.λᶠᵃᵃ[base_g.Nx + 1], length = nx))
+    end
+
+    lats = try
+        [Float64(Oceananigans.Grids.ynode(j, base_g, Oceananigans.Grids.Center())) for j in 1:ny]
+    catch
+        collect(Float64, range(base_g.φᵃᶠᵃ[1], base_g.φᵃᶠᵃ[base_g.Ny + 1], length = ny))
+    end
+
+    depths = try
+        [Float64(Oceananigans.Grids.znode(k, base_g, Oceananigans.Grids.Center())) for k in 1:nz]
+    catch
+        collect(Float64, range(-1000.0, 0.0, length = nz))
+    end
+
+    return (lons = lons, lats = lats, depths = depths)
 end
 

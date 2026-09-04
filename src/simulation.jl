@@ -44,18 +44,22 @@ function compute_advective_cfl(model, Δt::Real)
     # Estimate horizontal grid spacing (in meters)
     base_g = model.grid isa ImmersedBoundaryGrid ? model.grid.underlying_grid : model.grid
     dx_approx = if hasproperty(base_g, :radius)
-        # Spherical grid
+        # Spherical grid: compute minimum zonal spacing at highest absolute latitude
         r_earth = Float64(base_g.radius)
-        dlon_deg = (base_g.λᶠᵃᵃ[base_g.Nx + 1] - base_g.λᶠᵃᵃ[1]) / base_g.Nx
-        lat_mean = 0.5 * (base_g.φᵃᶠᵃ[1] + base_g.φᵃᶠᵃ[base_g.Ny + 1])
-        r_earth * cosd(lat_mean) * deg2rad(dlon_deg)
+        dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
+        lat_max_abs = max(abs(base_g.φᵃᶠᵃ[1]), abs(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
+        r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg)
+    elseif hasproperty(base_g, :Lx)
+        Float64(base_g.Lx) / base_g.Nx
     else
         1000.0
     end
     dy_approx = if hasproperty(base_g, :radius)
         r_earth = Float64(base_g.radius)
-        dlat_deg = (base_g.φᵃᶠᵃ[base_g.Ny + 1] - base_g.φᵃᶠᵃ[1]) / base_g.Ny
+        dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃ[1:base_g.Ny + 1])))
         r_earth * deg2rad(dlat_deg)
+    elseif hasproperty(base_g, :Ly)
+        Float64(base_g.Ly) / base_g.Ny
     else
         1000.0
     end
@@ -299,27 +303,38 @@ function create_flow_interpolator_from_jld2(
     # The file is closed after this block; the closure captures in-memory arrays.
     local lons_vec, lats_vec, deps_vec, t_vec
     local u_arr, v_arr, w_arr, T_arr
+    local has_eta, η_arr
 
     jldopen(jld2_filepath, "r") do file
+        if !haskey(file, "timeseries/u")
+            error("JLD2 file at $(jld2_filepath) is missing required 'timeseries/u' group.")
+        end
+
+        u_group = file["timeseries/u"]
+        u_raw_keys = collect(keys(u_group))
+        if isempty(u_raw_keys)
+            error("JLD2 timeseries group 'timeseries/u' contains no time snapshots in $(jld2_filepath).")
+        end
+
+        # Robust chronological ordering: parse numeric timestamps or iterations
+        sorted_keys = sort(u_raw_keys, by = k -> begin
+            parsed = tryparse(Float64, k)
+            !isnothing(parsed) ? parsed : 0.0
+        end)
+
+        nt = length(sorted_keys)
+
         # Extract time vector
         t_vec = if haskey(file, "timeseries/t")
             collect(Float64, file["timeseries/t"])
         else
-            iters = sort([parse(Int, k)
-                          for k in keys(file["timeseries/u"])
-                          if tryparse(Int, k) !== nothing])
-            if isempty(iters)
-                error("Cannot find time data in JLD2 file: $(jld2_filepath)")
-            end
-            Float64.(iters)
+            [something(tryparse(Float64, k), Float64(idx)) for (idx, k) in enumerate(sorted_keys)]
         end
 
-        # Extract grid coordinate vectors from stored metadata or infer from data shape
-        first_key = string(first(keys(file["timeseries/u"])))
-        sample_u  = file["timeseries/u/$(first_key)"]
+        # Extract grid coordinate vectors from stored metadata or infer from sample
+        sample_u = file["timeseries/u/$(first(sorted_keys))"]
         nx, ny, nz = size(sample_u)
 
-        # Oceananigans stores grid info in the output file
         if haskey(file, "grid")
             g = file["grid"]
             lons_vec = haskey(g, "λᶜᵃᵃ") ? collect(Float64, g["λᶜᵃᵃ"][1:nx]) :
@@ -336,68 +351,120 @@ function create_flow_interpolator_from_jld2(
         end
 
         # Load all time snapshots for each variable into 4D arrays (nx, ny, nz, nt)
-        nt = length(t_vec)
         u_arr = Array{Float64}(undef, nx, ny, nz, nt)
         v_arr = Array{Float64}(undef, nx, ny, nz, nt)
         w_arr = Array{Float64}(undef, nx, ny, nz, nt)
         T_arr = Array{Float64}(undef, nx, ny, nz, nt)
 
-        for (m, key) in enumerate(string.(sort(parse.(Int, keys(file["timeseries/u"])))))
+        has_w   = haskey(file, "timeseries/w")
+        has_T   = haskey(file, "timeseries/T")
+        has_eta = haskey(file, "timeseries/η")
+
+        η_arr = has_eta ? Array{Float64}(undef, nx, ny, nt) : Array{Float64}(undef, 0, 0, 0)
+
+        for (m, key) in enumerate(sorted_keys)
             u_arr[:, :, :, m] = Float64.(file["timeseries/u/$(key)"])
             v_arr[:, :, :, m] = Float64.(file["timeseries/v/$(key)"])
-            w_arr[:, :, :, m] = haskey(file["timeseries"], "w") ?
-                                 Float64.(file["timeseries/w/$(key)"]) : zeros(nx, ny, nz)
-            T_arr[:, :, :, m] = haskey(file["timeseries"], "T") ?
-                                 Float64.(file["timeseries/T/$(key)"]) : fill(4.5, nx, ny, nz)
+            w_arr[:, :, :, m] = has_w ? Float64.(file["timeseries/w/$(key)"]) : zeros(nx, ny, nz)
+            T_arr[:, :, :, m] = has_T ? Float64.(file["timeseries/T/$(key)"]) : fill(4.5, nx, ny, nz)
+            if has_eta
+                η_arr[:, :, m] = Float64.(file["timeseries/η/$(key)"])
+            end
         end
     end
 
     nx, ny, nz, nt = size(u_arr)
 
     function flow_interpolator(lon::Real, lat::Real, z::Real, t::Real)
-        # Find spatial indices via binary search
+        # Find spatial indices via binary search with boundary-safe clamping
         i_f = searchsortedlast(lons_vec, Float64(lon))
         j_f = searchsortedlast(lats_vec, Float64(lat))
         k_f = searchsortedlast(deps_vec, Float64(z))
-        i = clamp(i_f, 1, nx - 1)
-        j = clamp(j_f, 1, ny - 1)
-        k = clamp(k_f, 1, nz - 1)
+        i = nx > 1 ? clamp(i_f, 1, nx - 1) : 1
+        j = ny > 1 ? clamp(j_f, 1, ny - 1) : 1
+        k = nz > 1 ? clamp(k_f, 1, nz - 1) : 1
 
         # Spatial fractional coordinates
-        sx = (lons_vec[i+1] - lons_vec[i]) != 0.0 ?
+        sx = (nx > 1 && (lons_vec[i+1] - lons_vec[i]) != 0.0) ?
              clamp((Float64(lon) - lons_vec[i]) / (lons_vec[i+1] - lons_vec[i]), 0.0, 1.0) : 0.0
-        sy = (lats_vec[j+1] - lats_vec[j]) != 0.0 ?
+        sy = (ny > 1 && (lats_vec[j+1] - lats_vec[j]) != 0.0) ?
              clamp((Float64(lat) - lats_vec[j]) / (lats_vec[j+1] - lats_vec[j]), 0.0, 1.0) : 0.0
-        sz = (deps_vec[k+1] - deps_vec[k]) != 0.0 ?
+        sz = (nz > 1 && (deps_vec[k+1] - deps_vec[k]) != 0.0) ?
              clamp((Float64(z) - deps_vec[k])  / (deps_vec[k+1]  - deps_vec[k]),  0.0, 1.0) : 0.0
 
         # Find temporal bracket
         m_f = searchsortedlast(t_vec, Float64(t))
-        m   = clamp(m_f, 1, nt - 1)
-        θ   = (t_vec[m+1] - t_vec[m]) != 0.0 ?
+        m   = nt > 1 ? clamp(m_f, 1, nt - 1) : 1
+        θ   = (nt > 1 && (t_vec[m+1] - t_vec[m]) != 0.0) ?
               clamp((Float64(t) - t_vec[m]) / (t_vec[m+1] - t_vec[m]), 0.0, 1.0) : 0.0
 
-        function interp(arr)
-            v0 = arr[i,   j,   k,   m] * (1-sx)*(1-sy)*(1-sz) +
-                 arr[i+1, j,   k,   m] * sx*(1-sy)*(1-sz) +
-                 arr[i,   j+1, k,   m] * (1-sx)*sy*(1-sz) +
-                 arr[i+1, j+1, k,   m] * sx*sy*(1-sz) +
-                 arr[i,   j,   k+1, m] * (1-sx)*(1-sy)*sz +
-                 arr[i+1, j,   k+1, m] * sx*(1-sy)*sz +
-                 arr[i,   j+1, k+1, m] * (1-sx)*sy*sz +
-                 arr[i+1, j+1, k+1, m] * sx*sy*sz
-            v1 = arr[i,   j,   k,   m+1] * (1-sx)*(1-sy)*(1-sz) +
-                 arr[i+1, j,   k,   m+1] * sx*(1-sy)*(1-sz) +
-                 arr[i,   j+1, k,   m+1] * (1-sx)*sy*(1-sz) +
-                 arr[i+1, j+1, k,   m+1] * sx*sy*(1-sz) +
-                 arr[i,   j,   k+1, m+1] * (1-sx)*(1-sy)*sz +
-                 arr[i+1, j,   k+1, m+1] * sx*(1-sy)*sz +
-                 arr[i,   j+1, k+1, m+1] * (1-sx)*sy*sz +
-                 arr[i+1, j+1, k+1, m+1] * sx*sy*sz
-            return (1 - θ) * v0 + θ * v1
+        function sample_at_time(arr, time_idx)
+            i_next = nx > 1 ? i + 1 : i
+            j_next = ny > 1 ? j + 1 : j
+            k_next = nz > 1 ? k + 1 : k
+
+            v000 = arr[i,      j,      k,      time_idx]
+            v100 = arr[i_next, j,      k,      time_idx]
+            v010 = arr[i,      j_next, k,      time_idx]
+            v110 = arr[i_next, j_next, k,      time_idx]
+            v001 = arr[i,      j,      k_next, time_idx]
+            v101 = arr[i_next, j,      k_next, time_idx]
+            v011 = arr[i,      j_next, k_next, time_idx]
+            v111 = arr[i_next, j_next, k_next, time_idx]
+
+            return (1.0 - sx) * (1.0 - sy) * (1.0 - sz) * v000 +
+                   sx         * (1.0 - sy) * (1.0 - sz) * v100 +
+                   (1.0 - sx) * sy         * (1.0 - sz) * v010 +
+                   sx         * sy         * (1.0 - sz) * v110 +
+                   (1.0 - sx) * (1.0 - sy) * sz         * v001 +
+                   sx         * (1.0 - sy) * sz         * v101 +
+                   (1.0 - sx) * sy         * sz         * v011 +
+                   sx         * sy         * sz         * v111
         end
 
-        return (interp(u_arr), interp(v_arr), interp(w_arr), interp(T_arr))
+        function sample_eta_at_time(time_idx)
+            i_next = nx > 1 ? i + 1 : i
+            j_next = ny > 1 ? j + 1 : j
+            e00 = η_arr[i,      j,      time_idx]
+            e10 = η_arr[i_next, j,      time_idx]
+            e01 = η_arr[i,      j_next, time_idx]
+            e11 = η_arr[i_next, j_next, time_idx]
+            return (1.0 - sx) * (1.0 - sy) * e00 +
+                   sx         * (1.0 - sy) * e10 +
+                   (1.0 - sx) * sy         * e01 +
+                   sx         * sy         * e11
+        end
+
+        function interp(arr)
+            val0 = sample_at_time(arr, m)
+            if nt > 1 && θ > 0.0
+                val1 = sample_at_time(arr, m + 1)
+                return (1.0 - θ) * val0 + θ * val1
+            else
+                return val0
+            end
+        end
+
+        function interp_eta()
+            if !has_eta
+                return 0.0
+            end
+            val0 = sample_eta_at_time(m)
+            if nt > 1 && θ > 0.0
+                val1 = sample_eta_at_time(m + 1)
+                return (1.0 - θ) * val0 + θ * val1
+            else
+                return val0
+            end
+        end
+
+        return (
+            u = interp(u_arr),
+            v = interp(v_arr),
+            w = interp(w_arr),
+            T = interp(T_arr),
+            η = interp_eta()
+        )
     end
 
     return flow_interpolator

@@ -29,23 +29,26 @@ The module provides:
 """
 module ParticleTracking
 
-using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Utils: prettytime
-using CairoMakie
-using NCDatasets
-using Downloads
-using Random
-using DuckDB
-using DataFrames
-using DBInterface
-using Dates
-using Statistics
-using LinearAlgebra
-using TOML
-using JLD2
+using Oceananigans
 
-# Sub-components
+using
+  Random,
+  CairoMakie,
+  NCDatasets,
+  Downloads,
+  Random,
+  DuckDB,
+  DataFrames,
+  DBInterface,
+  Dates,
+  Statistics,
+  LinearAlgebra,
+  TOML,
+  JLD2
+
+# Sub-components (in src/)
 include("configuration.jl")
 include("open_data.jl")
 include("synthetic_data.jl")
@@ -69,6 +72,8 @@ export
     configuration_to_options,
     options_to_configuration,
     get_default_configuration,
+    get_snowcrab_configuration,
+    SnowCrabRunOptions,
     find_default_config_path,
 
     # Architecture and device resolution
@@ -77,7 +82,9 @@ export
     # Open real-world data and regridding
     fetch_open_bathymetry,
     fetch_open_surface_winds,
+    fetch_open_meteo_surface_winds,
     fetch_open_woa_climatology,
+    fetch_copernicus_surface_winds,
     wind_speed_to_kinematic_stress,
     regrid_2d_field,
 
@@ -103,6 +110,7 @@ export
     get_strata_buffered_envelope,
     build_immersed_grid,
     build_immersed_grid_from_real_data,
+    extract_grid_coordinates,
 
     # Hydrodynamic model
     build_hydrodynamic_model,
@@ -128,13 +136,20 @@ export
     create_flow_interpolator_from_jld2,
 
     # Larval behavior and particle tracking
+    larval_ascent_velocity,
     diel_vertical_migration_velocity,
     superpose_tidal_velocity,
     update_larval_stage,
     evaluate_settlement_suitability,
     larval_transport_step,
+    bbl_velocity_factor,
+    larval_passive_sinking_velocity,
     initialize_larval_particles,
     track_larval_cohort,
+    safe_mean,
+    canonicalize_trajectories,
+    canonicalize_status,
+    canonicalize_status!,
 
     # Empirical movement, recruitment & connectivity analysis
     point_in_polygon,
@@ -150,6 +165,7 @@ export
     # DuckDB analytical storage, scenario management & model averaging
     open_duckdb_storage,
     close_duckdb_storage,
+    close_all_duckdb_storage!,
     initialize_duckdb_schema!,
     save_simulation_run!,
     load_run_configuration,
@@ -177,6 +193,11 @@ export
     extract_hydrodynamic_dataset,
     plot_hydrodynamic_advection,
     plot_hydrodynamic_tracers,
+    plot_hydrodynamic_stratification,
+    plot_hydrodynamic_diffusion,
+    plot_hydrodynamic_section,
+    plot_hydrodynamic_timeseries,
+    plot_hydrodynamic_field,
     export_interactive_tracks_html,
     plot_interactive_trajectories_map
 

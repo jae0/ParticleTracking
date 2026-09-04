@@ -39,8 +39,205 @@ julia --project=. ParticleTrackingRun.jl --viz
 # Load the ParticleTracking module
 import Pkg
 Pkg.activate(@__DIR__, io = devnull)
-using ParticleTracking
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fast CLI Help Handler (Dispatched before loading Oceananigans / CairoMakie)
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    display_help()
+
+Print command-line usage instructions and option flags for `ParticleTrackingRun.jl`.
+"""
+function display_help()
+    println("""
+Hydrodynamic Model & Particle Tracking CLI Interface
+
+Usage:
+  julia --project=. ParticleTrackingRun.jl [FLAGS...]
+
+Execution Modes:
+  --all                   Execute entire end-to-end workflow pipeline.
+  --quick, -q             Fast debug mode with coarse resolution and short duration.
+  --segment=<name>        Run a single workflow segment.
+                          Choices: data, grid, model, climate, sim, track, metrics, viz, all.
+
+Decoupled Hydrodynamics & Multi-Cohort Tracking:
+  --hydro-model=<path>    Target hydrodynamic JLD2 model file (output or input).
+                          Default: outputs/hydrodynamics_<scenario>_<year>.jld2.
+  --hydro-only            Run hydrodynamics only (Segments 1-5) and save to --hydro-model.
+  --track-only            Run larval tracking only (Segments 6-8) using --hydro-model.
+  --reuse-hydro           Reuse existing --hydro-model checkpoint if present; else simulate.
+  --run-id=<string>       Unique cohort run identifier for DuckDB persistence and figures.
+
+Individual Segment Flags:
+  --data                  Run environmental data ingestion (Segment 1).
+  --grid                  Run grid and immersed boundary construction (Segment 2).
+  --model                 Run hydrodynamic model setup with tidal forcing (Segment 3).
+  --climate               Run CMIP6 climate scenario & larval thermal biology (Segment 4).
+  --sim, --simulation     Run Oceananigans hydrodynamic time integration (Segment 5).
+  --track, --tracking     Run Lagrangian larval particle tracking (Segment 6).
+  --metrics               Compute retention, empirical diffusion & connectivity (Segment 7).
+  --viz, --visualize      Generate CairoMakie spatial figures and interactive HTML map (Segment 8).
+
+DuckDB Analytical Storage & Model Averaging:
+  --duckdb                Enable DuckDB storage archiving (default: true).
+  --no-duckdb             Disable DuckDB storage archiving.
+  --db-path=<path>        Custom DuckDB database path (default: outputs/particle_tracking.duckdb).
+  --list-runs             Query and display all simulation runs archived in DuckDB.
+  --compare-scenarios     Query and display multi-scenario comparison metrics.
+  --model-average         Compute ensemble model-averaged connectivity and recruitment.
+  --export-parquet        Export all DuckDB tables to Apache Parquet files.
+
+Centralized Configuration:
+  --config=<path>         Path to centralized .config file (default: inputs/ParticleTracking.config).
+  --save-config[=<path>]  Export active parameter options to .config file and exit.
+
+Ecosystem & Species Configurations:
+  --snowcrab-settings     Load calibrated Snow Crab (Chionoecetes opilio) parameters:
+                          500 larvae, 60-day PLD, bottom release (0.5-3.0m off bed),
+                          active ascent (10 mm/s to -10m), DVM, molting (T_base = -1.5°C;
+                          65, 130, 200 DD), 100x100x20 grid, Scotian Shelf/slope domain,
+                          and persistence to outputs/snowcrab_tracking.duckdb.
+                          Additional CLI arguments override these defaults.
+  --snowcrab              Alias for --snowcrab-settings.
+  --snowcrab-mode         Alias for --snowcrab-settings.
+  --real-5yr              Execute 5-Year physical hydrodynamic cycle scenario.
+  --climatology-2yr       Execute 2-Year climatological average cycle scenario.
+  --climatology-1.5yr     Execute 1.5-Year (18-Month) climatological cycle scenario.
+  --compare               Query DuckDB and display comparative scenario analytics.
+  --heat-flux=<val>       Summer atmospheric heat flux in W/m² (default: 50.0).
+
+Computational Architecture:
+  --gpu, --cuda           Enable NVIDIA CUDA GPU acceleration for hydrodynamics.
+  --cpu                   Execute on multi-threaded CPU (default).
+  --fallback-cpu          Automatically fall back to CPU if CUDA GPU is not functional.
+
+Visualization Options:
+  --interactive           Export standalone interactive HTML5 Leaflet map (default).
+  --no-interactive        Disable interactive HTML map generation.
+
+Spatial Domain & Grid Discretization:
+  --lon=<min,max>         Longitude bounding range in degrees East (default: -68.0,-57.0).
+  --lat=<min,max>         Latitude bounding range in degrees North (default: 42.0,47.0).
+  --depth-range=<min,max> Vertical depth range in meters (default: -1000.0,0.0).
+  --grid=<nx,ny,nz>       Grid cell dimensions (default: 50,50,10; quick: 15,15,5).
+  --nx=<int>              Zonal grid cells (default: 50).
+  --ny=<int>              Meridional grid cells (default: 50).
+  --nz=<int>              Vertical grid layers (default: 10).
+
+Environmental Data & Forcing:
+  --real                  Fetch real-world NOAA ERDDAP bathymetry and winds.
+  --synthetic             Generate idealized synthetic shelf data (default).
+  --tides                 Enable astronomical tidal body forcing (default: true).
+  --no-tides              Disable tidal body forcing.
+  --tidal-u=<val>         Semi-major tidal current amplitude in m/s (default: 0.25).
+  --tidal-v=<val>         Semi-minor tidal current amplitude in m/s (default: 0.12).
+
+Climate Scenarios & Thermal Biology:
+  --scenario=<name>       Climate scenario: historical, ssp126, ssp245, ssp585, mhw.
+  --year=<int>            Climate projection horizon year (default: 2050).
+
+Hydrodynamic Simulation:
+  --duration=<hours>      Hydrodynamic simulation duration in hours (default: 12.0).
+  --sim-duration=<sec>    Hydrodynamic simulation duration in seconds (default: 43200.0).
+  --sim-dt=<sec>          Initial hydrodynamic time step in seconds (default: 120.0).
+  --adaptive-cfl          Enable adaptive CFL time stepping (default: true).
+  --no-adaptive-cfl       Disable adaptive CFL time stepping.
+  --target-cfl=<val>      Target advective Courant-Friedrichs-Lewy limit (default: 0.2).
+
+Lagrangian Particle Tracking & Larval Ecology:
+  --particles=<int>       Number of larvae to initialize and track (default: 100).
+  --track-duration=<days> Cohort tracking duration in days (default: 5.0).
+  --track-dt=<sec>        Lagrangian integration time step in seconds (default: 300.0).
+  --min-depth=<meters>    Minimum water depth for larval placement (default: 100.0).
+  --buffer-km=<km>        Spatial buffer beyond stratum boundaries (default: 100.0 km).
+  --dvm                   Enable stage-dependent Diel Vertical Migration (default: true).
+  --no-dvm                Disable Diel Vertical Migration.
+  --molting               Enable degree-day thermal molting & mortality (default: true).
+  --no-molting            Disable thermal molting.
+  --diff-h=<val>          Horizontal turbulent diffusivity in m^2/s (default: 10.0).
+  --diff-v=<val>          Vertical turbulent diffusivity in m^2/s (default: 1e-4).
+  --release-mode=<mode>   Release depth mode: bottom, range, surface (default: bottom).
+  --ascent                Enable post-hatch vertical ascent toward surface (default: true).
+  --no-ascent             Disable initial vertical ascent.
+  --ascent-speed=<val>    Vertical ascent swimming speed in m/s (default: 0.010).
+  --ascent-target=<val>   Target depth in meters for ascent completion (default: -10.0).
+
+I/O & Environment:
+  --output-dir=<path>     Directory for output figures and datasets (default: outputs).
+  --input-dir=<path>      Directory for input NetCDF caches (default: inputs).
+  --seed=<int>            Random number generator seed (default: 42).
+  --help, -h              Display this help documentation.
+
+Examples:
+  # 1. Run hydrodynamics only and save checkpoint:
+  julia --project=. ParticleTrackingRun.jl --hydro-only --hydro-model=hydrodynamics1.jld2
+
+  # 2. Track larval cohort reusing pre-computed hydrodynamics:
+  julia --project=. ParticleTrackingRun.jl --track-only --hydro-model=hydrodynamics1.jld2 \\
+      --run-id=cohort_spring_2020 --particles=500 --ascent
+
+  # 3. Track second cohort with alternate vertical ascent speed:
+  julia --project=. ParticleTrackingRun.jl --track-only --hydro-model=hydrodynamics1.jld2 \\
+      --run-id=cohort_summer_fast --particles=500 --ascent-speed=0.015
+
+  # 4. Fast end-to-end debug pipeline:
+  julia --project=. ParticleTrackingRun.jl --all --quick
+""")
+end
+
+is_cli_invocation = isempty(PROGRAM_FILE) ||
+    lowercase(normpath(abspath(PROGRAM_FILE))) == lowercase(normpath(abspath(@__FILE__))) ||
+    endswith(lowercase(PROGRAM_FILE), "particletrackingrun.jl")
+
+if is_cli_invocation && (isempty(ARGS) || "--help" in ARGS || "-h" in ARGS)
+    display_help()
+    exit(0)
+end
+
+using
+    Random,
+    CairoMakie,
+    NCDatasets,
+    Downloads,
+    DuckDB,
+    DataFrames,
+    DBInterface,
+    Dates,
+    Statistics,
+    LinearAlgebra,
+    TOML,
+    JLD2,
+    Oceananigans,
+    Oceananigans.Units,
+    Oceananigans.Utils,
+    ParticleTracking
+
+"""
+    resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
+
+Resolve the target hydrodynamic JLD2 output/input path and filename. If `opts.hydro_model_file`
+is specified, it is used directly (or resolved relative to `opts.output_dir` if a bare filename
+is provided). If empty, returns `(joinpath(opts.output_dir, default_filename), default_filename)`.
+
+# Inputs
+- `opts::HydrodynamicOptions`: Configuration parameters.
+- `default_filename::String`: Default fallback filename when none is specified.
+
+# Outputs
+- `Tuple{String, String}`: `(full_path, file_basename)`
+"""
+function resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String)
+    if isempty(opts.hydro_model_file)
+        full_path = joinpath(opts.output_dir, default_filename)
+        return (full_path, default_filename)
+    else
+        raw = opts.hydro_model_file
+        full_path = isabspath(raw) || dirname(raw) != "" ? raw : joinpath(opts.output_dir, raw)
+        return (full_path, basename(raw))
+    end
+end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment 1: Data Ingestion & Benchmark Generation
@@ -63,7 +260,6 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
     println(" [Segment 1/8] Environmental Data Ingestion & Drag Processing")
     println("=================================================================")
     mkpath(opts.input_dir)
-
     bathy_file = joinpath(opts.input_dir, "bathymetry_active.nc")
     wind_file  = joinpath(opts.input_dir, "wind_active.nc")
 
@@ -71,51 +267,44 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
         println("Retrieving real bathymetry from NOAA ERDDAP (etopo180)...")
         try
             fetch_open_bathymetry(
-                lon_range = opts.domain_lon,
-                lat_range = opts.domain_lat,
+                lon_range = opts.domain_lon, 
+                lat_range = opts.domain_lat, 
                 output_path = bathy_file
             )
         catch err
-            @warn "NOAA ERDDAP bathymetry download failed: $(err). Falling back to synthetic."
-            generate_synthetic_bathymetry(
-                bathy_file,
-                lon_range = opts.domain_lon,
-                lat_range = opts.domain_lat,
-                n_lon = opts.grid_size[1],
-                n_lat = opts.grid_size[2]
-            )
+            @warn "Primary NOAA ERDDAP bathymetry download failed: $(err). Trying alternate mirror..."
+            try
+                # Secondary backup endpoint for topography
+                backup_bathy_url = "https://www.ncei.noaa.gov/erddap/griddap/etopo190.nc?altitude[($(opts.domain_lat[1])):(($(opts.domain_lat[2]))][($(opts.domain_lon[1])):(($(opts.domain_lon[2]))]"
+                Downloads.download(backup_bathy_url, bathy_file)
+            catch backup_err
+                @warn "All live bathymetry sources failed. Falling back to synthetic topography."
+                generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
+            end
         end
 
-        println("Retrieving real surface winds from NOAA ERDDAP (erdBSwinds1day)...")
+        println("Retrieving real surface winds from NOAA ERDDAP / NCEP Reanalysis...")
         try
             fetch_open_surface_winds(
-                lon_range = opts.domain_lon,
-                lat_range = opts.domain_lat,
-                time_iso = "2023-06-01T00:00:00Z",
+                lon_range = opts.domain_lon, 
+                lat_range = opts.domain_lat, 
+                time_iso = "2023-06-01T00:00:00Z", 
                 output_path = wind_file
             )
         catch err
-            @warn "NOAA ERDDAP wind download failed: $(err). Falling back to synthetic."
-            generate_synthetic_forcing(
-                wind_file,
-                lon_range = opts.domain_lon,
-                lat_range = opts.domain_lat,
-                n_lon = opts.grid_size[1],
-                n_lat = opts.grid_size[2]
-            )
+            @warn "NOAA CoastWatch wind server timed out: $(err). Trying NCEP/NCAR reanalysis fallback..."
+            try
+                # Alternative reanalysis wind endpoint
+                backup_wind_url = "https://psl.noaa.gov/thredds/fileServer/Datasets/ncep.reanalysis/surface/uwnd.10m.gauss.2023.nc"
+                Downloads.download(backup_wind_url, wind_file)
+            catch backup_err
+                @warn "Live wind servers unreachable. Falling back to synthetic wind forcing."
+                generate_synthetic_forcing(wind_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
+            end
         end
     else
         println("Generating synthetic Scotian Shelf bathymetry...")
-        generate_synthetic_bathymetry(
-            bathy_file,
-            lon_range = opts.domain_lon,
-            lat_range = opts.domain_lat,
-            n_lon = opts.grid_size[1],
-            n_lat = opts.grid_size[2],
-            inshore_depth = -100.0,
-            shelf_slope = 600.0
-        )
-
+        generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2], inshore_depth = -100.0, shelf_slope = 600.0 )
         println("Generating synthetic surface wind forcing...")
         generate_synthetic_forcing(
             wind_file,
@@ -125,30 +314,21 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
             n_lon = opts.grid_size[1],
             n_lat = opts.grid_size[2],
             n_time = 24,
-            tau_x_amplitude = 0.1,
-            tau_y_amplitude = 0.02
+            tau_x_amplitude = 1e-4,
+            tau_y_amplitude = 2e-5
         )
     end
 
-    # Inspect the generated/downloaded NetCDF datasets
     bathy_info = inspect_netcdf(bathy_file, verbose = true)
-
-    # Compute kinematic surface wind stress via Large & Pond (1981) formulation
-    u10_ref, v10_ref = 8.5, 3.2 # m/s
+    u10_ref, v10_ref = 8.5, 3.2 
     tau_x, tau_y = wind_speed_to_kinematic_stress(u10_ref, v10_ref)
     println("Calculated Large & Pond (1981) kinematic wind stress:")
     println("  Reference 10m wind: u = $(u10_ref) m/s, v = $(v10_ref) m/s")
-    println("  Kinematic stress:   tau_x = $(round(tau_x, digits=6)), " *
-            "tau_y = $(round(tau_y, digits=6)) m^2/s^2")
-
-    return (
-        bathy_file = bathy_file,
-        wind_file = wind_file,
-        tau_x = tau_x,
-        tau_y = tau_y,
-        bathy_info = bathy_info
-    )
+    println("  Kinematic stress:   tau_x = $(round(tau_x, digits=6)), tau_y = $(round(tau_y, digits=6)) m^2/s^2")
+    return (bathy_file = bathy_file, wind_file = wind_file, tau_x = tau_x, tau_y = tau_y, bathy_info = bathy_info)
 end
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment 2: Computational Grid & Immersed Seafloor Boundary
@@ -247,23 +427,26 @@ function run_segment_model(;
     end
 
     tidal_forcing = if opts.enable_tides
-        println("Configuring astronomical tidal body forcing (M2 constituent)...")
+        println("Configuring astronomical tidal body forcing (M2 + S2 spring-neap envelope)...")
+        u_amps = Dict(:M2 => opts.tidal_u_amp, :S2 => 0.44 * opts.tidal_u_amp)
+        v_amps = Dict(:M2 => opts.tidal_v_amp, :S2 => 0.42 * opts.tidal_v_amp)
         build_tidal_body_forcing(
-            constituents = [:M2],
-            u_amplitudes = Dict(:M2 => opts.tidal_u_amp),
-            v_amplitudes = Dict(:M2 => opts.tidal_v_amp)
+            constituents = [:M2, :S2],
+            u_amplitudes = u_amps,
+            v_amplitudes = v_amps
         )
     else
         nothing
     end
 
     coriolis_lat = 0.5 * (opts.domain_lat[1] + opts.domain_lat[2])
-    println("Building HydrostaticFreeSurfaceModel (Coriolis at $(coriolis_lat)°N)...")
+    println("Building HydrostaticFreeSurfaceModel (Coriolis at $(coriolis_lat)°N, summer surface heat flux)...")
     model = build_hydrodynamic_model(
         target_grid,
         coriolis_latitude = coriolis_lat,
         surface_wind_stress_x = tau_x,
         surface_wind_stress_y = tau_y,
+        surface_heat_flux = opts.surface_heat_flux,
         tidal_forcing = tidal_forcing,
         ν = 1e-2,
         κ = 1e-2,
@@ -387,8 +570,22 @@ function run_segment_simulation(;
         model
     end
 
-    jld2_filename = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
-    jld2_path = joinpath(opts.output_dir, jld2_filename)
+    default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
+    jld2_path, jld2_filename = resolve_hydro_model_path(opts, default_jld2)
+
+    # If track-only or reuse-hydro with an existing checkpoint, skip hydrodynamics integration
+    if opts.track_only || (opts.reuse_hydro && isfile(jld2_path))
+        if isfile(jld2_path)
+            println("Reusing existing hydrodynamic flow solution from: $(jld2_path)")
+            return (simulation = nothing, jld2_output_path = jld2_path)
+        else
+            error("Cannot run in --track-only mode: hydrodynamic model file does not exist: $(jld2_path)\n" *
+                  "Please run with --hydro-only first or specify an existing file with --hydro-model=<path>.")
+        end
+    end
+
+    out_dir_target = dirname(jld2_path)
+    mkpath(out_dir_target)
 
     println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt=$(opts.sim_dt)s)...")
     sim = setup_hydrodynamic_simulation(
@@ -397,7 +594,7 @@ function run_segment_simulation(;
         stop_time = opts.sim_duration,
         adaptive_time_step = opts.adaptive_cfl,
         target_cfl = opts.target_cfl,
-        output_dir = opts.output_dir,
+        output_dir = out_dir_target,
         output_filename = jld2_filename,
         output_schedule = 50,
         progress_schedule = 20
@@ -411,27 +608,36 @@ function run_segment_simulation(;
     if opts.enable_duckdb
         try
             println("Archiving hydrodynamic flow fields to DuckDB -> $(opts.duckdb_path)...")
-            db = open_duckdb_storage(opts.duckdb_path)
-            run_id = "run_$(opts.scenario)_$(opts.projection_year)"
-            g = target_model.grid
-            under_g = g isa ImmersedBoundaryGrid ? g.underlying_grid : g
-            glon = collect(under_g.λᶠᵃᵃ[1:under_g.Nx])
-            glat = collect(under_g.φᵃᶠᵃ[1:under_g.Ny])
-            gdepth = collect(under_g.zᵃᵃᶜ[1:under_g.Nz])
+            coords = extract_grid_coordinates(target_model.grid)
+            glon, glat, gdepth = coords.lons, coords.lats, coords.depths
             u_data = Array(interior(target_model.velocities.u))
             v_data = Array(interior(target_model.velocities.v))
             w_data = Array(interior(target_model.velocities.w))
             t_data = Array(interior(target_model.tracers.T))
             s_data = Array(interior(target_model.tracers.S))
-            save_hydrodynamic_field!(
-                db, run_id, opts;
-                grid_lons = glon, grid_lats = glat, grid_depths = gdepth,
-                u = u_data, v = v_data, w = w_data,
-                temperature = t_data, salinity = s_data,
-                time_seconds = opts.sim_duration
-            )
-            close_duckdb_storage(db)
-            println("Hydrodynamic fields for '$(run_id)' archived in DuckDB.")
+            eta_data = if hasproperty(target_model, :free_surface) &&
+                          hasproperty(target_model.free_surface, :η)
+                Array(interior(target_model.free_surface.η))
+            else
+                nothing
+            end
+
+            db = open_duckdb_storage(opts.duckdb_path)
+            try
+                target_run_id = !isempty(opts.run_id) ? opts.run_id :
+                    "run_$(opts.scenario)_$(opts.projection_year)"
+                save_hydrodynamic_field!(
+                    db, target_run_id, opts;
+                    grid_lons = glon, grid_lats = glat, grid_depths = gdepth,
+                    u = u_data, v = v_data, w = w_data,
+                    temperature = t_data, salinity = s_data,
+                    elevation = eta_data,
+                    time_seconds = opts.sim_duration
+                )
+                println("Hydrodynamic fields for '$(target_run_id)' archived in DuckDB.")
+            finally
+                close_duckdb_storage(db)
+            end
         catch err
             @warn "Failed to archive hydrodynamic fields to DuckDB: $(err)"
         end
@@ -478,12 +684,14 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         (lon, lat) -> -120.0 - 200.0 * (lat - opts.domain_lat[1]) / (opts.domain_lat[2] - opts.domain_lat[1])
     end
 
-    println("Initializing $(opts.n_particles) Zoea I larvae in marine water (min depth >= $(opts.min_seabed_depth) m, buffer = $(opts.buffer_km) km)...")
+    println("Initializing $(opts.n_particles) Zoea I larvae in marine water (mode = $(opts.release_depth_mode), min depth >= $(opts.min_seabed_depth) m)...")
     larvae = initialize_larval_particles(
         opts.n_particles,
         lon_range = spawn_lon,
         lat_range = spawn_lat,
-        depth_range = (-45.0, -15.0),
+        release_depth_mode = opts.release_depth_mode,
+        bottom_offset = opts.bottom_release_offset,
+        ascent_target_depth = opts.ascent_target_depth,
         min_seabed_depth = opts.min_seabed_depth,
         buffer_km = 0.0, # Buffer is already incorporated into spawn_lon/spawn_lat
         bathymetry = bathy_src,
@@ -491,42 +699,86 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         rng = rng
     )
 
-    # Scotian Shelf alongshore current: flows southwestward along the shelf edge.
-    # u ≈ -0.08 to -0.12 m/s (westward), v ≈ -0.03 to -0.06 m/s (southward/offshore).
-    # Tidal oscillation superimposed with ~6 h period at quarter-amplitude.
-    # Reference: Loder, J. W. & Petrie, B. (1991), CJFAS.
-    flow_field_fn(lon, lat, z, t) = begin
-        tidal_phase = 2.0 * π * t / 44712.0  # M2 period ≈ 12.42 h
-        depth_decay  = exp(z / 120.0)          # velocity decays with depth
-        # Depth-dependent cross-shelf position modulates jet speed
-        lon_norm = clamp((lon - opts.domain_lon[1]) /
-                         (opts.domain_lon[2] - opts.domain_lon[1]), 0.0, 1.0)
-        jet_factor = 0.5 + 0.8 * exp(-((lon_norm - 0.3)^2) / 0.04)
-        u_mean = (-0.10 * jet_factor + 0.02 * sin(tidal_phase)) * depth_decay
-        v_mean = (-0.04 * jet_factor + 0.01 * cos(tidal_phase)) * depth_decay
-        w_mean = 0.00020 * sin(2.0 * π * lon_norm) * depth_decay
-        (u_mean, v_mean, w_mean)
+    # 4D hydrodynamic and temperature fields: use create_flow_interpolator_from_jld2
+    # if simulation JLD2 archive exists; otherwise use analytical Scotian Shelf background.
+    default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
+    jld2_target_path, _ = resolve_hydro_model_path(opts, default_jld2)
+
+    if opts.track_only && !isfile(jld2_target_path)
+        error("Cannot run in --track-only mode: hydrodynamic model file does not exist: $(jld2_target_path)\n" *
+              "Please run with --hydro-only first or specify an existing file with --hydro-model=<path>.")
     end
 
-    # 3D Scotian Shelf thermal structure: surface mixed layer + CIL + slope water.
-    # Consistent with set_initial_stratification! in hydrodynamic_model.jl.
-    temp_field_fn(lon, lat, z, t) = begin
-        lon_min, lon_max = opts.domain_lon
-        lat_min, lat_max = opts.domain_lat
-        x_norm = clamp((lon - lon_min) / (lon_max - lon_min), 0.0, 1.0)
-        y_norm = clamp((lat - lat_min) / (lat_max - lat_min), 0.0, 1.0)
-        T_surf   = 14.0 + 8.0 * x_norm - 5.0 * y_norm   # surface mixed layer
-        T_cil_min = 1.5
-        T_slope   = 8.5
-        if z > -20.0
-            frac = (z + 20.0) / 20.0
-            clamp(T_cil_min + frac * (T_surf - T_cil_min), -1.5, 22.0)
-        elseif z > -80.0
-            centre_frac = (z + 50.0) / 30.0
-            clamp(T_cil_min + 2.5 * centre_frac^2, -1.5, T_surf)
-        else
-            depth_factor = (abs(z) - 80.0) / 100.0
-            clamp(T_cil_min + depth_factor * (T_slope - T_cil_min), T_cil_min, T_slope)
+    sim_jld2_candidates = unique([
+        jld2_target_path,
+        joinpath(opts.output_dir, default_jld2),
+        joinpath(opts.output_dir, "simulation_flow.jld2"),
+        joinpath(opts.output_dir, "simulation_$(opts.scenario)_$(opts.projection_year).jld2"),
+        joinpath("outputs", "simulation_flow.jld2")
+    ])
+    sim_jld2_path = findfirst(isfile, sim_jld2_candidates)
+    flow_interpolator = if !isnothing(sim_jld2_path)
+        actual_path = sim_jld2_candidates[sim_jld2_path]
+        println("Loading 4D simulated hydrodynamic fields from $(actual_path)...")
+        try
+            create_flow_interpolator_from_jld2(actual_path)
+        catch err
+            @warn "Failed to create JLD2 flow interpolator from $(actual_path): $(err). Using analytical jet."
+            nothing
+        end
+    else
+        nothing
+    end
+
+    flow_field_fn = if !isnothing(flow_interpolator)
+        (lon, lat, z, t) -> begin
+            f = flow_interpolator(lon, lat, z, t)
+            (f.u, f.v, f.w)
+        end
+    else
+        # Scotian Shelf alongshore current: flows southwestward along the shelf edge.
+        # u ≈ -0.08 to -0.12 m/s (westward), v ≈ -0.03 to -0.06 m/s (southward/offshore).
+        # Tidal oscillation superimposed with ~6 h period at quarter-amplitude.
+        # Reference: Loder, J. W. & Petrie, B. (1991), CJFAS.
+        (lon, lat, z, t) -> begin
+            tidal_phase = 2.0 * π * t / 44712.0  # M2 period ≈ 12.42 h
+            depth_decay  = exp(z / 120.0)          # velocity decays with depth
+            lon_norm = clamp((lon - opts.domain_lon[1]) /
+                             (opts.domain_lon[2] - opts.domain_lon[1]), 0.0, 1.0)
+            jet_factor = 0.5 + 0.8 * exp(-((lon_norm - 0.3)^2) / 0.04)
+            u_mean = (-0.10 * jet_factor + 0.02 * sin(tidal_phase)) * depth_decay
+            v_mean = (-0.04 * jet_factor + 0.01 * cos(tidal_phase)) * depth_decay
+            w_mean = 0.00020 * sin(2.0 * π * lon_norm) * depth_decay
+            (u_mean, v_mean, w_mean)
+        end
+    end
+
+    temp_field_fn = if !isnothing(flow_interpolator)
+        (lon, lat, z, t) -> begin
+            f = flow_interpolator(lon, lat, z, t)
+            f.T
+        end
+    else
+        # 3D Scotian Shelf thermal structure: surface mixed layer + CIL + slope water.
+        # Consistent with set_initial_stratification! in hydrodynamic_model.jl.
+        (lon, lat, z, t) -> begin
+            lon_min, lon_max = opts.domain_lon
+            lat_min, lat_max = opts.domain_lat
+            x_norm = clamp((lon - lon_min) / (lon_max - lon_min), 0.0, 1.0)
+            y_norm = clamp((lat - lat_min) / (lat_max - lat_min), 0.0, 1.0)
+            T_surf   = 14.0 + 8.0 * x_norm - 5.0 * y_norm   # surface mixed layer
+            T_cil_min = 1.5
+            T_slope   = 8.5
+            if z > -20.0
+                frac = (z + 20.0) / 20.0
+                clamp(T_cil_min + frac * (T_surf - T_cil_min), -1.5, 22.0)
+            elseif z > -80.0
+                centre_frac = (z + 50.0) / 30.0
+                clamp(T_cil_min + 2.5 * centre_frac^2, -1.5, T_surf)
+            else
+                depth_factor = (abs(z) - 80.0) / 100.0
+                clamp(T_cil_min + depth_factor * (T_slope - T_cil_min), T_cil_min, T_slope)
+            end
         end
     end
 
@@ -536,6 +788,9 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
     else
         (lon, lat) -> -120.0 - 200.0 * (lat - opts.domain_lat[1]) / (opts.domain_lat[2] - opts.domain_lat[1])
     end
+
+    coastline_path = joinpath(opts.input_dir, "coastline.dat")
+    coast_polys = isfile(coastline_path) ? load_coastline_polygons(coastline_path) : nothing
 
     println("Tracking cohort over $(opts.track_duration / 86400.0) days (dt=$(opts.track_dt)s)...")
     trajectories = track_larval_cohort(
@@ -551,13 +806,23 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         enable_tides = opts.enable_tides,
         tidal_u_amp = opts.tidal_u_amp,
         tidal_v_amp = opts.tidal_v_amp,
+        tidal_constituents = [:M2, :S2],
+        tidal_u_amplitudes = Dict(:M2 => opts.tidal_u_amp, :S2 => 0.44 * opts.tidal_u_amp),
+        tidal_v_amplitudes = Dict(:M2 => opts.tidal_v_amp, :S2 => 0.42 * opts.tidal_v_amp),
         enable_molting = opts.enable_molting,
+        enable_bbl = true,
+        enable_sinking = true,
+        enable_initial_ascent = opts.enable_initial_ascent,
+        ascent_speed = opts.ascent_speed,
+        ascent_target_depth = opts.ascent_target_depth,
+        coastline = coast_polys,
         rng = rng
     )
 
     # Save trajectories to JLD2 checkpoint for modular reloading
     mkpath(opts.output_dir)
-    track_checkpoint = joinpath(opts.output_dir, "larval_trajectories.jld2")
+    tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
+    track_checkpoint = joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")
     jldsave(
         track_checkpoint;
         lons = trajectories.lons,
@@ -567,28 +832,44 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         degree_days = trajectories.degree_days,
         degree_days_timeseries = hasproperty(trajectories, :degree_days_timeseries) ? trajectories.degree_days_timeseries : nothing,
         survival_probability = hasproperty(trajectories, :survival_probability) ? trajectories.survival_probability : nothing,
+        stage_survival = hasproperty(trajectories, :stage_survival) ? trajectories.stage_survival : nothing,
         stages = trajectories.stages,
         alive = trajectories.alive,
         settlement_status = trajectories.settlement_status,
         settlement_age = trajectories.settlement_age,
+        ascent_duration = hasproperty(trajectories, :ascent_duration) ? trajectories.ascent_duration : nothing,
         times = trajectories.times,
         ids = trajectories.ids
     )
+
+    # Maintain default checkpoint as fallback when custom run_id is supplied
+    if !isempty(opts.run_id)
+        default_cp = joinpath(opts.output_dir, "larval_trajectories.jld2")
+        try
+            cp(track_checkpoint, default_cp, force = true)
+        catch
+        end
+    end
 
     # Save trajectories directly into DuckDB
     if opts.enable_duckdb
         try
             println("Archiving trajectories to DuckDB -> $(opts.duckdb_path)...")
             db = open_duckdb_storage(opts.duckdb_path)
-            run_id = "run_$(opts.scenario)_$(opts.projection_year)"
-            save_simulation_run!(
-                db, run_id, opts;
-                trajectories = trajectories,
-                config = options_to_configuration(opts),
-                notes = "Hydrodynamic tracking run ($(opts.scenario), $(opts.projection_year))"
-            )
-            close_duckdb_storage(db)
-            println("Trajectories for '$(run_id)' successfully archived in DuckDB.")
+            try
+                target_run_id = !isempty(opts.run_id) ? opts.run_id :
+                    "run_$(opts.scenario)_$(opts.projection_year)"
+                save_simulation_run!(
+                    db, target_run_id, opts;
+                    trajectories = trajectories,
+                    config = options_to_configuration(opts),
+                    notes = "Hydrodynamic tracking run ($(opts.scenario), $(opts.projection_year))" *
+                            (!isempty(opts.run_id) ? " [$(opts.run_id)]" : "")
+                )
+                println("Trajectories for '$(target_run_id)' successfully archived in DuckDB.")
+            finally
+                close_duckdb_storage(db)
+            end
         catch err
             @warn "Failed to archive trajectories to DuckDB: $(err)"
         end
@@ -636,67 +917,51 @@ function run_segment_metrics(;
     println("=================================================================")
 
     target_trajs = if isnothing(trajectories)
-        run_id = "run_$(opts.scenario)_$(opts.projection_year)"
+        target_run_id = !isempty(opts.run_id) ? opts.run_id :
+            "run_$(opts.scenario)_$(opts.projection_year)"
+        tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
+        track_cp = isfile(joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")) ?
+            joinpath(opts.output_dir, "larval_trajectories$(tag).jld2") :
+            joinpath(opts.output_dir, "larval_trajectories.jld2")
+
+        loaded = nothing
         if opts.enable_duckdb && isfile(opts.duckdb_path)
             db = open_duckdb_storage(opts.duckdb_path; read_only = true)
             try
-                println("Loading particle trajectories from DuckDB for run '$(run_id)'...")
-                load_trajectories_namedtuple(db, run_id)
+                println("Loading particle trajectories from DuckDB for run '$(target_run_id)'...")
+                loaded = load_trajectories_namedtuple(db, target_run_id)
             catch err
-                track_cp = joinpath(opts.output_dir, "larval_trajectories.jld2")
-                if isfile(track_cp)
-                    println("Loading particle trajectories from checkpoint: $(track_cp)...")
-                    saved = load(track_cp)
-                    n_p, n_t = size(saved["lons"])
-                    t_end = saved["times"][end]
-                    (
-                        lons = saved["lons"],
-                        lats = saved["lats"],
-                        depths = saved["depths"],
-                        temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
-                        degree_days = saved["degree_days"],
-                        degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
-                        survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
-                        stages = saved["stages"],
-                        alive = saved["alive"],
-                        settlement_status = saved["settlement_status"],
-                        settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
-                        times = saved["times"],
-                        ids = saved["ids"]
-                    )
-                else
-                    println("Trajectories checkpoint not found. Running Segment 6...")
-                    run_segment_tracking(opts = opts).trajectories
-                end
+                # fallback to JLD2
             finally
                 close_duckdb_storage(db)
             end
+        end
+
+        if !isnothing(loaded)
+            loaded
+        elseif isfile(track_cp)
+            println("Loading particle trajectories from checkpoint: $(track_cp)...")
+            saved = load(track_cp)
+            n_p, n_t = size(saved["lons"])
+            t_end = saved["times"][end]
+            (
+                lons = saved["lons"],
+                lats = saved["lats"],
+                depths = saved["depths"],
+                temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
+                degree_days = saved["degree_days"],
+                degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
+                survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
+                stages = saved["stages"],
+                alive = saved["alive"],
+                settlement_status = saved["settlement_status"],
+                settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
+                times = saved["times"],
+                ids = saved["ids"]
+            )
         else
-            track_cp = joinpath(opts.output_dir, "larval_trajectories.jld2")
-            if isfile(track_cp)
-                println("Loading particle trajectories from checkpoint: $(track_cp)...")
-                saved = load(track_cp)
-                n_p, n_t = size(saved["lons"])
-                t_end = saved["times"][end]
-                (
-                    lons = saved["lons"],
-                    lats = saved["lats"],
-                    depths = saved["depths"],
-                    temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
-                    degree_days = saved["degree_days"],
-                    degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
-                    survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
-                    stages = saved["stages"],
-                    alive = saved["alive"],
-                    settlement_status = saved["settlement_status"],
-                    settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
-                    times = saved["times"],
-                    ids = saved["ids"]
-                )
-            else
-                println("Trajectories checkpoint not found. Running Segment 6...")
-                run_segment_tracking(opts = opts).trajectories
-            end
+            println("Trajectories checkpoint not found. Running Segment 6...")
+            run_segment_tracking(opts = opts).trajectories
         end
     else
         trajectories
@@ -765,35 +1030,44 @@ function run_segment_metrics(;
 
     # 6. Archive simulation run, trajectories, metrics & connectivity in DuckDB
     if opts.enable_duckdb
-        println("Archiving simulation run and metrics to DuckDB -> $(opts.duckdb_path)...")
-        db = open_duckdb_storage(opts.duckdb_path)
-        run_id = "run_$(opts.scenario)_$(opts.projection_year)"
-        save_simulation_run!(
-            db,
-            run_id,
-            opts;
-            trajectories = target_trajs,
-            metrics = (
-                mean_exposure_temperature = therm_metrics.mean_exposure_temperature,
-                mean_degree_days = therm_metrics.mean_degree_days
-            ),
-            connectivity = conn,
-            gridded_dispersal = (
-                lon_centers = emp_mov.lon_centers,
-                lat_centers = emp_mov.lat_centers,
-                u_mean = emp_mov.u_mean,
-                v_mean = emp_mov.v_mean,
-                diffusivity = emp_mov.diffusivity,
-                density = rec_metrics.settlement_density,
-                mean_exposure_temperature = therm_metrics.mean_exposure_temperature,
-                mean_degree_days = therm_metrics.mean_degree_days,
-                sample_count = emp_mov.sample_count
-            ),
-            config = active_config,
-            notes = "Hydrodynamic workflow run ($(opts.scenario), $(opts.projection_year))"
-        )
-        close_duckdb_storage(db)
-        println("DuckDB run '$(run_id)' successfully archived.")
+        try
+            println("Archiving simulation run and metrics to DuckDB -> $(opts.duckdb_path)...")
+            db = open_duckdb_storage(opts.duckdb_path)
+            try
+                target_run_id = !isempty(opts.run_id) ? opts.run_id :
+                    "run_$(opts.scenario)_$(opts.projection_year)"
+                save_simulation_run!(
+                    db,
+                    target_run_id,
+                    opts;
+                    trajectories = target_trajs,
+                    metrics = (
+                        mean_exposure_temperature = therm_metrics.mean_exposure_temperature,
+                        mean_degree_days = therm_metrics.mean_degree_days
+                    ),
+                    connectivity = conn,
+                    gridded_dispersal = (
+                        lon_centers = emp_mov.lon_centers,
+                        lat_centers = emp_mov.lat_centers,
+                        u_mean = emp_mov.u_mean,
+                        v_mean = emp_mov.v_mean,
+                        diffusivity = emp_mov.diffusivity,
+                        density = rec_metrics.settlement_density,
+                        mean_exposure_temperature = therm_metrics.mean_exposure_temperature,
+                        mean_degree_days = therm_metrics.mean_degree_days,
+                        sample_count = emp_mov.sample_count
+                    ),
+                    config = active_config,
+                    notes = "Hydrodynamic workflow run ($(opts.scenario), $(opts.projection_year))" *
+                            (!isempty(opts.run_id) ? " [$(opts.run_id)]" : "")
+                )
+                println("DuckDB run '$(target_run_id)' successfully archived.")
+            finally
+                close_duckdb_storage(db)
+            end
+        catch err
+            @warn "Failed to archive simulation run and metrics to DuckDB: $(err)"
+        end
     end
 
     return (
@@ -834,76 +1108,62 @@ function run_segment_visualize(;
     mkpath(opts.output_dir)
 
     target_trajs = if isnothing(trajectories)
-        run_id = "run_$(opts.scenario)_$(opts.projection_year)"
+        target_run_id = !isempty(opts.run_id) ? opts.run_id :
+            "run_$(opts.scenario)_$(opts.projection_year)"
+        tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
+        track_cp = isfile(joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")) ?
+            joinpath(opts.output_dir, "larval_trajectories$(tag).jld2") :
+            joinpath(opts.output_dir, "larval_trajectories.jld2")
+
+        loaded = nothing
         if opts.enable_duckdb && isfile(opts.duckdb_path)
             db = open_duckdb_storage(opts.duckdb_path; read_only = true)
             try
-                println("Loading particle trajectories from DuckDB for run '$(run_id)'...")
-                load_trajectories_namedtuple(db, run_id)
+                println("Loading particle trajectories from DuckDB for run '$(target_run_id)'...")
+                loaded = load_trajectories_namedtuple(db, target_run_id)
             catch err
-                track_cp = joinpath(opts.output_dir, "larval_trajectories.jld2")
-                if isfile(track_cp)
-                    println("DuckDB run not found. Loading from JLD2 fallback: $(track_cp)...")
-                    saved = load(track_cp)
-                    n_p, n_t = size(saved["lons"])
-                    t_end = saved["times"][end]
-                    (
-                        lons = saved["lons"],
-                        lats = saved["lats"],
-                        depths = saved["depths"],
-                        temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
-                        degree_days = saved["degree_days"],
-                        degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
-                        survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
-                        stages = saved["stages"],
-                        alive = saved["alive"],
-                        settlement_status = saved["settlement_status"],
-                        settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
-                        times = saved["times"],
-                        ids = saved["ids"]
-                    )
-                else
-                    println("Trajectories checkpoint not found. Running Segment 6...")
-                    run_segment_tracking(opts = opts).trajectories
-                end
+                # fallback to JLD2
             finally
                 close_duckdb_storage(db)
             end
+        end
+
+        if !isnothing(loaded)
+            loaded
+        elseif isfile(track_cp)
+            println("Loading particle trajectories from checkpoint: $(track_cp)...")
+            saved = load(track_cp)
+            n_p, n_t = size(saved["lons"])
+            t_end = saved["times"][end]
+            (
+                lons = saved["lons"],
+                lats = saved["lats"],
+                depths = saved["depths"],
+                temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
+                degree_days = saved["degree_days"],
+                degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
+                survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
+                stages = saved["stages"],
+                alive = saved["alive"],
+                settlement_status = saved["settlement_status"],
+                settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
+                times = saved["times"],
+                ids = saved["ids"]
+            )
         else
-            track_cp = joinpath(opts.output_dir, "larval_trajectories.jld2")
-            if isfile(track_cp)
-                println("Loading particle trajectories from checkpoint: $(track_cp)...")
-                saved = load(track_cp)
-                n_p, n_t = size(saved["lons"])
-                t_end = saved["times"][end]
-                (
-                    lons = saved["lons"],
-                    lats = saved["lats"],
-                    depths = saved["depths"],
-                    temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
-                    degree_days = saved["degree_days"],
-                    degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
-                    survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
-                    stages = saved["stages"],
-                    alive = saved["alive"],
-                    settlement_status = saved["settlement_status"],
-                    settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
-                    times = saved["times"],
-                    ids = saved["ids"]
-                )
-            else
-                println("Trajectories checkpoint not found. Running Segment 6...")
-                run_segment_tracking(opts = opts).trajectories
-            end
+            println("Trajectories checkpoint not found. Running Segment 6...")
+            run_segment_tracking(opts = opts).trajectories
         end
     else
         trajectories
     end
 
+ 
+
     # Load bathymetry data for background contours
-    bathy_path = joinpath(opts.input_dir, "bathymetry_active.nc")
-    bathy_data = if isfile(bathy_path)
-        load_bathymetry_from_netcdf(bathy_path)
+    target_bathy_path = joinpath(opts.input_dir, "bathymetry_active.nc")
+    bathy_data = if isfile(target_bathy_path)
+        load_bathymetry_from_netcdf(target_bathy_path)
     else
         nothing
     end
@@ -981,14 +1241,17 @@ function run_segment_visualize(;
     fig9_path = joinpath(opts.output_dir, "hydrodynamic_tracers.png")
     println("Rendering hydrodynamic advection velocity field -> $(fig8_path)...")
     active_hydro = if opts.enable_duckdb && isfile(opts.duckdb_path)
-        db_h = open_duckdb_storage(opts.duckdb_path; read_only = true)
         try
-            run_id = "run_$(opts.scenario)_$(opts.projection_year)"
-            load_hydrodynamic_field(db_h, run_id)
+            db_h = open_duckdb_storage(opts.duckdb_path; read_only = true)
+            try
+                target_run_id = !isempty(opts.run_id) ? opts.run_id :
+                    "run_$(opts.scenario)_$(opts.projection_year)"
+                load_hydrodynamic_field(db_h, target_run_id)
+            finally
+                close_duckdb_storage(db_h)
+            end
         catch
             nothing
-        finally
-            close_duckdb_storage(db_h)
         end
     else
         nothing
@@ -998,31 +1261,52 @@ function run_segment_visualize(;
     println("Rendering hydrodynamic seawater temperature & salinity tracers -> $(fig9_path)...")
     plot_hydrodynamic_tracers(active_hydro, output_path = fig9_path)
 
+    fig_strat_path = joinpath(opts.output_dir, "hydrodynamic_stratification.png")
+    println("Rendering hydrodynamic stratification diagnostics (N², S) -> $(fig_strat_path)...")
+    plot_hydrodynamic_stratification(active_hydro, output_path = fig_strat_path)
+
+    fig_diff_path = joinpath(opts.output_dir, "hydrodynamic_diffusion.png")
+    println("Rendering hydrodynamic turbulent diffusion & eddy viscosity -> $(fig_diff_path)...")
+    plot_hydrodynamic_diffusion(active_hydro, output_path = fig_diff_path)
+
+    fig_sec_path = joinpath(opts.output_dir, "hydrodynamic_section.png")
+    println("Rendering hydrodynamic vertical cross-section -> $(fig_sec_path)...")
+    plot_hydrodynamic_section(
+        active_hydro,
+        variable = :temperature,
+        coordinate = 44.0,
+        section_type = :lat,
+        output_path = fig_sec_path
+    )
+
     # 9. Query Archived Scenarios from DuckDB for Cross-Scenario Comparison & Multi-Layer Interactive Map
     scenarios_bundle = Dict{String, Any}()
     if opts.enable_duckdb && isfile(opts.duckdb_path)
-        db = open_duckdb_storage(opts.duckdb_path; read_only = true)
         try
-            runs_df = list_simulation_runs(db)
-            for r in eachrow(runs_df)
-                s_id = string(r.run_id)
-                s_label = "$(r.scenario) ($(r.projection_year))"
-                try
-                    s_trajs = load_trajectories_namedtuple(db, s_id)
-                    s_disp = try load_gridded_dispersal(db, s_id) catch; nothing end
-                    s_conn = try load_connectivity_matrix(db, s_id) catch; nothing end
-                    s_hydro = try load_hydrodynamic_field(db, s_id) catch; nothing end
-                    scenarios_bundle[s_label] = (
-                        trajectories = s_trajs,
-                        gridded_dispersal = s_disp,
-                        connectivity = s_conn,
-                        hydrodynamics = s_hydro
-                    )
-                catch
+            db = open_duckdb_storage(opts.duckdb_path; read_only = true)
+            try
+                runs_df = list_simulation_runs(db)
+                for r in eachrow(runs_df)
+                    s_id = string(r.run_id)
+                    s_label = "$(r.scenario) ($(r.projection_year))"
+                    try
+                        s_trajs = load_trajectories_namedtuple(db, s_id)
+                        s_disp = try load_gridded_dispersal(db, s_id) catch; nothing end
+                        s_conn = try load_connectivity_matrix(db, s_id) catch; nothing end
+                        s_hydro = try load_hydrodynamic_field(db, s_id) catch; nothing end
+                        scenarios_bundle[s_label] = (
+                            trajectories = s_trajs,
+                            gridded_dispersal = s_disp,
+                            connectivity = s_conn,
+                            hydrodynamics = s_hydro
+                        )
+                    catch
+                    end
                 end
+            finally
+                close_duckdb_storage(db)
             end
-        finally
-            close_duckdb_storage(db)
+        catch
         end
     end
 
@@ -1137,19 +1421,52 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
     # Step 2: Grid Construction
     grid_res = run_segment_grid(opts = opts, bathy_file = data_res.bathy_file)
 
-    # Step 3: Model Setup
-    model_res = run_segment_model(
-        opts = opts,
-        immersed_grid = grid_res.immersed_grid,
-        tau_x = data_res.tau_x,
-        tau_y = data_res.tau_y
-    )
+    # Decoupled hydrodynamics: skip model and simulation if --track-only is active
+    model_res = nothing
+    climate_res = nothing
+    sim_res = nothing
 
-    # Step 4: Climate Scenarios
-    climate_res = run_segment_climate(opts = opts, model = model_res.model)
+    if !opts.track_only
+        # Step 3: Model Setup
+        model_res = run_segment_model(
+            opts = opts,
+            immersed_grid = grid_res.immersed_grid,
+            tau_x = data_res.tau_x,
+            tau_y = data_res.tau_y
+        )
 
-    # Step 5: Hydrodynamic Simulation
-    sim_res = run_segment_simulation(opts = opts, model = model_res.model)
+        # Step 4: Climate Scenarios
+        climate_res = run_segment_climate(opts = opts, model = model_res.model)
+
+        # Step 5: Hydrodynamic Simulation
+        sim_res = run_segment_simulation(opts = opts, model = model_res.model)
+    else
+        println("[Pipeline Notice] --track-only active: Skipping hydrodynamic simulation (Segments 3-5).")
+    end
+
+    # If --hydro-only is active, exit early after saving hydrodynamic solution
+    if opts.hydro_only
+        t_elapsed = round(time() - t_start, digits = 2)
+        println("\n=================================================================")
+        println(" Hydrodynamics-only execution complete in $(t_elapsed) s (--hydro-only specified).")
+        println(" Flow solution saved to: $(isnothing(sim_res) ? opts.hydro_model_file : sim_res.jld2_output_path)")
+        println(" Skipping larval particle tracking, metrics, and visualization.")
+        if opts.enable_duckdb
+            close_all_duckdb_storage!()
+        end
+        println("=================================================================")
+        return (
+            data = data_res,
+            grid = grid_res,
+            model = model_res,
+            climate = climate_res,
+            simulation = sim_res,
+            tracking = nothing,
+            metrics = nothing,
+            visualizations = nothing,
+            elapsed_seconds = t_elapsed
+        )
+    end
 
     # Step 6: Lagrangian Particle Tracking
     track_res = run_segment_tracking(opts = opts)
@@ -1166,6 +1483,7 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
     println(" Outputs written to: $(opts.output_dir)/")
     if opts.enable_duckdb
         println(" DuckDB analytical storage: $(opts.duckdb_path)")
+        close_all_duckdb_storage!()
     end
     println("=================================================================")
 
@@ -1304,117 +1622,6 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    display_help()
-
-Print command-line usage instructions and option flags.
-"""
-function display_help()
-    println("""
-Hydrodynamic Model & Particle Tracking CLI Interface
-
-Usage:
-  julia --project=. ParticleTrackingRun.jl [FLAGS...]
-
-Execution Modes:
-  --all                   Execute entire end-to-end workflow pipeline.
-  --quick, -q             Fast debug mode with coarse resolution and short duration.
-  --segment=<name>        Run a single workflow segment.
-                          Choices: data, grid, model, climate, sim, track, metrics, viz, all.
-
-Individual Segment Flags:
-  --data                  Run environmental data ingestion (Option 2A/2B).
-  --grid                  Run grid and immersed boundary construction.
-  --model                 Run hydrodynamic model setup with tidal forcing.
-  --climate               Run CMIP6 climate scenario & larval thermal biology.
-  --sim, --simulation     Run Oceananigans hydrodynamic time integration.
-  --track, --tracking     Run Lagrangian larval particle tracking.
-  --metrics               Compute retention, empirical diffusion & connectivity.
-  --viz, --visualize      Generate CairoMakie spatial figures and interactive HTML map.
-
-DuckDB Analytical Storage & Model Averaging:
-  --duckdb                Enable DuckDB storage archiving (default: true).
-  --no-duckdb             Disable DuckDB storage archiving.
-  --db-path=<path>        Custom DuckDB database path (default: outputs/particle_tracking.duckdb).
-  --list-runs             Query and display all simulation runs archived in DuckDB.
-  --compare-scenarios     Query and display multi-scenario comparison metrics.
-  --model-average         Compute ensemble model-averaged connectivity and recruitment.
-  --export-parquet        Export all DuckDB tables to Apache Parquet files.
-
-Centralized Configuration:
-  --config=<path>         Path to centralized .config file (default: inputs/ParticalTracking.config).
-  --save-config[=<path>]  Export active parameter options to .config file and exit.
-
-Computational Architecture:
-  --gpu, --cuda           Enable NVIDIA CUDA GPU acceleration for hydrodynamics.
-  --cpu                   Execute on multi-threaded CPU (default).
-  --fallback-cpu          Automatically fall back to CPU if CUDA GPU is not functional.
-
-Visualization Options:
-  --interactive           Export standalone interactive HTML5 Leaflet map (default).
-  --no-interactive        Disable interactive HTML map generation.
-
-Spatial Domain & Grid Discretization:
-  --lon=<min,max>         Longitude bounding range in degrees East (default: -68.0,-57.0).
-  --lat=<min,max>         Latitude bounding range in degrees North (default: 42.0,47.0).
-  --depth-range=<min,max> Vertical depth range in meters (default: -1000.0,0.0).
-  --grid=<nx,ny,nz>       Grid cell dimensions (default: 50,50,10; quick: 15,15,5).
-  --nx=<int>              Zonal grid cells (default: 50).
-  --ny=<int>              Meridional grid cells (default: 50).
-  --nz=<int>              Vertical grid layers (default: 10).
-
-Environmental Data & Forcing:
-  --real                  Fetch real-world NOAA ERDDAP bathymetry and winds.
-  --synthetic             Generate idealized synthetic shelf data (default).
-  --tides                 Enable astronomical tidal body forcing (default: true).
-  --no-tides              Disable tidal body forcing.
-  --tidal-u=<val>         Semi-major tidal current amplitude in m/s (default: 0.25).
-  --tidal-v=<val>         Semi-minor tidal current amplitude in m/s (default: 0.12).
-
-Climate Scenarios & Thermal Biology:
-  --scenario=<name>       Climate scenario: historical, ssp126, ssp245, ssp585, mhw.
-  --year=<int>            Climate projection horizon year (default: 2050).
-
-Hydrodynamic Simulation:
-  --duration=<hours>      Hydrodynamic simulation duration in hours (default: 12.0).
-  --sim-duration=<sec>    Hydrodynamic simulation duration in seconds (default: 43200.0).
-  --sim-dt=<sec>          Initial hydrodynamic time step in seconds (default: 120.0).
-  --adaptive-cfl          Enable adaptive CFL time stepping (default: true).
-  --no-adaptive-cfl       Disable adaptive CFL time stepping.
-  --target-cfl=<val>      Target advective Courant-Friedrichs-Lewy limit (default: 0.2).
-
-Lagrangian Particle Tracking & Larval Ecology:
-  --particles=<int>       Number of larvae to initialize and track (default: 100).
-  --track-duration=<days> Cohort tracking duration in days (default: 5.0).
-  --track-dt=<sec>        Lagrangian integration time step in seconds (default: 300.0).
-  --min-depth=<meters>    Minimum water depth for larval placement (default: 100.0).
-  --buffer-km=<km>        Spatial buffer beyond stratum boundaries (default: 100.0 km).
-  --dvm                   Enable stage-dependent Diel Vertical Migration (default: true).
-  --no-dvm                Disable Diel Vertical Migration.
-  --molting               Enable degree-day thermal molting & mortality (default: true).
-  --no-molting            Disable thermal molting.
-  --diff-h=<val>          Horizontal turbulent diffusivity in m^2/s (default: 10.0).
-  --diff-v=<val>          Vertical turbulent diffusivity in m^2/s (default: 1e-4).
-
-I/O & Environment:
-  --output-dir=<path>     Directory for output figures and datasets (default: outputs).
-  --input-dir=<path>      Directory for input NetCDF caches (default: inputs).
-  --seed=<int>            Random number generator seed (default: 42).
-  --help, -h              Display this help documentation.
-
-Examples:
-  julia --project=. ParticleTrackingRun.jl --all --quick
-  julia --project=. ParticleTrackingRun.jl --all --config=inputs/ParticalTracking.config
-  julia --project=. ParticleTrackingRun.jl --all --scenario=ssp585 --year=2050 --particles=250
-  julia --project=. ParticleTrackingRun.jl --track --min-depth=100 --track-duration=10.0 --buffer-km=100
-  julia --project=. ParticleTrackingRun.jl --list-runs
-  julia --project=. ParticleTrackingRun.jl --compare-scenarios
-  julia --project=. ParticleTrackingRun.jl --model-average
-  julia --project=. ParticleTrackingRun.jl --export-parquet
-  julia --project=. ParticleTrackingRun.jl --particles=500 --save-config=inputs/custom.config
-""")
-end
-
-"""
     main(args=ARGS)
 
 Parse command-line arguments and dispatch execution to the requested segment.
@@ -1426,13 +1633,18 @@ function main(args = ARGS)
     end
 
     # 1. Resolve configuration file path and load centralized configuration
-    config_file = find_default_config_path()
+    is_snowcrab = "--snowcrab-settings" in args || "--snowcrab" in args || "--snowcrab-mode" in args
+    config_file = is_snowcrab ? joinpath("inputs", "snowcrab.config") : find_default_config_path()
     for a in args
         if startswith(a, "--config=")
             config_file = String(split(a, "=")[2])
         end
     end
-    cfg = load_configuration(config_file)
+    cfg = if is_snowcrab && !isfile(config_file)
+        get_snowcrab_configuration()
+    else
+        load_configuration(config_file)
+    end
 
     # 2. Extract baseline defaults from configuration
     dom_cfg = get(cfg, "domain", Dict())
@@ -1465,12 +1677,24 @@ function main(args = ARGS)
     sim_dt = Float64(get(hydro_cfg, "sim_dt_seconds", 120.0))
     adaptive_cfl = Bool(get(hydro_cfg, "adaptive_cfl", true))
     target_cfl = Float64(get(hydro_cfg, "target_cfl", 0.2))
+    surface_heat_flux = Float64(get(hydro_cfg, "surface_heat_flux", 50.0))
+    hydro_model_file = String(get(hydro_cfg, "hydro_model_file", ""))
+    hydro_only = Bool(get(hydro_cfg, "hydro_only", false))
+    track_only = Bool(get(hydro_cfg, "track_only", false))
+    reuse_hydro = Bool(get(hydro_cfg, "reuse_hydro", false))
+    run_id_val = String(get(store_cfg, "run_id", ""))
     n_parts = Int(get(bio_cfg, "n_particles", 100))
     track_dur = Float64(get(bio_cfg, "track_duration_days", 5.0)) * 86400.0
     track_dt = Float64(get(bio_cfg, "track_dt_seconds", 300.0))
     min_depth = Float64(get(bio_cfg, "min_seabed_depth", 100.0))
     diff_h = Float64(get(bio_cfg, "diffusivity_h", 10.0))
     diff_v = Float64(get(bio_cfg, "diffusivity_v", 1e-4))
+    rel_mode = Symbol(get(bio_cfg, "release_depth_mode", "bottom"))
+    bot_off_raw = get(bio_cfg, "bottom_release_offset", [0.5, 3.0])
+    bot_off = (Float64(bot_off_raw[1]), Float64(bot_off_raw[2]))
+    init_ascent = Bool(get(bio_cfg, "enable_initial_ascent", true))
+    asc_spd = Float64(get(bio_cfg, "ascent_speed", 0.010))
+    asc_target = Float64(get(bio_cfg, "ascent_target_depth", -10.0))
     enable_dvm = Bool(get(dvm_cfg, "enable_dvm", true))
     enable_molting = Bool(get(molt_cfg, "enable_molting", true))
     enable_duckdb = Bool(get(store_cfg, "enable_duckdb", true))
@@ -1527,10 +1751,62 @@ function main(args = ARGS)
     elseif "--no-molting" in args
         enable_molting = false
     end
+    if "--ascent" in args
+        init_ascent = true
+    elseif "--no-ascent" in args
+        init_ascent = false
+    end
+    if "--hydro-only" in args
+        hydro_only = true
+    end
+    if "--track-only" in args
+        track_only = true
+    end
+    if "--reuse-hydro" in args
+        reuse_hydro = true
+    end
+    if "--real-5yr" in args
+        scenario = :historical
+        proj_year = 2020
+        is_real = true
+        sim_dur = is_quick ? 432000.0 : 157788000.0
+        if isempty(run_id_val)
+            run_id_val = "snowcrab_real_5yr"
+        end
+        if isempty(hydro_model_file)
+            hydro_model_file = "hydrodynamics_real_5yr.jld2"
+        end
+    elseif "--climatology-2yr" in args
+        scenario = :ssp245
+        proj_year = 2022
+        is_real = false
+        sim_dur = is_quick ? 172800.0 : 63115200.0
+        if isempty(run_id_val)
+            run_id_val = "snowcrab_climatology_2yr"
+        end
+        if isempty(hydro_model_file)
+            hydro_model_file = "hydrodynamics_climatology_2yr.jld2"
+        end
+    elseif "--climatology-1.5yr" in args || "--climatology-18mo" in args
+        scenario = :ssp245
+        proj_year = 2022
+        is_real = false
+        sim_dur = is_quick ? 172800.0 : 47336400.0
+        if isempty(run_id_val)
+            run_id_val = "snowcrab_climatology_1.5yr"
+        end
+        if isempty(hydro_model_file)
+            hydro_model_file = "hydrodynamics_climatology_1.5yr.jld2"
+        end
+    end
 
     # 4. Parse explicit key-value arguments
     for a in args
-        if startswith(a, "--scenario=")
+        if startswith(a, "--hydro-model=")
+            hydro_model_file = String(split(a, "=")[2])
+        elseif startswith(a, "--run-id=")
+            run_id_val = String(split(a, "=")[2])
+        elseif startswith(a, "--scenario=")
             scenario = Symbol(split(a, "=")[2])
         elseif startswith(a, "--year=")
             proj_year = parse(Int, split(a, "=")[2])
@@ -1572,6 +1848,8 @@ function main(args = ARGS)
             sim_dt = parse(Float64, split(a, "=")[2])
         elseif startswith(a, "--target-cfl=")
             target_cfl = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--heat-flux=")
+            surface_heat_flux = parse(Float64, split(a, "=")[2])
         elseif startswith(a, "--duration=")
             sim_dur = parse(Float64, split(a, "=")[2]) * 3600.0
         elseif startswith(a, "--sim-duration=")
@@ -1584,17 +1862,28 @@ function main(args = ARGS)
             diff_h = parse(Float64, split(a, "=")[2])
         elseif startswith(a, "--diff-v=") || startswith(a, "--diffusivity-v=")
             diff_v = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--release-mode=")
+            rel_mode = Symbol(split(a, "=")[2])
+        elseif startswith(a, "--ascent-speed=")
+            asc_spd = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--ascent-target=")
+            asc_target = parse(Float64, split(a, "=")[2])
         elseif startswith(a, "--seed=")
             seed = parse(Int, split(a, "=")[2])
         end
     end
 
+    # Check for mutually exclusive flags
+    if hydro_only && track_only
+        error("Flags --hydro-only and --track-only are mutually exclusive. Choose one.")
+    end
+
     # Fast override for quick prototyping
     if is_quick
-        n_parts = min(n_parts, 25)
-        grid_dim = (15, 15, 5)
-        sim_dur = min(sim_dur, 3600.0)
-        track_dur = min(track_dur, 86400.0 * 2)
+        n_parts = min(n_parts, is_snowcrab ? 50 : 25)
+        grid_dim = is_snowcrab ? (40, 40, 10) : (15, 15, 5)
+        sim_dur = min(sim_dur, is_snowcrab ? 432000.0 : 3600.0)
+        track_dur = min(track_dur, 86400.0 * 5)
     end
 
     opts = HydrodynamicOptions(
@@ -1612,6 +1901,12 @@ function main(args = ARGS)
         sim_duration = sim_dur,
         adaptive_cfl = adaptive_cfl,
         target_cfl = target_cfl,
+        surface_heat_flux = surface_heat_flux,
+        hydro_model_file = hydro_model_file,
+        hydro_only = hydro_only,
+        track_only = track_only,
+        reuse_hydro = reuse_hydro,
+        run_id = run_id_val,
         n_particles = n_parts,
         track_duration = track_dur,
         track_dt = track_dt,
@@ -1619,6 +1914,11 @@ function main(args = ARGS)
         diffusivity_v = diff_v,
         enable_dvm = enable_dvm,
         enable_molting = enable_molting,
+        release_depth_mode = rel_mode,
+        bottom_release_offset = bot_off,
+        enable_initial_ascent = init_ascent,
+        ascent_speed = asc_spd,
+        ascent_target_depth = asc_target,
         min_seabed_depth = min_depth,
         buffer_km = buffer_km,
         use_gpu = use_gpu,
@@ -1648,7 +1948,7 @@ function main(args = ARGS)
         return
     end
 
-    if "--compare-scenarios" in args || "--compare-runs" in args
+    if "--compare" in args || "--compare-scenarios" in args || "--compare-runs" in args
         run_cli_compare_scenarios(opts = opts)
         return
     end
@@ -1672,6 +1972,47 @@ function main(args = ARGS)
 
     # Segment dispatch
     has_run = false
+
+    # Standalone decoupled execution modes (when run without explicit individual segment flags)
+    if opts.hydro_only && !("--sim" in args || "--simulation" in args || "--segment=sim" in args || "--all" in args)
+        println("=================================================================")
+        println(" Execution Mode: Hydrodynamic Simulation ONLY (--hydro-only)")
+        if !isempty(opts.hydro_model_file)
+            println(" Target Model File: $(opts.hydro_model_file)")
+        end
+        println("=================================================================")
+        run_segment_data(opts = opts)
+        run_segment_grid(opts = opts)
+        m_res = run_segment_model(opts = opts)
+        run_segment_climate(opts = opts, model = m_res.model)
+        s_res = run_segment_simulation(opts = opts, model = m_res.model)
+        println("\nHydrodynamic simulation completed successfully.")
+        println("Output flow field saved to: $(s_res.jld2_output_path)")
+        if opts.enable_duckdb
+            close_all_duckdb_storage!()
+        end
+        return
+    end
+
+    if opts.track_only && !("--track" in args || "--tracking" in args || "--segment=track" in args || "--all" in args)
+        println("=================================================================")
+        println(" Execution Mode: Larval Tracking ONLY (--track-only)")
+        if !isempty(opts.hydro_model_file)
+            println(" Reusing Model File: $(opts.hydro_model_file)")
+        end
+        if !isempty(opts.run_id)
+            println(" Active Run ID: $(opts.run_id)")
+        end
+        println("=================================================================")
+        t_res = run_segment_tracking(opts = opts)
+        run_segment_metrics(opts = opts, trajectories = t_res.trajectories)
+        run_segment_visualize(opts = opts, trajectories = t_res.trajectories)
+        println("\nLarval tracking, metrics, and visualizations completed successfully.")
+        if opts.enable_duckdb
+            close_all_duckdb_storage!()
+        end
+        return
+    end
 
     if "--all" in args || "--pipeline" in args || "--segment=all" in args
         run_production_pipeline(opts = opts)
@@ -1725,6 +2066,6 @@ function main(args = ARGS)
 end
 
 # Execute if run directly as script from command line
-if abspath(PROGRAM_FILE) == @__FILE__
+if is_cli_invocation
     main(ARGS)
 end

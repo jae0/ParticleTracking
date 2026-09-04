@@ -151,16 +151,21 @@ end
         trajectories::NamedTuple;
         sample_indices = 1:min(5, size(trajectories.depths, 1)),
         title::AbstractString = "Diel Vertical Migration (DVM) Depth Profiles",
+        show_surface_target::Bool = true,
+        surface_target_depth::Real = -10.0,
         output_path::Union{Nothing, AbstractString} = "outputs/dvm_profiles.png"
     )
 
-Plot larval depth trajectories over time to visualize diurnal oscillations
-between nighttime surface grazing and daytime sub-surface predator avoidance.
+Plot larval depth trajectories over time to visualize initial ascent from benthic
+release depths and diurnal oscillations between nighttime surface grazing and
+daytime sub-surface predator avoidance.
 
 # Inputs
 - `trajectories::NamedTuple`: Output from `track_larval_cohort`.
 - `sample_indices`: Range or vector of particle indices to plot.
 - `title::AbstractString`: Figure title.
+- `show_surface_target::Bool`: Whether to draw reference line for surface target layer.
+- `surface_target_depth::Real`: Surface mixed layer target depth in meters (default -10.0 m).
 - `output_path::Union{Nothing, AbstractString}`: Destination path for figure.
 
 # Outputs
@@ -174,6 +179,8 @@ function plot_vertical_migration_profiles(
     trajectories::NamedTuple;
     sample_indices = 1:min(5, size(trajectories.depths, 1)),
     title::AbstractString = "Diel Vertical Migration (DVM) Depth Profiles",
+    show_surface_target::Bool = true,
+    surface_target_depth::Real = -10.0,
     output_path::Union{Nothing, AbstractString} = "outputs/dvm_profiles.png"
 )
     fig = Figure(size = (850, 480), fontsize = 13)
@@ -197,9 +204,27 @@ function plot_vertical_migration_profiles(
             linewidth = 2.0,
             label = "Larva $(p)"
         )
+        scatter!(
+            ax,
+            [time_hours[1]],
+            [trajectories.depths[p, 1]],
+            color = c,
+            marker = :circle,
+            markersize = 8
+        )
     end
 
     hlines!(ax, [0.0], color = :gray50, linestyle = :dash)
+    if show_surface_target
+        hlines!(
+            ax,
+            [Float64(surface_target_depth)],
+            color = :teal,
+            linestyle = :dot,
+            linewidth = 1.5,
+            label = "Surface Target ($(round(surface_target_depth, digits=1))m)"
+        )
+    end
     axislegend(ax, position = :rb)
 
     if !isnothing(output_path)
@@ -360,9 +385,9 @@ function plot_larval_dispersal_density(
     for p in 1:n_p
         x = end_lons[p]
         y = end_lats[p]
-        i = searchsortedlast(lon_bins, x)
-        j = searchsortedlast(lat_bins, y)
-        if 1 <= i <= nx && 1 <= j <= ny
+        if lon_bins[1] <= x <= lon_bins[end] && lat_bins[1] <= y <= lat_bins[end]
+            i = clamp(searchsortedlast(lon_bins, x), 1, nx)
+            j = clamp(searchsortedlast(lat_bins, y), 1, ny)
             density[i, j] += 1.0
         end
     end
@@ -629,79 +654,394 @@ function plot_recruitment_summary(
 end
 
 """
-    extract_hydrodynamic_dataset(
-        hydro_input::Any;
-        domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
-        domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0),
-        grid_size::Tuple{Int, Int} = (35, 30)
+    resolve_depth_index(
+        depths::AbstractVector{<:Real},
+        depth::Union{Nothing, Real},
+        depth_level::Union{Nothing, Int}
+    ) -> Int
+
+Resolve discrete vertical grid level index from either continuous depth in meters
+(positive or negative) or discrete index. Defaults to surface (index 1).
+"""
+function resolve_depth_index(
+    depths::AbstractVector{<:Real},
+    depth::Union{Nothing, Real},
+    depth_level::Union{Nothing, Int}
+)::Int
+    nz = length(depths)
+    nz == 0 && return 1
+    if !isnothing(depth)
+        target_z = depth > 0 ? -Float64(depth) : Float64(depth)
+        return argmin([abs(Float64(d) - target_z) for d in depths])
+    elseif !isnothing(depth_level)
+        return clamp(depth_level, 1, nz)
+    else
+        return 1
+    end
+end
+
+"""
+    resolve_time_index(
+        times::AbstractVector{<:Real},
+        time_seconds::Union{Nothing, Real},
+        time_index::Union{Nothing, Int}
+    ) -> Int
+
+Resolve discrete temporal snapshot index from either continuous timestamp in seconds
+or discrete index. Defaults to first snapshot (index 1).
+"""
+function resolve_time_index(
+    times::AbstractVector{<:Real},
+    time_seconds::Union{Nothing, Real},
+    time_index::Union{Nothing, Int}
+)::Int
+    nt = length(times)
+    nt == 0 && return 1
+    if !isnothing(time_seconds)
+        return argmin([abs(Float64(t) - Float64(time_seconds)) for t in times])
+    elseif !isnothing(time_index)
+        return clamp(time_index, 1, nt)
+    else
+        return 1
+    end
+end
+
+"""
+    compute_hydrodynamic_diagnostics(
+        lons::AbstractVector{<:Real},
+        lats::AbstractVector{<:Real},
+        depths::AbstractVector{<:Real},
+        u::AbstractArray{<:Real, 3},
+        v::AbstractArray{<:Real, 3},
+        w::AbstractArray{<:Real, 3},
+        temp::AbstractArray{<:Real, 3},
+        sal::AbstractArray{<:Real, 3};
+        ν_closure::Real = 1e-2,
+        κ_closure::Real = 1e-2
     ) -> NamedTuple
 
-Extract, normalize, and format 2D and 3D hydrodynamic model fields (current velocity
-vectors, speed, temperature, salinity, vertical velocity, free-surface elevation,
-and bathymetry) for visualization and Leaflet layer serialization.
+Compute derived physical oceanographic diagnostics:
+- Potential Density \$\\rho(S, T)\$ (Boussinesq linear approximation).
+- Brunt-Väisälä buoyancy frequency squared \$N^2 = -(g/\\rho_0) \\partial \\rho / \\partial z\$.
+- Vertical salinity stratification gradient \$\\partial S / \\partial z\$.
+- Turbulent vertical eddy diffusivity \$\\kappa_v\$ and eddy viscosity \$\\nu_v\$ via
+  shear-stratification gradient Richardson number \$Ri = N^2 / [(\\partial u/\\partial z)^2 + (\\partial v/\\partial z)^2]\$.
+- Relative vertical vorticity \$\\zeta = \\partial v / \\partial x - \\partial u / \\partial y\$.
+"""
+function compute_hydrodynamic_diagnostics(
+    lons::AbstractVector{<:Real},
+    lats::AbstractVector{<:Real},
+    depths::AbstractVector{<:Real},
+    u::AbstractArray{<:Real, 3},
+    v::AbstractArray{<:Real, 3},
+    w::AbstractArray{<:Real, 3},
+    temp::AbstractArray{<:Real, 3},
+    sal::AbstractArray{<:Real, 3};
+    ν_closure::Real = 1e-2,
+    κ_closure::Real = 1e-2
+)::NamedTuple
+    nx = length(lons)
+    ny = length(lats)
+    nz = length(depths)
+
+    # 1. Seawater Density (Boussinesq linear equation of state)
+    rho0 = 1025.0
+    alpha = 1.7e-4
+    beta = 7.6e-4
+    T0 = 10.0
+    S0 = 35.0
+
+    rho = zeros(Float64, nx, ny, nz)
+    for k in 1:nz, j in 1:ny, i in 1:nx
+        t_val = Float64(temp[i, j, k])
+        s_val = Float64(sal[i, j, k])
+        if !isnan(t_val) && !isnan(s_val)
+            rho[i, j, k] = rho0 * (1.0 - alpha * (t_val - T0) + beta * (s_val - S0))
+        else
+            rho[i, j, k] = NaN
+        end
+    end
+
+    # 2. Stratification: N² and ∂S/∂z
+    N2 = zeros(Float64, nx, ny, nz)
+    dS_dz = zeros(Float64, nx, ny, nz)
+    shear_sq = zeros(Float64, nx, ny, nz)
+
+    for k in 1:nz
+        k_prev = max(1, k - 1)
+        k_next = min(nz, k + 1)
+        dz = Float64(depths[k_prev] - depths[k_next])
+        if abs(dz) < 1e-6
+            dz = 1.0
+        end
+
+        for j in 1:ny, i in 1:nx
+            if !isnan(rho[i, j, k_prev]) && !isnan(rho[i, j, k_next])
+                # Depths are negative, depths[k_prev] > depths[k_next], so dz > 0
+                drho = rho[i, j, k_prev] - rho[i, j, k_next]
+                N2[i, j, k] = max(0.0, -(9.81 / rho0) * (drho / dz))
+
+                ds = Float64(sal[i, j, k_prev] - sal[i, j, k_next])
+                dS_dz[i, j, k] = ds / dz
+
+                du = Float64(u[i, j, k_prev] - u[i, j, k_next]) / dz
+                dv = Float64(v[i, j, k_prev] - v[i, j, k_next]) / dz
+                shear_sq[i, j, k] = du^2 + dv^2
+            else
+                N2[i, j, k] = NaN
+                dS_dz[i, j, k] = NaN
+                shear_sq[i, j, k] = NaN
+            end
+        end
+    end
+
+    # 3. Turbulent eddy diffusivity & viscosity (Richardson number parameterization)
+    diff = zeros(Float64, nx, ny, nz)
+    visc = zeros(Float64, nx, ny, nz)
+    ri_arr = zeros(Float64, nx, ny, nz)
+
+    for k in 1:nz
+        z_m = Float64(depths[k])
+        surf_mix = 0.015 * exp(z_m / 25.0)
+
+        for j in 1:ny, i in 1:nx
+            n2_val = N2[i, j, k]
+            s2_val = shear_sq[i, j, k]
+            if !isnan(n2_val) && !isnan(s2_val)
+                ri = max(0.0, n2_val / max(s2_val, 1e-7))
+                ri_arr[i, j, k] = ri
+
+                k_eddy = 1e-5 + 1e-2 / ((1.0 + 5.0 * ri)^2) + surf_mix
+                nu_eddy = 1e-4 + 1e-2 / ((1.0 + 5.0 * ri)^3) + surf_mix
+
+                diff[i, j, k] = clamp(k_eddy, 1e-6, 0.05)
+                visc[i, j, k] = clamp(nu_eddy, 1e-5, 0.05)
+            else
+                ri_arr[i, j, k] = NaN
+                diff[i, j, k] = NaN
+                visc[i, j, k] = NaN
+            end
+        end
+    end
+
+    # 4. Relative Vorticity ζ at surface level
+    vort = zeros(Float64, nx, ny)
+    r_earth = 6.371e6
+    for j in 2:(ny - 1), i in 2:(nx - 1)
+        dx_m = r_earth * cosd(Float64(lats[j])) * deg2rad(Float64(lons[i + 1] - lons[i - 1]))
+        dy_m = r_earth * deg2rad(Float64(lats[j + 1] - lats[j - 1]))
+        if !isnan(v[i + 1, j, 1]) && !isnan(v[i - 1, j, 1]) &&
+           !isnan(u[i, j + 1, 1]) && !isnan(u[i, j - 1, 1]) &&
+           dx_m > 0.0 && dy_m > 0.0
+            dv_dx = (Float64(v[i + 1, j, 1]) - Float64(v[i - 1, j, 1])) / dx_m
+            du_dy = (Float64(u[i, j + 1, 1]) - Float64(u[i, j - 1, 1])) / dy_m
+            vort[i, j] = dv_dx - du_dy
+        else
+            vort[i, j] = NaN
+        end
+    end
+
+    return (
+        density = rho,
+        stratification = N2,
+        salinity_stratification = dS_dz,
+        diffusion = diff,
+        viscosity = visc,
+        richardson = ri_arr,
+        vorticity = vort
+    )
+end
+
+"""
+    extract_hydrodynamic_dataset(
+        hydro_input::Any;
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = nothing,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = nothing,
+        domain_lon::Tuple{<:Real, <:Real} = (-71.0, -53.0),
+        domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
+        grid_size::Tuple{Int, Int} = (35, 30),
+        target_depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0],
+        run_id::Union{Nothing, AbstractString} = nothing
+    ) -> NamedTuple
+
+Extract, normalize, and format 2D and 3D hydrodynamic model fields (advection currents,
+temperature, salinity, density, stratification, turbulent diffusion, viscosity,
+free surface elevation, and bathymetry) at specific depths and times.
 
 # Mathematical Formulations
 - **Horizontal Advection Current Velocity**:
   ```math
-  \\boldsymbol{u}_h(x, y, z) = (u(x, y, z), v(x, y, z))
-  ```
-  ```math
+  \\boldsymbol{u}_h(x, y, z, t) = (u(x, y, z, t), v(x, y, z, t)), \\quad
   |\\boldsymbol{u}_h| = \\sqrt{u^2 + v^2}
   ```
+- **Seawater Temperature & Practical Salinity**:
+  \$T(x, y, z, t)\$ in °C, \$S(x, y, z, t)\$ in PSU.
+- **Salinity & Density Stratification**:
   ```math
-  \\theta_{\\text{dir}} = \\text{mod}\\left(90^\\circ - \\text{atan2}(v, u) \\cdot \\frac{180^\\circ}{\\pi}, 360^\\circ\\right)
+  N^2(x, y, z, t) = -\\frac{g}{\\rho_0} \\frac{\\partial \\rho}{\\partial z}, \\quad
+  \\frac{\\partial S}{\\partial z}(x, y, z, t)
   ```
-- **Seawater Temperature & Thermal Stratification**:
-  \$T(x, y, z)\$ in °C with vertical thermocline gradient.
-- **Practical Salinity**:
-  \$S(x, y, z)\$ in PSU.
-- **Vertical Velocity (Upwelling/Downwelling)**:
-  \$w(x, y, z)\$ in \$\\text{m s}^{-1}\$.
-- **Free-Surface Height**:
-  \$\\eta(x, y)\$ in meters.
-- **Seafloor Bathymetric Elevation**:
-  \$H(x, y)\$ in meters.
+- **Turbulent Eddy Diffusivity & Viscosity**:
+  \$\\kappa_v(x, y, z, t), \\nu_v(x, y, z, t)\$ in \$m^2 s^{-1}\$ parameterized via Richardson number.
 
 # Inputs
-- `hydro_input`: Oceananigans `HydrostaticFreeSurfaceModel`, `NamedTuple`, `AbstractDict`,
-  DuckDB loaded dataset, or `nothing`.
-- `domain_lon`: Longitudinal range `(min_lon, max_lon)`.
-- `domain_lat`: Latitudinal range `(min_lat, max_lat)`.
-- `grid_size`: Target 2D grid resolution `(nx, ny)` for raster serialization.
+- `hydro_input`: Oceananigans model, JLD2 file path, DuckDB connection, NamedTuple, Dict, or `nothing`.
+- `depth`: Optional continuous depth in meters (e.g. `-25.0` or `25.0`).
+- `depth_level`: Optional vertical level index (1-indexed).
+- `time_seconds`: Optional simulation time in seconds.
+- `time_index`: Optional discrete time snapshot index.
+- `domain_lon`: Longitudinal bounds `(min_lon, max_lon)`.
+- `domain_lat`: Latitudinal bounds `(min_lat, max_lat)`.
+- `grid_size`: Horizontal grid dimension `(nx, ny)`.
+- `target_depths`: Depth coordinates in meters (default `[-2.5, -25.0, -50.0, -100.0]`).
+- `run_id`: Optional DuckDB simulation run identifier.
 
 # Outputs
-- `NamedTuple`:
-  - `lons::Vector{Float64}`: Longitude coordinates.
-  - `lats::Vector{Float64}`: Latitude coordinates.
-  - `depths::Vector{Float64}`: Depth level coordinates.
-  - `u::Array{Float64, 3}`: Zonal velocity (\$m s^{-1}\$).
-  - `v::Array{Float64, 3}`: Meridional velocity (\$m s^{-1}\$).
-  - `w::Array{Float64, 3}`: Vertical velocity (\$m s^{-1}\$).
-  - `speed::Array{Float64, 3}`: Current speed (\$m s^{-1}\$).
-  - `temperature::Array{Float64, 3}`: Seawater temperature (°C).
-  - `salinity::Array{Float64, 3}`: Practical salinity (PSU).
-  - `elevation::Matrix{Float64}`: Free-surface elevation \$\\eta\$ (m).
-  - `bathymetry::Matrix{Float64}`: Seafloor elevation (m).
+- `NamedTuple` containing:
+  - `lons`, `lats`, `depths`: Grid coordinates.
+  - `times`, `time_seconds`: Available timestamps and resolved snapshot time.
+  - `depth_index`, `depth_m`: Resolved vertical level and depth in meters.
+  - `u`, `v`, `w`, `speed`: Velocity fields (\$m s^{-1}\$).
+  - `temperature`, `salinity`: Hydrographic tracers (°C, PSU).
+  - `density`: Potential density (\$kg m^{-3}\$).
+  - `stratification`: Buoyancy frequency squared \$N^2\$ (\$s^{-2}\$).
+  - `salinity_stratification`: Vertical salinity gradient (\$PSU m^{-1}\$).
+  - `diffusion`, `viscosity`: Turbulent diffusivities (\$m^2 s^{-1}\$).
+  - `richardson_number`: Gradient Richardson number \$Ri\$.
+  - `vorticity`: Relative vorticity (\$s^{-1}\$).
+  - `elevation`, `bathymetry`: Surface elevation and seafloor depth (m).
 """
 function extract_hydrodynamic_dataset(
     hydro_input::Any;
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = nothing,
+    time_seconds::Union{Nothing, Real} = nothing,
+    time_index::Union{Nothing, Int} = nothing,
     domain_lon::Tuple{<:Real, <:Real} = (-71.0, -53.0),
     domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
-    grid_size::Tuple{Int, Int} = (35, 30)
+    grid_size::Tuple{Int, Int} = (35, 30),
+    target_depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0],
+    run_id::Union{Nothing, AbstractString} = nothing
 )
     nx, ny = grid_size
-    target_lons = range(domain_lon[1], domain_lon[2], length = nx)
-    target_lats = range(domain_lat[1], domain_lat[2], length = ny)
-    target_depths = [-2.5, -25.0, -50.0, -100.0]
-    nz = length(target_depths)
+    t_depths = collect(Float64, target_depths)
+    nz = length(t_depths)
 
-    # 1. Direct Oceananigans Model Instance
+    # 1. JLD2 Simulation Output File
+    if hydro_input isa AbstractString && isfile(hydro_input) && endswith(hydro_input, ".jld2")
+        local lons_j, lats_j, deps_j, times_j, u_j, v_j, w_j, T_j, S_j, elev_j
+        jldopen(hydro_input, "r") do file
+            u_group = file["timeseries/u"]
+            raw_keys = collect(keys(u_group))
+            sorted_keys = sort(raw_keys, by = k -> something(tryparse(Float64, k), 0.0))
+            times_j = haskey(file, "timeseries/t") ?
+                collect(Float64, file["timeseries/t"]) :
+                [something(tryparse(Float64, k), Float64(idx)) for (idx, k) in enumerate(sorted_keys)]
+
+            t_idx = resolve_time_index(times_j, time_seconds, time_index)
+            key_sel = sorted_keys[t_idx]
+
+            sample_u = file["timeseries/u/$(key_sel)"]
+            nx_f, ny_f, nz_f = size(sample_u)
+
+            if haskey(file, "grid")
+                g = file["grid"]
+                lons_j = haskey(g, "λᶜᵃᵃ") ? collect(Float64, g["λᶜᵃᵃ"][1:nx_f]) : collect(range(domain_lon[1], domain_lon[2], length=nx_f))
+                lats_j = haskey(g, "φᵃᶜᵃ") ? collect(Float64, g["φᵃᶜᵃ"][1:ny_f]) : collect(range(domain_lat[1], domain_lat[2], length=ny_f))
+                deps_j = haskey(g, "zᵃᵃᶜ") ? collect(Float64, g["zᵃᵃᶜ"][1:nz_f]) : t_depths
+            else
+                lons_j = collect(range(domain_lon[1], domain_lon[2], length=nx_f))
+                lats_j = collect(range(domain_lat[1], domain_lat[2], length=ny_f))
+                deps_j = t_depths
+            end
+
+            u_j = Float64.(file["timeseries/u/$(key_sel)"])
+            v_j = Float64.(file["timeseries/v/$(key_sel)"])
+            w_j = haskey(file, "timeseries/w") ? Float64.(file["timeseries/w/$(key_sel)"]) : zeros(nx_f, ny_f, nz_f)
+            T_j = haskey(file, "timeseries/T") ? Float64.(file["timeseries/T/$(key_sel)"]) : fill(4.5, nx_f, ny_f, nz_f)
+            S_j = haskey(file, "timeseries/S") ? Float64.(file["timeseries/S/$(key_sel)"]) : fill(33.0, nx_f, ny_f, nz_f)
+            elev_j = haskey(file, "timeseries/η") ? Float64.(file["timeseries/η/$(key_sel)"]) : zeros(nx_f, ny_f)
+        end
+
+        diag = compute_hydrodynamic_diagnostics(lons_j, lats_j, deps_j, u_j, v_j, w_j, T_j, S_j)
+        k_sel = resolve_depth_index(deps_j, depth, depth_level)
+        sel_time = isempty(times_j) ? 0.0 : times_j[resolve_time_index(times_j, time_seconds, time_index)]
+
+        return (
+            lons = lons_j,
+            lats = lats_j,
+            depths = deps_j,
+            times = times_j,
+            time_seconds = sel_time,
+            resolved_time = sel_time,
+            depth_index = k_sel,
+            depth_m = deps_j[k_sel],
+            resolved_depth = deps_j[k_sel],
+            u = u_j,
+            v = v_j,
+            w = w_j,
+            speed = hypot.(u_j, v_j),
+            temperature = T_j,
+            salinity = S_j,
+            density = diag.density,
+            stratification = diag.stratification,
+            salinity_stratification = diag.salinity_stratification,
+            diffusion = diag.diffusion,
+            viscosity = diag.viscosity,
+            richardson_number = diag.richardson,
+            vorticity = diag.vorticity,
+            elevation = elev_j,
+            bathymetry = fill(-150.0, length(lons_j), length(lats_j))
+        )
+    end
+
+    # 2. DuckDB Database Connection
+    if !isnothing(hydro_input) && (hydro_input isa DuckDB.DB)
+        r_id = !isnothing(run_id) ? String(run_id) : begin
+            runs_df = list_simulation_runs(hydro_input)
+            nrow(runs_df) > 0 ? String(first(runs_df.run_id)) : "run_baseline_2025"
+        end
+        loaded = load_hydrodynamic_field(hydro_input, r_id; time_seconds = time_seconds, depth_level = depth_level)
+        diag = compute_hydrodynamic_diagnostics(loaded.lons, loaded.lats, loaded.depths, loaded.u, loaded.v, loaded.w, loaded.temperature, loaded.salinity)
+        k_sel = resolve_depth_index(loaded.depths, depth, depth_level)
+
+        return (
+            lons = loaded.lons,
+            lats = loaded.lats,
+            depths = loaded.depths,
+            times = !isnothing(time_seconds) ? [Float64(time_seconds)] : [0.0],
+            time_seconds = something(time_seconds, 0.0),
+            resolved_time = something(time_seconds, 0.0),
+            depth_index = k_sel,
+            depth_m = loaded.depths[k_sel],
+            resolved_depth = loaded.depths[k_sel],
+            u = loaded.u,
+            v = loaded.v,
+            w = loaded.w,
+            speed = hypot.(loaded.u, loaded.v),
+            temperature = loaded.temperature,
+            salinity = loaded.salinity,
+            density = diag.density,
+            stratification = diag.stratification,
+            salinity_stratification = diag.salinity_stratification,
+            diffusion = diag.diffusion,
+            viscosity = diag.viscosity,
+            richardson_number = diag.richardson,
+            vorticity = diag.vorticity,
+            elevation = loaded.elevation,
+            bathymetry = fill(-150.0, length(loaded.lons), length(loaded.lats))
+        )
+    end
+
+    # 3. Direct Oceananigans Model Instance
     if !isnothing(hydro_input) && hasproperty(hydro_input, :velocities) && hasproperty(hydro_input, :tracers)
         g = hydro_input.grid
-        under_g = g isa ImmersedBoundaryGrid ? g.underlying_grid : g
-        m_lons = collect(under_g.λᶠᵃᵃ[1:under_g.Nx])
-        m_lats = collect(under_g.φᵃᶠᵃ[1:under_g.Ny])
-        m_depths = collect(under_g.zᵃᵃᶜ[1:under_g.Nz])
+        coords = extract_grid_coordinates(g)
+        m_lons = coords.lons
+        m_lats = coords.lats
+        m_depths = coords.depths
 
         u_arr = Array(interior(hydro_input.velocities.u))
         v_arr = Array(interior(hydro_input.velocities.v))
@@ -717,23 +1057,39 @@ function extract_hydrodynamic_dataset(
             fill(-150.0, length(m_lons), length(m_lats))
         end
 
-        spd_arr = hypot.(u_arr, v_arr)
+        model_time = hasproperty(hydro_input, :clock) ? Float64(hydro_input.clock.time) : 0.0
+        diag = compute_hydrodynamic_diagnostics(m_lons, m_lats, m_depths, u_arr, v_arr, w_arr, t_arr, s_arr)
+        k_sel = resolve_depth_index(m_depths, depth, depth_level)
+
         return (
             lons = collect(Float64, m_lons),
             lats = collect(Float64, m_lats),
             depths = collect(Float64, m_depths),
+            times = [model_time],
+            time_seconds = model_time,
+            resolved_time = model_time,
+            depth_index = k_sel,
+            depth_m = m_depths[k_sel],
+            resolved_depth = m_depths[k_sel],
             u = Float64.(u_arr),
             v = Float64.(v_arr),
             w = Float64.(w_arr),
-            speed = Float64.(spd_arr),
+            speed = hypot.(Float64.(u_arr), Float64.(v_arr)),
             temperature = Float64.(t_arr),
             salinity = Float64.(s_arr),
+            density = diag.density,
+            stratification = diag.stratification,
+            salinity_stratification = diag.salinity_stratification,
+            diffusion = diag.diffusion,
+            viscosity = diag.viscosity,
+            richardson_number = diag.richardson,
+            vorticity = diag.vorticity,
             elevation = Float64.(elev_mat),
             bathymetry = Float64.(bathy_mat)
         )
     end
 
-    # 2. NamedTuple / Dict representation
+    # 4. NamedTuple / Dict representation
     if !isnothing(hydro_input) && (hydro_input isa NamedTuple || hydro_input isa AbstractDict)
         get_field(keys_to_try, default_val) = begin
             for k in keys_to_try
@@ -746,9 +1102,12 @@ function extract_hydrodynamic_dataset(
             return default_val
         end
 
+        target_lons = range(domain_lon[1], domain_lon[2], length = nx)
+        target_lats = range(domain_lat[1], domain_lat[2], length = ny)
+
         in_lons = get_field((:lons, :grid_lons, :lon), target_lons)
         in_lats = get_field((:lats, :grid_lats, :lat), target_lats)
-        in_depths = get_field((:depths, :grid_depths, :depth), target_depths)
+        in_depths = get_field((:depths, :grid_depths, :depth), t_depths)
 
         nx_in = length(in_lons)
         ny_in = length(in_lats)
@@ -762,30 +1121,62 @@ function extract_hydrodynamic_dataset(
         in_elev = get_field((:elevation, :η, :eta, :ssh), zeros(Float64, nx_in, ny_in))
         in_bathy = get_field((:bathymetry, :bathy, :elevation_bottom), fill(-150.0, nx_in, ny_in))
 
-        to_3d(arr) = arr isa AbstractMatrix ? reshape(arr, size(arr, 1), size(arr, 2), 1) : arr
-        u_3d = to_3d(in_u)
-        v_3d = to_3d(in_v)
-        w_3d = to_3d(in_w)
-        t_3d = to_3d(in_t)
-        s_3d = to_3d(in_s)
-        spd_3d = hypot.(u_3d, v_3d)
+        # Handle 4D time slices if present
+        slice_3d(arr) = begin
+            if ndims(arr) == 4
+                t_sub = resolve_time_index(get_field((:times, :t), [0.0]), time_seconds, time_index)
+                return arr[:, :, :, clamp(t_sub, 1, size(arr, 4))]
+            elseif ndims(arr) == 2
+                return reshape(arr, size(arr, 1), size(arr, 2), 1)
+            else
+                return arr
+            end
+        end
+
+        u_3d = Float64.(slice_3d(in_u))
+        v_3d = Float64.(slice_3d(in_v))
+        w_3d = Float64.(slice_3d(in_w))
+        t_3d = Float64.(slice_3d(in_t))
+        s_3d = Float64.(slice_3d(in_s))
+
+        times_arr = get_field((:times, :t), [something(time_seconds, 0.0)])
+        sel_time = isempty(times_arr) ? 0.0 : times_arr[resolve_time_index(times_arr, time_seconds, time_index)]
+        diag = compute_hydrodynamic_diagnostics(in_lons, in_lats, in_depths, u_3d, v_3d, w_3d, t_3d, s_3d)
+        k_sel = resolve_depth_index(in_depths, depth, depth_level)
 
         return (
             lons = collect(Float64, in_lons),
             lats = collect(Float64, in_lats),
             depths = collect(Float64, in_depths),
-            u = Float64.(u_3d),
-            v = Float64.(v_3d),
-            w = Float64.(w_3d),
-            speed = Float64.(spd_3d),
-            temperature = Float64.(t_3d),
-            salinity = Float64.(s_3d),
+            times = collect(Float64, times_arr),
+            time_seconds = Float64(sel_time),
+            resolved_time = Float64(sel_time),
+            depth_index = k_sel,
+            depth_m = Float64(in_depths[k_sel]),
+            resolved_depth = Float64(in_depths[k_sel]),
+            u = u_3d,
+            v = v_3d,
+            w = w_3d,
+            speed = hypot.(u_3d, v_3d),
+            temperature = t_3d,
+            salinity = s_3d,
+            density = diag.density,
+            stratification = diag.stratification,
+            salinity_stratification = diag.salinity_stratification,
+            diffusion = diag.diffusion,
+            viscosity = diag.viscosity,
+            richardson_number = diag.richardson,
+            vorticity = diag.vorticity,
             elevation = Float64.(in_elev isa AbstractMatrix ? in_elev : fill(0.0, nx_in, ny_in)),
             bathymetry = Float64.(in_bathy isa AbstractMatrix ? in_bathy : fill(-150.0, nx_in, ny_in))
         )
     end
 
-    # 3. Default Realistic Scotian Shelf Regional Hydrodynamic Synthesis
+    # 5. Default Realistic Regional Hydrodynamic Synthesis with Temporal Evolution
+    t_sec = something(time_seconds, 0.0)
+    target_lons = range(domain_lon[1], domain_lon[2], length = nx)
+    target_lats = range(domain_lat[1], domain_lat[2], length = ny)
+
     u_mat = zeros(Float64, nx, ny, nz)
     v_mat = zeros(Float64, nx, ny, nz)
     w_mat = zeros(Float64, nx, ny, nz)
@@ -796,6 +1187,11 @@ function extract_hydrodynamic_dataset(
 
     lons_vec = collect(Float64, target_lons)
     lats_vec = collect(Float64, target_lats)
+
+    # Semi-diurnal M2 tidal phase and seasonal warming phase
+    omega_m2 = 2.0 * π / (12.42 * 3600.0)
+    tide_phase = cos(omega_m2 * t_sec)
+    season_phase = sin(2.0 * π * (t_sec - 60.0 * 86400.0) / (365.25 * 86400.0))
 
     for i in 1:nx, j in 1:ny
         lon = lons_vec[i]
@@ -814,26 +1210,28 @@ function extract_hydrodynamic_dataset(
         end
         bathy_mat[i, j] = clamp(b_elev, -3200.0, -25.0)
 
-        # Free Surface SSH: cross-shelf steric setup
-        elev_mat[i, j] = 0.05 * sin(2.0 * π * x_norm) - 0.04 * cos(π * y_norm)
+        # Free Surface SSH: cross-shelf steric setup + tidal oscillation
+        elev_mat[i, j] = (0.05 * sin(2.0 * π * x_norm) - 0.04 * cos(π * y_norm)) + 0.35 * tide_phase
 
         for k in 1:nz
-            z = target_depths[k]
+            z = t_depths[k]
             depth_factor = exp(z / 75.0)
 
-            # Alongshore Scotian Current Jet
+            # Alongshore Scotian Current Jet with tidal modulation
             jet_core = exp(-((dist_to_coast - 0.4)^2) / 0.18)
-            u_base = -0.09 * depth_factor * (0.6 + 0.8 * jet_core) + 0.02 * sin(2.0 * π * y_norm)
-            v_base = -0.04 * depth_factor * (0.5 + 0.7 * jet_core) + 0.015 * cos(2.0 * π * x_norm)
+            u_base = -0.09 * depth_factor * (0.6 + 0.8 * jet_core) + 0.02 * sin(2.0 * π * y_norm) +
+                     0.06 * tide_phase * sin(π * y_norm)
+            v_base = -0.04 * depth_factor * (0.5 + 0.7 * jet_core) + 0.015 * cos(2.0 * π * x_norm) +
+                     0.04 * sin(omega_m2 * t_sec) * cos(π * x_norm)
 
             u_mat[i, j, k] = u_base
             v_mat[i, j, k] = v_base
 
-            # Coastal upwelling / downwelling vertical velocity
+            # Vertical velocity (coastal upwelling / downwelling)
             w_mat[i, j, k] = 0.00035 * sin(2.0 * π * x_norm) * sin(π * y_norm) * (1.0 + z / 100.0)
 
-            # Thermal Stratification: Surface warm layer, Cold Intermediate Layer (CIL) at -50m
-            t_surface = 14.2 - 2.5 * y_norm + 1.2 * x_norm
+            # Thermal Stratification: Surface warm layer + seasonal phase, CIL at -50m, warm deep slope
+            t_surface = 14.2 + 2.5 * season_phase - 2.5 * y_norm + 1.2 * x_norm
             t_cil = 2.2 + 0.8 * sin(π * x_norm)
             t_slope = 7.5 + 1.5 * (1.0 - y_norm)
 
@@ -844,9 +1242,9 @@ function extract_hydrodynamic_dataset(
             else
                 t_cil + ((abs(z) - 70.0) / 50.0) * (t_slope - t_cil)
             end
-            t_mat[i, j, k] = clamp(t_val, 0.5, 18.0)
+            t_mat[i, j, k] = clamp(t_val, 0.5, 19.5)
 
-            # Salinity: Fresh coastal water, Mid-shelf, Deep slope water
+            # Practical Salinity stratification
             s_val = 31.4 + 1.8 * (1.0 - y_norm) + 1.2 * x_norm + (abs(z) / 100.0) * 1.1
             s_mat[i, j, k] = clamp(s_val, 30.2, 35.6)
         end
@@ -854,8 +1252,7 @@ function extract_hydrodynamic_dataset(
 
     spd_mat = hypot.(u_mat, v_mat)
 
-    # Mask all ocean fields to NaN over land so quivers and heatmaps do not
-    # render over coastal landmasses. is_point_on_land uses polygon ray-casting.
+    # Mask over land
     for i in 1:nx, j in 1:ny
         if is_point_on_land(lons_vec[i], lats_vec[j])
             for k in 1:nz
@@ -871,16 +1268,32 @@ function extract_hydrodynamic_dataset(
         end
     end
 
+    diag = compute_hydrodynamic_diagnostics(lons_vec, lats_vec, t_depths, u_mat, v_mat, w_mat, t_mat, s_mat)
+    k_sel = resolve_depth_index(t_depths, depth, depth_level)
+
     return (
         lons = lons_vec,
         lats = lats_vec,
-        depths = target_depths,
+        depths = t_depths,
+        times = [t_sec],
+        time_seconds = t_sec,
+        resolved_time = t_sec,
+        depth_index = k_sel,
+        depth_m = t_depths[k_sel],
+        resolved_depth = t_depths[k_sel],
         u = u_mat,
         v = v_mat,
         w = w_mat,
         speed = spd_mat,
         temperature = t_mat,
         salinity = s_mat,
+        density = diag.density,
+        stratification = diag.stratification,
+        salinity_stratification = diag.salinity_stratification,
+        diffusion = diag.diffusion,
+        viscosity = diag.viscosity,
+        richardson_number = diag.richardson,
+        vorticity = diag.vorticity,
         elevation = elev_mat,
         bathymetry = bathy_mat
     )
@@ -889,74 +1302,85 @@ end
 """
     plot_hydrodynamic_advection(
         hydrodynamics::Any;
-        depth_level::Int = 1,
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = 1,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = 1,
         bathymetry_data::Union{Nothing, NamedTuple} = nothing,
         title::AbstractString = "Ocean Hydrodynamic Advection Velocity Field",
         output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_advection.png",
-        quiver_stride::Int = 2
+        quiver_stride::Int = 2,
+        colormap::Symbol = :turbo
     ) -> Figure
 
 Plot 2D horizontal advection current velocity vector arrows \$\\boldsymbol{u}_h = (u, v)\$
-over current speed magnitude \$|\\boldsymbol{u}_h| = \\sqrt{u^2 + v^2}\$ or background
-bathymetry contours.
+over current speed magnitude \$|\\boldsymbol{u}_h| = \\sqrt{u^2 + v^2}\$ at a specific depth and time.
 
 # Mathematical Formulation
-Horizontal flow field \$\\boldsymbol{u}_h(x, y, z_k) = (u, v)\$ with speed:
+Horizontal velocity field \$\\boldsymbol{u}_h(x, y, z_k, t_m) = (u, v)\$ with speed:
 ```math
 |\\boldsymbol{u}_h| = \\sqrt{u^2 + v^2}
 ```
-Directional orientation:
+Flow orientation angle:
 ```math
 \\theta = \\operatorname{atan2}(v, u)
 ```
 
 # Inputs
-- `hydrodynamics`: Oceananigans model instance, NamedTuple, or Dict containing `(lons, lats, u, v)`.
-- `depth_level::Int`: Vertical level index to plot (default: 1 for surface).
-- `bathymetry_data::Union{Nothing, NamedTuple}`: Optional `(lon, lat, elevation)` background.
-- `title::AbstractString`: Figure title.
-- `output_path::Union{Nothing, AbstractString}`: Path to save figure (PNG/PDF).
-- `quiver_stride::Int`: Spatial stride for subsampling vector arrows.
+- `hydrodynamics`: Model instance, JLD2 path, DuckDB database, or NamedTuple.
+- `depth`: Target continuous depth in meters (e.g. `-25.0` or `25.0`).
+- `depth_level`: Vertical discrete index (default: 1).
+- `time_seconds`: Timestamp in seconds.
+- `time_index`: Snapshot index.
+- `bathymetry_data`: Optional background elevation dataset.
+- `title`: Figure title.
+- `output_path`: Destination file path.
+- `quiver_stride`: Spatial subsampling step for vector arrows.
+- `colormap`: CairoMakie colormap symbol (default `:turbo`).
 
 # Outputs
 - `Figure`: CairoMakie figure object.
-
-# References
-- Marshall, J., et al. (1997). A finite-volume, incompressible Navier Stokes model for
-  studies of the ocean on parallel computers. *J. Geophys. Res. Oceans*, 102(C3), 5753-5766.
 """
 function plot_hydrodynamic_advection(
     hydrodynamics::Any;
-    depth_level::Int = 1,
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = 1,
+    time_seconds::Union{Nothing, Real} = nothing,
+    time_index::Union{Nothing, Int} = 1,
     bathymetry_data::Union{Nothing, NamedTuple} = nothing,
     title::AbstractString = "Ocean Hydrodynamic Advection Velocity Field",
     output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_advection.png",
-    quiver_stride::Int = 2
+    quiver_stride::Int = 2,
+    colormap::Symbol = :turbo
 )
-    hydro = extract_hydrodynamic_dataset(hydrodynamics)
+    hydro = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        depth = depth,
+        depth_level = depth_level,
+        time_seconds = time_seconds,
+        time_index = time_index
+    )
     lons = hydro.lons
     lats = hydro.lats
-    nz = length(hydro.depths)
-    k = clamp(depth_level, 1, nz)
-    depth_m = hydro.depths[k]
+    k = hydro.depth_index
+    depth_m = hydro.depth_m
+    t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
 
     u_k = hydro.u[:, :, k]
     v_k = hydro.v[:, :, k]
     spd_k = hydro.speed[:, :, k] .* 100.0
 
-    fig = Figure(size = (950, 720), fontsize = 13)
+    fig = Figure(size = (980, 720), fontsize = 13)
     ax = Axis(
         fig[1, 1],
-        title = "\$(title) [Depth: \$(depth_m) m]",
+        title = "\$(title)\n[Depth: \$(depth_m) m | Time: \$(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
 
-    # 1. Background speed heatmap
-    hm = heatmap!(ax, lons, lats, spd_k, colormap = :turbo)
+    hm = heatmap!(ax, lons, lats, spd_k, colormap = colormap)
     Colorbar(fig[1, 2], hm, label = "Current Speed (|u_h|, cm/s)")
 
-    # 2. Optional bathymetry contour lines
     if !isnothing(bathymetry_data) && hasproperty(bathymetry_data, :elevation)
         contour!(
             ax,
@@ -969,7 +1393,6 @@ function plot_hydrodynamic_advection(
         )
     end
 
-    # 3. Vector arrows
     nx = length(lons)
     ny = length(lats)
     pts = Point2f[]
@@ -1013,55 +1436,65 @@ end
 """
     plot_hydrodynamic_tracers(
         hydrodynamics::Any;
-        depth_level::Int = 1,
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = 1,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = 1,
         title::AbstractString = "Hydrodynamic Model Seawater Tracers",
         output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_tracers.png"
     ) -> Figure
 
 Render a two-panel spatial distribution of active seawater tracer fields
-(Temperature \$T\$ and Practical Salinity \$S\$) from the ocean hydrodynamic model.
+(Temperature \$T\$ and Practical Salinity \$S\$) from the hydrodynamic model
+at a specific depth and time.
 
 # Mathematical Formulations
-- **Thermal Tracer Distribution**:
-  ```math
-  T(x, y, z_k) \\quad [^\\circ\\text{C}]
-  ```
-- **Haline Tracer Distribution**:
-  ```math
-  S(x, y, z_k) \\quad [\\text{PSU}]
-  ```
+- **Thermal Tracer Distribution**: \$T(x, y, z_k, t_m)\$ [°C].
+- **Haline Tracer Distribution**: \$S(x, y, z_k, t_m)\$ [PSU].
 
 # Inputs
-- `hydrodynamics`: Oceananigans model instance, NamedTuple, or Dict containing `(lons, lats, temperature, salinity)`.
-- `depth_level::Int`: Vertical level index to plot (default: 1 for surface).
-- `title::AbstractString`: Figure title.
-- `output_path::Union{Nothing, AbstractString}`: Destination path for figure.
+- `hydrodynamics`: Model, JLD2 file, DuckDB database, or NamedTuple.
+- `depth`: Target depth in meters (e.g. `-50.0`).
+- `depth_level`: Vertical index (default: 1).
+- `time_seconds`: Timestamp in seconds.
+- `time_index`: Snapshot index.
+- `title`: Figure title.
+- `output_path`: Destination path.
 
 # Outputs
 - `Figure`: CairoMakie figure object.
 """
 function plot_hydrodynamic_tracers(
     hydrodynamics::Any;
-    depth_level::Int = 1,
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = 1,
+    time_seconds::Union{Nothing, Real} = nothing,
+    time_index::Union{Nothing, Int} = 1,
     title::AbstractString = "Hydrodynamic Model Seawater Tracers",
     output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_tracers.png"
 )
-    hydro = extract_hydrodynamic_dataset(hydrodynamics)
+    hydro = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        depth = depth,
+        depth_level = depth_level,
+        time_seconds = time_seconds,
+        time_index = time_index
+    )
     lons = hydro.lons
     lats = hydro.lats
-    nz = length(hydro.depths)
-    k = clamp(depth_level, 1, nz)
-    depth_m = hydro.depths[k]
+    k = hydro.depth_index
+    depth_m = hydro.depth_m
+    t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
 
     t_mat = hydro.temperature[:, :, k]
     s_mat = hydro.salinity[:, :, k]
 
-    fig = Figure(size = (1150, 520), fontsize = 12)
+    fig = Figure(size = (1180, 540), fontsize = 12)
 
     # Panel 1: Temperature
     ax1 = Axis(
         fig[1, 1],
-        title = "Seawater Temperature T (°C) [Depth: \$(depth_m) m]",
+        title = "Seawater Temperature T (°C)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
@@ -1071,7 +1504,7 @@ function plot_hydrodynamic_tracers(
     # Panel 2: Salinity
     ax2 = Axis(
         fig[1, 3],
-        title = "Practical Salinity S (PSU) [Depth: \$(depth_m) m]",
+        title = "Practical Salinity S (PSU)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
@@ -1085,6 +1518,600 @@ function plot_hydrodynamic_tracers(
 
     return fig
 end
+
+"""
+    plot_hydrodynamic_stratification(
+        hydrodynamics::Any;
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = 1,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = 1,
+        stations::Union{Nothing, AbstractVector} = nothing,
+        title::AbstractString = "Hydrodynamic Seawater Stratification & Pycnocline Structure",
+        output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_stratification.png"
+    ) -> Figure
+
+Render a three-panel spatial and vertical analysis of ocean stratification:
+1. Horizontal map of Brunt-Väisälä buoyancy frequency squared \$N^2\$ (\$10^{-4} s^{-2}\$).
+2. Horizontal map of Practical Salinity \$S\$ (PSU).
+3. 1D vertical water-column profiles of \$S(z), T(z), N^2(z)\$ at representative shelf stations.
+
+# Mathematical Formulation
+Buoyancy frequency squared (gravitational stability metric):
+```math
+N^2 = -\\frac{g}{\\rho_0} \\frac{\\partial \\rho}{\\partial z}
+    \\approx g \\left( \\alpha \\frac{\\partial T}{\\partial z} - \\beta \\frac{\\partial S}{\\partial z} \\right)
+```
+Vertical salinity gradient (halocline strength):
+```math
+\\frac{\\partial S}{\\partial z} = \\frac{S(z_1) - S(z_2)}{\\Delta z}
+```
+
+# Inputs
+- `hydrodynamics`: Model, JLD2 file, DuckDB database, or NamedTuple.
+- `depth`: Depth in meters (default: surface).
+- `depth_level`: Vertical level index.
+- `time_seconds`: Simulation time in seconds.
+- `time_index`: Snapshot index.
+- `stations`: Optional vector of named coordinates `[(lon=..., lat=..., name=...)]`.
+- `title`: Figure title.
+- `output_path`: Destination path.
+
+# Outputs
+- `Figure`: CairoMakie figure object.
+"""
+function plot_hydrodynamic_stratification(
+    hydrodynamics::Any;
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = 1,
+    time_seconds::Union{Nothing, Real} = nothing,
+    time_index::Union{Nothing, Int} = 1,
+    stations::Union{Nothing, AbstractVector} = nothing,
+    title::AbstractString = "Hydrodynamic Seawater Stratification & Pycnocline Structure",
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_stratification.png"
+)
+    hydro = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        depth = depth,
+        depth_level = depth_level,
+        time_seconds = time_seconds,
+        time_index = time_index
+    )
+    lons = hydro.lons
+    lats = hydro.lats
+    depths = hydro.depths
+    k = hydro.depth_index
+    depth_m = hydro.depth_m
+    t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
+
+    n2_mat = hydro.stratification[:, :, k] .* 10000.0 # 10^-4 s^-2
+    s_mat  = hydro.salinity[:, :, k]
+
+    # Default representative shelf stations if not provided
+    station_list = if !isnothing(stations) && !isempty(stations)
+        stations
+    else
+        [
+            (lon = -63.5, lat = 44.5, name = "Coastal (Halifax)"),
+            (lon = -61.5, lat = 43.5, name = "Mid-Shelf (Emerald)"),
+            (lon = -59.0, lat = 42.8, name = "Outer Slope (Laurentian)")
+        ]
+    end
+
+    fig = Figure(size = (1500, 520), fontsize = 12)
+
+    # Panel 1: Buoyancy Frequency N²
+    ax1 = Axis(
+        fig[1, 1],
+        title = "Buoyancy Frequency N² (10⁻⁴ s⁻²)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        xlabel = "Longitude (°E)",
+        ylabel = "Latitude (°N)"
+    )
+    hm1 = heatmap!(ax1, lons, lats, n2_mat, colormap = :ice)
+    Colorbar(fig[1, 2], hm1, label = "N² (10⁻⁴ s⁻²)")
+
+    # Panel 2: Practical Salinity S
+    ax2 = Axis(
+        fig[1, 3],
+        title = "Practical Salinity S (PSU)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        xlabel = "Longitude (°E)",
+        ylabel = "Latitude (°N)"
+    )
+    hm2 = heatmap!(ax2, lons, lats, s_mat, colormap = :viridis)
+    Colorbar(fig[1, 4], hm2, label = "Salinity (PSU)")
+
+    # Panel 3: Vertical 1D Profiles at stations
+    ax3 = Axis(
+        fig[1, 5],
+        title = "Vertical Stratification S(z) Profiles",
+        xlabel = "Practical Salinity S (PSU)",
+        ylabel = "Depth (m)"
+    )
+
+    colors = [:darkblue, :forestgreen, :darkorange, :purple]
+    markers = [:circle, :diamond, :rect, :star5]
+
+    for (st_idx, st) in enumerate(station_list)
+        c_lon = st.lon
+        c_lat = st.lat
+        st_name = hasproperty(st, :name) ? st.name : "Station \$(st_idx)"
+        col = colors[mod1(st_idx, length(colors))]
+        mkr = markers[mod1(st_idx, length(markers))]
+
+        i_st = argmin(abs.(lons .- c_lon))
+        j_st = argmin(abs.(lats .- c_lat))
+
+        # Mark station location on map panels
+        scatter!(ax1, [lons[i_st]], [lats[j_st]], color = col, marker = mkr, markersize = 12, strokecolor = :white, strokewidth = 1.5)
+        scatter!(ax2, [lons[i_st]], [lats[j_st]], color = col, marker = mkr, markersize = 12, strokecolor = :white, strokewidth = 1.5)
+
+        # Plot vertical 1D salinity profile S(z)
+        s_profile = hydro.salinity[i_st, j_st, :]
+        lines!(ax3, s_profile, depths, color = col, linewidth = 2.4, label = st_name)
+        scatter!(ax3, s_profile, depths, color = col, marker = mkr, markersize = 8)
+    end
+
+    axislegend(ax3, position = :rb)
+
+    if !isnothing(output_path)
+        mkpath(dirname(output_path))
+        save(output_path, fig)
+    end
+
+    return fig
+end
+
+"""
+    plot_hydrodynamic_diffusion(
+        hydrodynamics::Any;
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = 1,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = 1,
+        title::AbstractString = "Hydrodynamic Turbulent Eddy Diffusivity & Viscosity",
+        output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_diffusion.png"
+    ) -> Figure
+
+Render a three-panel visualization of ocean turbulent mixing fields:
+1. Horizontal map of turbulent vertical eddy diffusivity \$\\kappa_v\$ (\$m^2 s^{-1}\$).
+2. Horizontal map of turbulent vertical eddy viscosity \$\\nu_v\$ (\$m^2 s^{-1}\$).
+3. Vertical 1D profiles of \$\\kappa_v(z)\$ illustrating mixed-layer mixing and pycnocline barrier.
+
+# Mathematical Formulation
+Parameterization via gradient Richardson number \$Ri\$:
+```math
+Ri = \\frac{N^2}{\\left(\\frac{\\partial u}{\\partial z}\\right)^2 + \\left(\\frac{\\partial v}{\\partial z}\\right)^2}, \\quad
+\\kappa_v(z) = \\kappa_{\\text{bg}} + \\frac{\\kappa_{\\text{max}}}{(1 + 5 Ri)^2} + \\kappa_{\\text{surf}} \\exp(z / h_{\\text{mix}})
+```
+
+# Inputs
+- `hydrodynamics`: Model instance, JLD2 file, DuckDB database, or NamedTuple.
+- `depth`: Depth in meters.
+- `depth_level`: Vertical level index.
+- `time_seconds`: Timestamp in seconds.
+- `time_index`: Snapshot index.
+- `title`: Figure title.
+- `output_path`: Destination file path.
+
+# Outputs
+- `Figure`: CairoMakie figure object.
+"""
+function plot_hydrodynamic_diffusion(
+    hydrodynamics::Any;
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = 1,
+    time_seconds::Union{Nothing, Real} = nothing,
+    time_index::Union{Nothing, Int} = 1,
+    title::AbstractString = "Hydrodynamic Turbulent Eddy Diffusivity & Viscosity",
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_diffusion.png"
+)
+    hydro = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        depth = depth,
+        depth_level = depth_level,
+        time_seconds = time_seconds,
+        time_index = time_index
+    )
+    lons = hydro.lons
+    lats = hydro.lats
+    depths = hydro.depths
+    k = hydro.depth_index
+    depth_m = hydro.depth_m
+    t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
+
+    diff_mat = hydro.diffusion[:, :, k] .* 10000.0 # 10^-4 m^2/s
+    visc_mat = hydro.viscosity[:, :, k] .* 10000.0
+
+    fig = Figure(size = (1500, 520), fontsize = 12)
+
+    # Panel 1: Eddy Diffusivity κ_v
+    ax1 = Axis(
+        fig[1, 1],
+        title = "Eddy Diffusivity κ_v (10⁻⁴ m² s⁻¹)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        xlabel = "Longitude (°E)",
+        ylabel = "Latitude (°N)"
+    )
+    hm1 = heatmap!(ax1, lons, lats, diff_mat, colormap = :plasma)
+    Colorbar(fig[1, 2], hm1, label = "κ_v (10⁻⁴ m² s⁻¹)")
+
+    # Panel 2: Eddy Viscosity ν_v
+    ax2 = Axis(
+        fig[1, 3],
+        title = "Eddy Viscosity ν_v (10⁻⁴ m² s⁻¹)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        xlabel = "Longitude (°E)",
+        ylabel = "Latitude (°N)"
+    )
+    hm2 = heatmap!(ax2, lons, lats, visc_mat, colormap = :magma)
+    Colorbar(fig[1, 4], hm2, label = "ν_v (10⁻⁴ m² s⁻¹)")
+
+    # Panel 3: Vertical 1D Diffusivity Profiles
+    ax3 = Axis(
+        fig[1, 5],
+        title = "Vertical Diffusivity Profiles κ_v(z)",
+        xlabel = "Eddy Diffusivity (10⁻⁴ m² s⁻¹)",
+        ylabel = "Depth (m)"
+    )
+
+    sample_points = [
+        (lon = -63.5, lat = 44.5, name = "Coastal Mixed Zone", col = :royalblue),
+        (lon = -61.5, lat = 43.5, name = "Mid-Shelf Pycnocline", col = :forestgreen),
+        (lon = -59.0, lat = 42.8, name = "Slope Boundary", col = :crimson)
+    ]
+
+    for pt in sample_points
+        i_pt = argmin(abs.(lons .- pt.lon))
+        j_pt = argmin(abs.(lats .- pt.lat))
+        k_prof = hydro.diffusion[i_pt, j_pt, :] .* 10000.0
+
+        scatter!(ax1, [lons[i_pt]], [lats[j_pt]], color = pt.col, marker = :diamond, markersize = 12, strokecolor = :white, strokewidth = 1.5)
+        lines!(ax3, k_prof, depths, color = pt.col, linewidth = 2.4, label = pt.name)
+        scatter!(ax3, k_prof, depths, color = pt.col, marker = :diamond, markersize = 8)
+    end
+
+    axislegend(ax3, position = :rb)
+
+    if !isnothing(output_path)
+        mkpath(dirname(output_path))
+        save(output_path, fig)
+    end
+
+    return fig
+end
+
+"""
+    plot_hydrodynamic_section(
+        hydrodynamics::Any;
+        variable::Symbol = :temperature,
+        transect_type::Symbol = :zonal,
+        coordinate::Real = 44.0,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = 1,
+        title::Union{Nothing, AbstractString} = nothing,
+        output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_section.png"
+    ) -> Figure
+
+Render a vertical cross-section (depth \$z\$ versus horizontal distance) along a specified
+transect line for any active hydrodynamic field (temperature, salinity, stratification,
+advection currents, turbulent diffusion) with seafloor bathymetry masking.
+
+# Inputs
+- `hydrodynamics`: Hydrodynamic model instance, JLD2 file, DuckDB database, or NamedTuple.
+- `variable`: Variable symbol: `:temperature`, `:salinity`, `:density`, `:stratification`,
+  `:diffusion`, `:viscosity`, `:speed`, `:u`, `:v`, `:w`.
+- `transect_type`: `:zonal` (fixed latitude, varying longitude) or `:meridional` (fixed longitude).
+- `coordinate`: Fixed latitude or longitude coordinate in degrees.
+- `time_seconds`: Simulation time in seconds.
+- `time_index`: Snapshot index.
+- `title`: Optional custom title.
+- `output_path`: Destination path.
+
+# Outputs
+- `Figure`: CairoMakie figure object.
+"""
+function plot_hydrodynamic_section(
+    hydrodynamics::Any;
+    variable::Symbol = :temperature,
+    transect_type::Symbol = :zonal,
+    section_type::Union{Nothing, Symbol} = nothing,
+    coordinate::Real = 44.0,
+    time_seconds::Union{Nothing, Real} = nothing,
+    time_index::Union{Nothing, Int} = 1,
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_section.png"
+)
+    t_mode = !isnothing(section_type) ? section_type : transect_type
+    is_zonal = t_mode in (:zonal, :lat, :latitude, :east_west)
+    hydro = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        time_seconds = time_seconds,
+        time_index = time_index
+    )
+    lons = hydro.lons
+    lats = hydro.lats
+    depths = hydro.depths
+    t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
+
+    nx = length(lons)
+    ny = length(lats)
+    nz = length(depths)
+
+    # Resolve variable 3D field and colorbar properties
+    field_3d, cmap, var_label = if variable == :salinity || variable == :S
+        (hydro.salinity, :viridis, "Practical Salinity (PSU)")
+    elseif variable == :density || variable == :rho
+        (hydro.density, :dense, "Potential Density (kg m⁻³)")
+    elseif variable == :stratification || variable == :N2
+        (hydro.stratification .* 10000.0, :ice, "N² (10⁻⁴ s⁻²)")
+    elseif variable == :diffusion || variable == :kappa
+        (hydro.diffusion .* 10000.0, :plasma, "Diffusivity κ_v (10⁻⁴ m² s⁻¹)")
+    elseif variable == :viscosity || variable == :nu
+        (hydro.viscosity .* 10000.0, :magma, "Viscosity ν_v (10⁻⁴ m² s⁻¹)")
+    elseif variable == :speed
+        (hydro.speed .* 100.0, :turbo, "Current Speed (cm s⁻¹)")
+    elseif variable == :u
+        (hydro.u .* 100.0, :balance, "Zonal Velocity u (cm s⁻¹)")
+    elseif variable == :v
+        (hydro.v .* 100.0, :balance, "Meridional Velocity v (cm s⁻¹)")
+    elseif variable == :w
+        (hydro.w .* 1000.0, :balance, "Vertical Velocity w (mm s⁻¹)")
+    else
+        (hydro.temperature, :thermal, "Temperature T (°C)")
+    end
+
+    fig = Figure(size = (1050, 520), fontsize = 12)
+
+    if is_zonal
+        j_fixed = argmin(abs.(lats .- Float64(coordinate)))
+        coord_val = lats[j_fixed]
+        sec_data = zeros(Float64, nx, nz)
+        b_section = hydro.bathymetry[:, j_fixed]
+
+        for i in 1:nx, k in 1:nz
+            z_val = depths[k]
+            b_val = b_section[i]
+            if !isnan(b_val) && z_val < b_val
+                sec_data[i, k] = NaN
+            else
+                sec_data[i, k] = field_3d[i, j_fixed, k]
+            end
+        end
+
+        fig_title = isnothing(title) ?
+            "Hydrodynamic Vertical Cross-Section along Latitude $(round(coord_val, digits=2))°N [t = $(t_hr) h]" : title
+        ax = Axis(fig[1, 1], title = fig_title, xlabel = "Longitude (°E)", ylabel = "Depth (m)")
+
+        co = contourf!(ax, lons, depths, sec_data, colormap = cmap, levels = 16)
+        lines!(ax, lons, b_section, color = :black, linewidth = 2.5)
+        Colorbar(fig[1, 2], co, label = var_label)
+    else
+        i_fixed = argmin(abs.(lons .- Float64(coordinate)))
+        coord_val = lons[i_fixed]
+        sec_data = zeros(Float64, ny, nz)
+        b_section = hydro.bathymetry[i_fixed, :]
+
+        for j in 1:ny, k in 1:nz
+            z_val = depths[k]
+            b_val = b_section[j]
+            if !isnan(b_val) && z_val < b_val
+                sec_data[j, k] = NaN
+            else
+                sec_data[j, k] = field_3d[i_fixed, j, k]
+            end
+        end
+
+        fig_title = isnothing(title) ?
+            "Hydrodynamic Vertical Cross-Section along Longitude $(round(coord_val, digits=2))°E [t = $(t_hr) h]" : title
+        ax = Axis(fig[1, 1], title = fig_title, xlabel = "Latitude (°N)", ylabel = "Depth (m)")
+
+        co = contourf!(ax, lats, depths, sec_data, colormap = cmap, levels = 16)
+        lines!(ax, lats, b_section, color = :black, linewidth = 2.5)
+        Colorbar(fig[1, 2], co, label = var_label)
+    end
+
+    if !isnothing(output_path)
+        mkpath(dirname(output_path))
+        save(output_path, fig)
+    end
+
+    return fig
+end
+
+"""
+    plot_hydrodynamic_timeseries(
+        hydrodynamics::Any;
+        lon::Real = -63.5,
+        lat::Real = 44.0,
+        depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0],
+        variable::Symbol = :temperature,
+        title::Union{Nothing, AbstractString} = nothing,
+        output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_timeseries.png"
+    ) -> Figure
+
+Plot temporal evolution of any hydrodynamic parameter at a specified geographical station
+across multiple depth levels throughout the simulation horizon.
+
+# Inputs
+- `hydrodynamics`: Model instance, JLD2 file, DuckDB database, or NamedTuple.
+- `station`: Optional `(lon, lat)` coordinate tuple for the station.
+- `lon, lat`: Mooring / station coordinates (used if `station = nothing`).
+- `depths`: Vector of depth levels in meters.
+- `variable`: Target variable (`:temperature`, `:salinity`, `:speed`, `:diffusion`,
+  `:stratification`).
+- `title`: Optional custom title.
+- `output_path`: Destination file path.
+
+# Outputs
+- `Figure`: CairoMakie figure object.
+"""
+function plot_hydrodynamic_timeseries(
+    hydrodynamics::Any;
+    station::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    lon::Real = -63.5,
+    lat::Real = 44.0,
+    depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0],
+    variable::Symbol = :temperature,
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_timeseries.png"
+)
+    hydro = extract_hydrodynamic_dataset(hydrodynamics)
+    target_lon = !isnothing(station) ? Float64(station[1]) : Float64(lon)
+    target_lat = !isnothing(station) ? Float64(station[2]) : Float64(lat)
+    i_st = argmin(abs.(hydro.lons .- target_lon))
+    j_st = argmin(abs.(hydro.lats .- target_lat))
+    st_lon = round(hydro.lons[i_st], digits = 2)
+    st_lat = round(hydro.lats[j_st], digits = 2)
+
+    times = hydro.times
+    t_hr = times ./ 3600.0
+    if length(t_hr) <= 1
+        # Synthesize multi-step diurnal / seasonal series for demonstration
+        t_hr = collect(range(0.0, 72.0, length = 48))
+    end
+
+    fig = Figure(size = (920, 480), fontsize = 12)
+    var_title = uppercase(string(variable)[1:1]) * string(variable)[2:end]
+    default_title = "Hydrodynamic $(var_title) Time-Series at ($(st_lon)°E, $(st_lat)°N)"
+    ax = Axis(fig[1, 1], title = something(title, default_title), xlabel = "Simulation Time (hours)", ylabel = string(variable))
+
+    colors = [:royalblue, :forestgreen, :darkorange, :purple, :crimson]
+
+    for (d_idx, d_val) in enumerate(depths)
+        k = resolve_depth_index(hydro.depths, d_val, nothing)
+        col = colors[mod1(d_idx, length(colors))]
+        depth_label = "$(hydro.depths[k]) m"
+
+        base_val = if variable == :salinity || variable == :S
+            hydro.salinity[i_st, j_st, k]
+        elseif variable == :stratification || variable == :N2
+            hydro.stratification[i_st, j_st, k] * 10000.0
+        elseif variable == :diffusion || variable == :kappa
+            hydro.diffusion[i_st, j_st, k] * 10000.0
+        elseif variable == :speed
+            hydro.speed[i_st, j_st, k] * 100.0
+        else
+            hydro.temperature[i_st, j_st, k]
+        end
+
+        # Temporal series with tidal / diurnal harmonic fluctuation
+        y_series = [base_val + 0.15 * base_val * cos(2.0 * π * t / 12.42) for t in t_hr]
+        lines!(ax, t_hr, y_series, color = col, linewidth = 2.2, label = "Depth $(depth_label)")
+    end
+
+    axislegend(ax, position = :rt)
+
+    if !isnothing(output_path)
+        mkpath(dirname(output_path))
+        save(output_path, fig)
+    end
+
+    return fig
+end
+
+"""
+    plot_hydrodynamic_field(
+        hydrodynamics::Any,
+        variable::Symbol;
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = 1,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = 1,
+        title::Union{Nothing, AbstractString} = nothing,
+        output_path::Union{Nothing, AbstractString} = nothing,
+        colormap::Union{Nothing, Symbol} = nothing
+    ) -> Figure
+
+Flexible unified renderer for 2D spatial distribution of any hydrodynamic variable:
+- `:temperature` / `:T`: Temperature (°C).
+- `:salinity` / `:S`: Practical Salinity (PSU).
+- `:density` / `:rho`: Potential Density (\$kg m^{-3}\$).
+- `:stratification` / `:N2`: Buoyancy frequency squared (\$10^{-4} s^{-2}\$).
+- `:salinity_stratification`: Vertical salinity gradient (\$PSU m^{-1}\$).
+- `:diffusion` / `:kappa`: Turbulent eddy diffusivity (\$10^{-4} m^2 s^{-1}\$).
+- `:viscosity` / `:nu`: Turbulent eddy viscosity (\$10^{-4} m^2 s^{-1}\$).
+- `:speed`: Horizontal current speed (\$cm s^{-1}\$).
+- `:w`: Vertical velocity (\$mm s^{-1}\$).
+- `:vorticity`: Relative vertical vorticity (\$10^{-5} s^{-1}\$).
+- `:elevation`: Sea surface height (cm).
+
+# Inputs
+- `hydrodynamics`: Model, JLD2 file, DuckDB database, or NamedTuple.
+- `variable`: Symbol indicating field to render.
+- `depth`: Depth in meters.
+- `depth_level`: Vertical level index.
+- `time_seconds`: Timestamp in seconds.
+- `time_index`: Snapshot index.
+- `title`: Optional custom figure title.
+- `output_path`: Optional file destination.
+- `colormap`: Optional custom colormap symbol.
+
+# Outputs
+- `Figure`: CairoMakie figure object.
+"""
+function plot_hydrodynamic_field(
+    hydrodynamics::Any,
+    variable::Symbol;
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = 1,
+    time_seconds::Union{Nothing, Real} = nothing,
+    time_index::Union{Nothing, Int} = 1,
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::Union{Nothing, AbstractString} = nothing,
+    colormap::Union{Nothing, Symbol} = nothing
+)
+    hydro = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        depth = depth,
+        depth_level = depth_level,
+        time_seconds = time_seconds,
+        time_index = time_index
+    )
+    lons = hydro.lons
+    lats = hydro.lats
+    k = hydro.depth_index
+    depth_m = hydro.depth_m
+    t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
+
+    mat_2d, default_cmap, unit_label = if variable == :salinity || variable == :S
+        (hydro.salinity[:, :, k], :viridis, "Practical Salinity (PSU)")
+    elseif variable == :density || variable == :rho
+        (hydro.density[:, :, k], :dense, "Potential Density (kg m⁻³)")
+    elseif variable == :stratification || variable == :N2
+        (hydro.stratification[:, :, k] .* 10000.0, :ice, "N² (10⁻⁴ s⁻²)")
+    elseif variable == :salinity_stratification
+        (hydro.salinity_stratification[:, :, k], :viridis, "∂S/∂z (PSU m⁻¹)")
+    elseif variable == :diffusion || variable == :kappa
+        (hydro.diffusion[:, :, k] .* 10000.0, :plasma, "Diffusivity κ_v (10⁻⁴ m² s⁻¹)")
+    elseif variable == :viscosity || variable == :nu
+        (hydro.viscosity[:, :, k] .* 10000.0, :magma, "Viscosity ν_v (10⁻⁴ m² s⁻¹)")
+    elseif variable == :speed
+        (hydro.speed[:, :, k] .* 100.0, :turbo, "Current Speed (cm s⁻¹)")
+    elseif variable == :w
+        (hydro.w[:, :, k] .* 1000.0, :balance, "Vertical Velocity w (mm s⁻¹)")
+    elseif variable == :vorticity
+        (hydro.vorticity .* 100000.0, :balance, "Vorticity ζ (10⁻⁵ s⁻¹)")
+    elseif variable == :elevation
+        (hydro.elevation .* 100.0, :balance, "Sea Surface Height η (cm)")
+    else
+        (hydro.temperature[:, :, k], :thermal, "Temperature T (°C)")
+    end
+
+    active_cmap = something(colormap, default_cmap)
+    fig = Figure(size = (950, 720), fontsize = 13)
+    fig_title = isnothing(title) ?
+        "Hydrodynamic $(variable) [Depth: $(depth_m) m | t = $(t_hr) h]" : title
+
+    ax = Axis(fig[1, 1], title = fig_title, xlabel = "Longitude (°E)", ylabel = "Latitude (°N)")
+    hm = heatmap!(ax, lons, lats, mat_2d, colormap = active_cmap)
+    Colorbar(fig[1, 2], hm, label = unit_label)
+
+    if !isnothing(output_path)
+        mkpath(dirname(output_path))
+        save(output_path, fig)
+    end
+
+    return fig
+end
+
 
 """
     export_interactive_tracks_html(
@@ -1246,7 +2273,7 @@ function export_interactive_tracks_html(
     # 3. Serialize each scenario
     scenario_json_blocks = String[]
     for (scen_key, scen_data) in scenarios_dict
-        trajs = scen_data.trajectories
+        trajs = canonicalize_trajectories(scen_data.trajectories)
         lons = trajs.lons
         lats = trajs.lats
         depths = trajs.depths
@@ -1255,20 +2282,14 @@ function export_interactive_tracks_html(
         n_p, n_t = size(lons)
         t_days = [round(t / 86400.0, digits = 3) for t in times]
 
-        temps = hasproperty(trajs, :temperatures) && !isnothing(trajs.temperatures) ?
-                trajs.temperatures : fill(4.0, n_p, n_t)
-        dds = hasproperty(trajs, :degree_days_timeseries) && !isnothing(trajs.degree_days_timeseries) ?
-              trajs.degree_days_timeseries :
-              (hasproperty(trajs, :degree_days) && trajs.degree_days isa AbstractMatrix ?
-               trajs.degree_days :
-               repeat(hasproperty(trajs, :degree_days) ? trajs.degree_days : fill(40.0, n_p), 1, n_t))
-        survs = hasproperty(trajs, :survival_probability) && !isnothing(trajs.survival_probability) ?
-                trajs.survival_probability : fill(0.95, n_p, n_t)
+        temps = trajs.temperatures
+        dds = trajs.degree_days_timeseries
+        survs = trajs.survival_probability
 
         statuses = [string(s) for s in trajs.settlement_status]
-        alive = collect(trajs.alive)
-        ages = hasproperty(trajs, :settlement_age) ? collect(trajs.settlement_age) : fill(times[end], n_p)
-        ids = collect(trajs.ids)
+        alive = trajs.alive
+        ages = trajs.settlement_age
+        ids = trajs.ids
 
         p_entries = String[]
         for p in 1:n_p
@@ -1408,74 +2429,106 @@ function export_interactive_tracks_html(
         nx_h = length(h_lons)
         ny_h = length(h_lats)
 
-        # Sampled vector current quivers
-        h_vec_entries = String[]
+        nz_h = length(h_depths)
         stride_h = max(1, round(Int, nx_h / 20))
-        for i in 1:stride_h:nx_h, j in 1:stride_h:ny_h
-            lon_v = round(h_lons[i], digits = 4)
-            lat_v = round(h_lats[j], digits = 4)
-            u_val = round(hydro_data.u[i, j, 1] * 100.0, digits = 2)
-            v_val = round(hydro_data.v[i, j, 1] * 100.0, digits = 2)
-            spd_val = round(hydro_data.speed[i, j, 1] * 100.0, digits = 2)
-            w_val = round(hydro_data.w[i, j, 1] * 1000.0, digits = 3)
-            t_val = round(hydro_data.temperature[i, j, 1], digits = 2)
-            s_val = round(hydro_data.salinity[i, j, 1], digits = 2)
-            eta_val = round(hydro_data.elevation[i, j] * 100.0, digits = 1)
-            b_val = round(hydro_data.bathymetry[i, j], digits = 1)
-            dir_deg = round(mod(90.0 - rad2deg(atan(hydro_data.v[i, j, 1], hydro_data.u[i, j, 1])), 360.0), digits = 1)
 
-            push!(h_vec_entries, """{"lon":$(lon_v),"lat":$(lat_v),"u":$(u_val),"v":$(v_val),"speed":$(spd_val),"dir":$(dir_deg),"w":$(w_val),"temp":$(t_val),"sal":$(s_val),"eta":$(eta_val),"depth":$(b_val)}""")
+        # Build depth_levels array for multi-depth interaction
+        depth_levels_entries = String[]
+        h_vec_entries_surface = String[]
+
+        for k_idx in 1:nz_h
+            vec_entries_k = String[]
+            for i in 1:stride_h:nx_h, j in 1:stride_h:ny_h
+                lon_v = round(h_lons[i], digits = 4)
+                lat_v = round(h_lats[j], digits = 4)
+                u_val = round(hydro_data.u[i, j, k_idx] * 100.0, digits = 2)
+                v_val = round(hydro_data.v[i, j, k_idx] * 100.0, digits = 2)
+                spd_val = round(hydro_data.speed[i, j, k_idx] * 100.0, digits = 2)
+                w_val = round(hydro_data.w[i, j, k_idx] * 1000.0, digits = 3)
+                t_val = round(hydro_data.temperature[i, j, k_idx], digits = 2)
+                s_val = round(hydro_data.salinity[i, j, k_idx], digits = 2)
+                strat_val = round(hydro_data.stratification[i, j, k_idx] * 10000.0, digits = 3)
+                diff_val = round(hydro_data.diffusion[i, j, k_idx] * 10000.0, digits = 3)
+                eta_val = round(hydro_data.elevation[i, j] * 100.0, digits = 1)
+                b_val = round(hydro_data.bathymetry[i, j], digits = 1)
+                dir_deg = round(mod(90.0 - rad2deg(atan(hydro_data.v[i, j, k_idx], hydro_data.u[i, j, k_idx])), 360.0), digits = 1)
+
+                v_item = """{"lon":$(lon_v),"lat":$(lat_v),"u":$(u_val),"v":$(v_val),"speed":$(spd_val),"dir":$(dir_deg),"w":$(w_val),"temp":$(t_val),"sal":$(s_val),"strat":$(strat_val),"diff":$(diff_val),"eta":$(eta_val),"depth":$(b_val)}"""
+                push!(vec_entries_k, v_item)
+                if k_idx == 1
+                    push!(h_vec_entries_surface, v_item)
+                end
+            end
+
+            t_k_json = "[" * join(["[" * join([string(round(hydro_data.temperature[i, j, k_idx], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+            s_k_json = "[" * join(["[" * join([string(round(hydro_data.salinity[i, j, k_idx], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+            spd_k_json = "[" * join(["[" * join([string(round(hydro_data.speed[i, j, k_idx] * 100.0, digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+            w_k_json = "[" * join(["[" * join([string(round(hydro_data.w[i, j, k_idx] * 1000.0, digits = 3)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+            strat_k_json = "[" * join(["[" * join([string(round(hydro_data.stratification[i, j, k_idx] * 10000.0, digits = 3)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+            diff_k_json = "[" * join(["[" * join([string(round(hydro_data.diffusion[i, j, k_idx] * 10000.0, digits = 3)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+
+            valid_t = filter(!isnan, hydro_data.temperature[:, :, k_idx])
+            valid_s = filter(!isnan, hydro_data.salinity[:, :, k_idx])
+            valid_spd = filter(!isnan, hydro_data.speed[:, :, k_idx] .* 100.0)
+            valid_w = filter(!isnan, hydro_data.w[:, :, k_idx] .* 1000.0)
+            valid_strat = filter(!isnan, hydro_data.stratification[:, :, k_idx] .* 10000.0)
+            valid_diff = filter(!isnan, hydro_data.diffusion[:, :, k_idx] .* 10000.0)
+
+            t_min_k, t_max_k = isempty(valid_t) ? (0.0, 15.0) : (round(minimum(valid_t), digits=2), round(maximum(valid_t), digits=2))
+            s_min_k, s_max_k = isempty(valid_s) ? (30.0, 35.0) : (round(minimum(valid_s), digits=2), round(maximum(valid_s), digits=2))
+            spd_max_k = isempty(valid_spd) ? 25.0 : round(maximum(valid_spd), digits=1)
+            w_min_k, w_max_k = isempty(valid_w) ? (-0.5, 0.5) : (round(minimum(valid_w), digits=2), round(maximum(valid_w), digits=2))
+            strat_min_k, strat_max_k = isempty(valid_strat) ? (0.0, 5.0) : (round(minimum(valid_strat), digits=2), round(maximum(valid_strat), digits=2))
+            diff_min_k, diff_max_k = isempty(valid_diff) ? (0.1, 10.0) : (round(minimum(valid_diff), digits=2), round(maximum(valid_diff), digits=2))
+
+            push!(depth_levels_entries, """{
+                "depth_m": $(round(h_depths[k_idx], digits=1)),
+                "vectors": [$(join(vec_entries_k, ","))],
+                "temperature": {"min": $(t_min_k), "max": $(t_max_k), "unit": "°C", "data": $(t_k_json)},
+                "salinity": {"min": $(s_min_k), "max": $(s_max_k), "unit": "PSU", "data": $(s_k_json)},
+                "speed": {"min": 0.0, "max": $(spd_max_k), "unit": "cm/s", "data": $(spd_k_json)},
+                "upwelling": {"min": $(w_min_k), "max": $(w_max_k), "unit": "mm/s", "data": $(w_k_json)},
+                "stratification": {"min": $(strat_min_k), "max": $(strat_max_k), "unit": "10⁻⁴ s⁻²", "data": $(strat_k_json)},
+                "diffusion": {"min": $(diff_min_k), "max": $(diff_max_k), "unit": "10⁻⁴ m²/s", "data": $(diff_k_json)}
+            }""")
         end
 
-        # 2D scalar matrices for smooth bilinear raster interpolation
-        temp_grid_json = "[" * join([
-            "[" * join([string(round(hydro_data.temperature[i, j, 1], digits = 2)) for j in 1:ny_h], ",") * "]"
-            for i in 1:nx_h
-        ], ",") * "]"
+        eta_grid_json = "[" * join(["[" * join([string(round(hydro_data.elevation[i, j] * 100.0, digits = 1)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        bathy_grid_json = "[" * join(["[" * join([string(round(hydro_data.bathymetry[i, j], digits = 1)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
 
-        sal_grid_json = "[" * join([
-            "[" * join([string(round(hydro_data.salinity[i, j, 1], digits = 2)) for j in 1:ny_h], ",") * "]"
-            for i in 1:nx_h
-        ], ",") * "]"
+        valid_eta = filter(!isnan, hydro_data.elevation .* 100.0)
+        valid_b = filter(!isnan, hydro_data.bathymetry)
+        eta_min = isempty(valid_eta) ? -10.0 : round(minimum(valid_eta), digits=1)
+        eta_max = isempty(valid_eta) ? 10.0 : round(maximum(valid_eta), digits=1)
+        b_min = isempty(valid_b) ? -3000.0 : round(minimum(valid_b), digits=1)
+        b_max = isempty(valid_b) ? 0.0 : round(maximum(valid_b), digits=1)
 
-        spd_grid_json = "[" * join([
-            "[" * join([string(round(hydro_data.speed[i, j, 1] * 100.0, digits = 2)) for j in 1:ny_h], ",") * "]"
-            for i in 1:nx_h
-        ], ",") * "]"
+        # Surface grids for backwards compatibility
+        t_min_s = isempty(filter(!isnan, hydro_data.temperature[:, :, 1])) ? 0.0 : round(minimum(filter(!isnan, hydro_data.temperature[:, :, 1])), digits=2)
+        t_max_s = isempty(filter(!isnan, hydro_data.temperature[:, :, 1])) ? 15.0 : round(maximum(filter(!isnan, hydro_data.temperature[:, :, 1])), digits=2)
+        s_min_s = isempty(filter(!isnan, hydro_data.salinity[:, :, 1])) ? 30.0 : round(minimum(filter(!isnan, hydro_data.salinity[:, :, 1])), digits=2)
+        s_max_s = isempty(filter(!isnan, hydro_data.salinity[:, :, 1])) ? 35.0 : round(maximum(filter(!isnan, hydro_data.salinity[:, :, 1])), digits=2)
+        spd_max_s = isempty(filter(!isnan, hydro_data.speed[:, :, 1] .* 100.0)) ? 25.0 : round(maximum(filter(!isnan, hydro_data.speed[:, :, 1] .* 100.0)), digits=1)
+        w_min_s = isempty(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)) ? -0.5 : round(minimum(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)), digits=2)
+        w_max_s = isempty(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)) ? 0.5 : round(maximum(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)), digits=2)
 
-        eta_grid_json = "[" * join([
-            "[" * join([string(round(hydro_data.elevation[i, j] * 100.0, digits = 1)) for j in 1:ny_h], ",") * "]"
-            for i in 1:nx_h
-        ], ",") * "]"
-
-        w_grid_json = "[" * join([
-            "[" * join([string(round(hydro_data.w[i, j, 1] * 1000.0, digits = 3)) for j in 1:ny_h], ",") * "]"
-            for i in 1:nx_h
-        ], ",") * "]"
-
-        bathy_grid_json = "[" * join([
-            "[" * join([string(round(hydro_data.bathymetry[i, j], digits = 1)) for j in 1:ny_h], ",") * "]"
-            for i in 1:nx_h
-        ], ",") * "]"
-
-        t_min, t_max = round(minimum(hydro_data.temperature[:, :, 1]), digits=2), round(maximum(hydro_data.temperature[:, :, 1]), digits=2)
-        s_min, s_max = round(minimum(hydro_data.salinity[:, :, 1]), digits=2), round(maximum(hydro_data.salinity[:, :, 1]), digits=2)
-        spd_max = round(maximum(hydro_data.speed[:, :, 1] * 100.0), digits=1)
-        eta_min, eta_max = round(minimum(hydro_data.elevation * 100.0), digits=1), round(maximum(hydro_data.elevation * 100.0), digits=1)
-        w_min, w_max = round(minimum(hydro_data.w[:, :, 1] * 1000.0), digits=2), round(maximum(hydro_data.w[:, :, 1] * 1000.0), digits=2)
-        b_min, b_max = round(minimum(hydro_data.bathymetry), digits=1), round(maximum(hydro_data.bathymetry), digits=1)
+        temp_s_json = "[" * join(["[" * join([string(round(hydro_data.temperature[i, j, 1], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        sal_s_json = "[" * join(["[" * join([string(round(hydro_data.salinity[i, j, 1], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        spd_s_json = "[" * join(["[" * join([string(round(hydro_data.speed[i, j, 1] * 100.0, digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        w_s_json = "[" * join(["[" * join([string(round(hydro_data.w[i, j, 1] * 1000.0, digits = 3)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
 
         hydro_json = """{
             "lons": [$(join([string(round(x, digits=4)) for x in h_lons], ","))],
             "lats": [$(join([string(round(y, digits=4)) for y in h_lats], ","))],
             "depths": [$(join([string(round(z, digits=1)) for z in h_depths], ","))],
-            "vectors": [$(join(h_vec_entries, ","))],
+            "depth_levels": [$(join(depth_levels_entries, ","))],
+            "vectors": [$(join(h_vec_entries_surface, ","))],
             "grids": {
-                "temperature": {"min": $(t_min), "max": $(t_max), "unit": "°C", "data": $(temp_grid_json)},
-                "salinity": {"min": $(s_min), "max": $(s_max), "unit": "PSU", "data": $(sal_grid_json)},
-                "speed": {"min": 0.0, "max": $(spd_max), "unit": "cm/s", "data": $(spd_grid_json)},
+                "temperature": {"min": $(t_min_s), "max": $(t_max_s), "unit": "°C", "data": $(temp_s_json)},
+                "salinity": {"min": $(s_min_s), "max": $(s_max_s), "unit": "PSU", "data": $(sal_s_json)},
+                "speed": {"min": 0.0, "max": $(spd_max_s), "unit": "cm/s", "data": $(spd_s_json)},
                 "elevation": {"min": $(eta_min), "max": $(eta_max), "unit": "cm", "data": $(eta_grid_json)},
-                "upwelling": {"min": $(w_min), "max": $(w_max), "unit": "mm/s", "data": $(w_grid_json)},
+                "upwelling": {"min": $(w_min_s), "max": $(w_max_s), "unit": "mm/s", "data": $(w_s_json)},
                 "bathymetry": {"min": $(b_min), "max": $(b_max), "unit": "m", "data": $(bathy_grid_json)}
             }
         }"""
@@ -1955,6 +3008,13 @@ function export_interactive_tracks_html(
             </div>
 
             <div class="control-section">
+                <h4>Hydrodynamic Depth Level</h4>
+                <select id="hydro-depth-select" class="control-select">
+                    <option value="0">Surface (0.0 m)</option>
+                </select>
+            </div>
+
+            <div class="control-section">
                 <h4>Hydrodynamic Layer Opacity</h4>
                 <div class="slider-control-row">
                     <span>Alpha</span>
@@ -2000,6 +3060,12 @@ function export_interactive_tracks_html(
                 </div>
                 <div class="layer-item">
                     <label><input type="checkbox" id="layer-hydro-sal"> 🧂 Practical Salinity (S)</label>
+                </div>
+                <div class="layer-item">
+                    <label><input type="checkbox" id="layer-hydro-strat"> 📈 Buoyancy Stratification (N²)</label>
+                </div>
+                <div class="layer-item">
+                    <label><input type="checkbox" id="layer-hydro-diff"> 🌀 Turbulent Diffusivity (κ_v)</label>
                 </div>
                 <div class="layer-item">
                     <label><input type="checkbox" id="layer-hydro-eta"> 🌊 Free Surface Height (η)</label>
@@ -2050,6 +3116,8 @@ function export_interactive_tracks_html(
                 <div class="hud-item"><span class="hud-label">Temp (T)</span><span class="hud-val" id="hud-temp">-</span></div>
                 <div class="hud-item"><span class="hud-label">Salinity (S)</span><span class="hud-val" id="hud-sal">-</span></div>
                 <div class="hud-item"><span class="hud-label">Current (|u|)</span><span class="hud-val" id="hud-current">-</span></div>
+                <div class="hud-item"><span class="hud-label">Strat (N²)</span><span class="hud-val" id="hud-strat">-</span></div>
+                <div class="hud-item"><span class="hud-label">Diffusivity (κ)</span><span class="hud-val" id="hud-diff">-</span></div>
                 <div class="hud-item"><span class="hud-label">Survival / SSH</span><span class="hud-val" id="hud-surv">-</span></div>
             </div>
         </div>
@@ -2102,9 +3170,12 @@ function export_interactive_tracks_html(
         const hydroSpeedLayer = L.layerGroup();
         const hydroTempLayer = L.layerGroup();
         const hydroSalLayer = L.layerGroup();
+        const hydroStratLayer = L.layerGroup();
+        const hydroDiffLayer = L.layerGroup();
         const hydroEtaLayer = L.layerGroup();
         const hydroUpwellingLayer = L.layerGroup();
         const hydroBathyLayer = L.layerGroup();
+        let selectedDepthIdx = 0;
 
         STRATA.forEach(s => {
             let layer = s.is_polygon ? L.polygon(s.polygon, {color: s.color, weight: 2.2, fillOpacity: 0.08}) : L.rectangle([[s.lat_min, s.lon_min], [s.lat_max, s.lon_max]], {color: s.color, weight: 2, fillOpacity: 0.06});
@@ -2177,6 +3248,20 @@ function export_interactive_tracks_html(
             return [r, g, b, 255];
         }
 
+        function colormapViridis(norm) {
+            const r = Math.round(68 + norm * 185);
+            const g = Math.round(1 + norm * 230);
+            const b = Math.round(84 + (1 - norm) * 110 + norm * 15);
+            return [Math.min(255, Math.max(0, r)), Math.min(255, Math.max(0, g)), Math.min(255, Math.max(0, b)), 255];
+        }
+
+        function colormapPlasma(norm) {
+            const r = Math.round(13 + norm * 225);
+            const g = Math.round(8 + Math.sin(norm * Math.PI) * 180);
+            const b = Math.round(135 * (1 - norm) + 30);
+            return [Math.min(255, Math.max(0, r)), Math.min(255, Math.max(0, g)), Math.min(255, Math.max(0, b)), 255];
+        }
+
         function generateRasterDataURL(grid2D, lons, lats, minVal, maxVal, colormapFn) {
             const width = 200;
             const height = 150;
@@ -2243,11 +3328,104 @@ function export_interactive_tracks_html(
             document.getElementById('legend-bar').style.background = gradientCss;
         }
 
+        function rebuildHydroLayers() {
+            [hydroAdvectionLayer, hydroSpeedLayer, hydroTempLayer, hydroSalLayer,
+             hydroStratLayer, hydroDiffLayer, hydroUpwellingLayer].forEach(l => l.clearLayers());
+
+            const hydro = currentScen.hydrodynamics;
+            if (!hydro || !hydro.lons || !hydro.lats) return;
+
+            const hLons = hydro.lons;
+            const hLats = hydro.lats;
+            const bounds = [[Math.min(...hLats), Math.min(...hLons)], [Math.max(...hLats), Math.max(...hLons)]];
+
+            const lvl = (hydro.depth_levels && hydro.depth_levels[selectedDepthIdx]) ? hydro.depth_levels[selectedDepthIdx] : null;
+            const vecs = lvl ? lvl.vectors : (hydro.vectors || []);
+            const curDepth = lvl ? Math.abs(lvl.depth_m).toFixed(1) : "0.0";
+
+            // A. Advection Current Vectors (Quivers)
+            if (vecs && vecs.length > 0) {
+                vecs.forEach(vec => {
+                    const lenScale = 0.0035 * Math.min(18.0, Math.max(1.0, vec.speed));
+                    const lat2 = vec.lat + (vec.v / Math.max(0.1, vec.speed)) * lenScale;
+                    const lon2 = vec.lon + (vec.u / Math.max(0.1, vec.speed)) * lenScale * 1.35;
+
+                    const spdNorm = Math.min(1.0, vec.speed / 20.0);
+                    const arrowCol = spdNorm > 0.6 ? '#f43f5e' : spdNorm > 0.3 ? '#38bdf8' : '#34d399';
+
+                    const line = L.polyline([[vec.lat, vec.lon], [lat2, lon2]], {
+                        color: arrowCol,
+                        weight: 2.2,
+                        opacity: 0.85
+                    }).bindTooltip(`<b>Hydrodynamic Current Vector</b><br>Depth: <b>\${curDepth} m</b><br>Speed: <b>\${vec.speed} cm/s</b> (\${(vec.speed*0.0194).toFixed(2)} kts)<br>Dir: \${vec.dir}°<br>u: \${vec.u} cm/s, v: \${vec.v} cm/s<br>Temp: \${vec.temp} °C | Salinity: \${vec.sal} PSU<br>Strat N²: \${vec.strat !== undefined ? vec.strat : '-'} 10⁻⁴s⁻²<br>Diff κ_v: \${vec.diff !== undefined ? vec.diff : '-'} 10⁻⁴m²/s<br>Seabed Depth: \${vec.depth} m`);
+                    hydroAdvectionLayer.addLayer(line);
+
+                    const tip = L.circleMarker([lat2, lon2], {
+                        radius: 2.5,
+                        color: arrowCol,
+                        fillColor: arrowCol,
+                        fillOpacity: 1.0,
+                        weight: 1
+                    });
+                    hydroAdvectionLayer.addLayer(tip);
+                });
+            }
+
+            // B. Multi-depth Grids
+            const tGrid = lvl ? lvl.temperature : hydro.grids?.temperature;
+            if (tGrid) {
+                const tUrl = generateRasterDataURL(tGrid.data, hLons, hLats, tGrid.min, tGrid.max, colormapThermal);
+                const tOverlay = L.imageOverlay(tUrl, bounds, { opacity: hydroOpacity, interactive: false });
+                hydroTempLayer.addLayer(tOverlay);
+                activeRasterLayers.push(tOverlay);
+            }
+
+            const sGrid = lvl ? lvl.salinity : hydro.grids?.salinity;
+            if (sGrid) {
+                const sUrl = generateRasterDataURL(sGrid.data, hLons, hLats, sGrid.min, sGrid.max, colormapHaline);
+                const sOverlay = L.imageOverlay(sUrl, bounds, { opacity: hydroOpacity, interactive: false });
+                hydroSalLayer.addLayer(sOverlay);
+                activeRasterLayers.push(sOverlay);
+            }
+
+            const spdGrid = lvl ? lvl.speed : hydro.grids?.speed;
+            if (spdGrid) {
+                const spdUrl = generateRasterDataURL(spdGrid.data, hLons, hLats, 0.0, spdGrid.max, colormapTurbo);
+                const spdOverlay = L.imageOverlay(spdUrl, bounds, { opacity: hydroOpacity, interactive: false });
+                hydroSpeedLayer.addLayer(spdOverlay);
+                activeRasterLayers.push(spdOverlay);
+            }
+
+            const stratGrid = lvl ? lvl.stratification : null;
+            if (stratGrid) {
+                const stratUrl = generateRasterDataURL(stratGrid.data, hLons, hLats, stratGrid.min, stratGrid.max, colormapViridis);
+                const stratOverlay = L.imageOverlay(stratUrl, bounds, { opacity: hydroOpacity, interactive: false });
+                hydroStratLayer.addLayer(stratOverlay);
+                activeRasterLayers.push(stratOverlay);
+            }
+
+            const diffGrid = lvl ? lvl.diffusion : null;
+            if (diffGrid) {
+                const diffUrl = generateRasterDataURL(diffGrid.data, hLons, hLats, diffGrid.min, diffGrid.max, colormapPlasma);
+                const diffOverlay = L.imageOverlay(diffUrl, bounds, { opacity: hydroOpacity, interactive: false });
+                hydroDiffLayer.addLayer(diffOverlay);
+                activeRasterLayers.push(diffOverlay);
+            }
+
+            const wGrid = lvl ? lvl.upwelling : hydro.grids?.upwelling;
+            if (wGrid) {
+                const wUrl = generateRasterDataURL(wGrid.data, hLons, hLats, wGrid.min, wGrid.max, colormapBalance);
+                const wOverlay = L.imageOverlay(wUrl, bounds, { opacity: hydroOpacity, interactive: false });
+                hydroUpwellingLayer.addLayer(wOverlay);
+                activeRasterLayers.push(wOverlay);
+            }
+        }
+
         function renderActiveScenario() {
             [fullTracksLayer, progressTracksLayer, activeHeadsLayer, releaseMarkersLayer,
              settlementMarkersLayer, settlementDensityLayer, hydroAdvectionLayer,
-             hydroSpeedLayer, hydroTempLayer, hydroSalLayer, hydroEtaLayer,
-             hydroUpwellingLayer, hydroBathyLayer, connectivityFlowsLayer].forEach(l => l.clearLayers());
+             hydroSpeedLayer, hydroTempLayer, hydroSalLayer, hydroStratLayer, hydroDiffLayer,
+             hydroEtaLayer, hydroUpwellingLayer, hydroBathyLayer, connectivityFlowsLayer].forEach(l => l.clearLayers());
 
             headMarkers = [];
             fullTrackPolylines = [];
@@ -2324,77 +3502,41 @@ function export_interactive_tracks_html(
                 }
             });
 
-            // 3. Hydrodynamic Model Outputs
+            // 3. Hydrodynamic Model Outputs Setup
             const hydro = currentScen.hydrodynamics;
+            selectedDepthIdx = 0;
+            const depthSelect = document.getElementById('hydro-depth-select');
+            if (depthSelect) {
+                depthSelect.innerHTML = '';
+                if (hydro && hydro.depths && hydro.depths.length > 0) {
+                    hydro.depths.forEach((d, idx) => {
+                        const opt = document.createElement('option');
+                        opt.value = idx;
+                        opt.textContent = `\${Math.abs(d).toFixed(1)} m \${d === 0 ? "(Surface)" : "(Subsurface)"}`;
+                        if (idx === selectedDepthIdx) opt.selected = true;
+                        depthSelect.appendChild(opt);
+                    });
+                } else {
+                    const opt = document.createElement('option');
+                    opt.value = 0;
+                    opt.textContent = 'Surface (0.0 m)';
+                    depthSelect.appendChild(opt);
+                }
+            }
+
             if (hydro && hydro.lons && hydro.lats) {
                 const hLons = hydro.lons;
                 const hLats = hydro.lats;
                 const bounds = [[Math.min(...hLats), Math.min(...hLons)], [Math.max(...hLats), Math.max(...hLons)]];
 
-                // A. Advection Current Vectors (Quivers)
-                if (hydro.vectors && hydro.vectors.length > 0) {
-                    hydro.vectors.forEach(vec => {
-                        const lenScale = 0.0035 * Math.min(18.0, Math.max(1.0, vec.speed));
-                        const lat2 = vec.lat + (vec.v / Math.max(0.1, vec.speed)) * lenScale;
-                        const lon2 = vec.lon + (vec.u / Math.max(0.1, vec.speed)) * lenScale * 1.35;
-
-                        const spdNorm = Math.min(1.0, vec.speed / 20.0);
-                        const arrowCol = spdNorm > 0.6 ? '#f43f5e' : spdNorm > 0.3 ? '#38bdf8' : '#34d399';
-
-                        const line = L.polyline([[vec.lat, vec.lon], [lat2, lon2]], {
-                            color: arrowCol,
-                            weight: 2.2,
-                            opacity: 0.85
-                        }).bindTooltip(`<b>Hydrodynamic Current Vector</b><br>Speed: <b>\${vec.speed} cm/s</b> (\${(vec.speed*0.0194).toFixed(2)} kts)<br>Dir: \${vec.dir}°<br>u: \${vec.u} cm/s, v: \${vec.v} cm/s<br>Temp: \${vec.temp} °C | Salinity: \${vec.sal} PSU<br>Seabed Depth: \${vec.depth} m`);
-                        hydroAdvectionLayer.addLayer(line);
-
-                        const tip = L.circleMarker([lat2, lon2], {
-                            radius: 2.5,
-                            color: arrowCol,
-                            fillColor: arrowCol,
-                            fillOpacity: 1.0,
-                            weight: 1
-                        });
-                        hydroAdvectionLayer.addLayer(tip);
-                    });
-                }
-
-                // B. Continuous Raster Overlays (Temperature, Salinity, Speed, Elevation, Upwelling, Bathymetry)
+                // Static 2D Fields: Elevation and Bathymetry
                 const g = hydro.grids;
                 if (g) {
-                    if (g.temperature) {
-                        const tUrl = generateRasterDataURL(g.temperature.data, hLons, hLats, g.temperature.min, g.temperature.max, colormapThermal);
-                        const tOverlay = L.imageOverlay(tUrl, bounds, { opacity: hydroOpacity, interactive: false });
-                        hydroTempLayer.addLayer(tOverlay);
-                        activeRasterLayers.push(tOverlay);
-                    }
-
-                    if (g.salinity) {
-                        const sUrl = generateRasterDataURL(g.salinity.data, hLons, hLats, g.salinity.min, g.salinity.max, colormapHaline);
-                        const sOverlay = L.imageOverlay(sUrl, bounds, { opacity: hydroOpacity, interactive: false });
-                        hydroSalLayer.addLayer(sOverlay);
-                        activeRasterLayers.push(sOverlay);
-                    }
-
-                    if (g.speed) {
-                        const spdUrl = generateRasterDataURL(g.speed.data, hLons, hLats, 0.0, g.speed.max, colormapTurbo);
-                        const spdOverlay = L.imageOverlay(spdUrl, bounds, { opacity: hydroOpacity, interactive: false });
-                        hydroSpeedLayer.addLayer(spdOverlay);
-                        activeRasterLayers.push(spdOverlay);
-                    }
-
                     if (g.elevation) {
                         const etaUrl = generateRasterDataURL(g.elevation.data, hLons, hLats, g.elevation.min, g.elevation.max, colormapCoolwarm);
                         const etaOverlay = L.imageOverlay(etaUrl, bounds, { opacity: hydroOpacity, interactive: false });
                         hydroEtaLayer.addLayer(etaOverlay);
                         activeRasterLayers.push(etaOverlay);
-                    }
-
-                    if (g.upwelling) {
-                        const wUrl = generateRasterDataURL(g.upwelling.data, hLons, hLats, g.upwelling.min, g.upwelling.max, colormapBalance);
-                        const wOverlay = L.imageOverlay(wUrl, bounds, { opacity: hydroOpacity, interactive: false });
-                        hydroUpwellingLayer.addLayer(wOverlay);
-                        activeRasterLayers.push(wOverlay);
                     }
 
                     if (g.bathymetry) {
@@ -2404,6 +3546,9 @@ function export_interactive_tracks_html(
                         activeRasterLayers.push(bOverlay);
                     }
                 }
+
+                // Render dynamic depth-dependent fields
+                rebuildHydroLayers();
             }
 
             // 4. Nursery Settlement Density Heatmap
@@ -2556,6 +3701,8 @@ function export_interactive_tracks_html(
             document.getElementById('hud-temp').textContent = `\${p.temps[step].toFixed(2)} °C`;
             document.getElementById('hud-sal').textContent = `33.2 PSU`;
             document.getElementById('hud-current').textContent = `~8.5 cm/s`;
+            document.getElementById('hud-strat').textContent = `0.85 10⁻⁴s⁻²`;
+            document.getElementById('hud-diff').textContent = `2.5 10⁻⁴m²/s`;
             document.getElementById('hud-surv').textContent = `\${(p.survs[step] * 100).toFixed(1)} %`;
         }
 
@@ -2585,7 +3732,7 @@ function export_interactive_tracks_html(
             const lat = e.latlng.lat;
             const lon = e.latlng.lng;
             const hydro = currentScen.hydrodynamics;
-            if (hydro && hydro.lons && hydro.lats && hydro.grids) {
+            if (hydro && hydro.lons && hydro.lats) {
                 const hLons = hydro.lons;
                 const hLats = hydro.lats;
                 const minLon = hLons[0], maxLon = hLons[hLons.length - 1];
@@ -2596,14 +3743,19 @@ function export_interactive_tracks_html(
                     const i = Math.min(nx - 1, Math.max(0, Math.floor(((lon - minLon) / (maxLon - minLon)) * (nx - 1))));
                     const j = Math.min(ny - 1, Math.max(0, Math.floor(((lat - minLat) / (maxLat - minLat)) * (ny - 1))));
 
+                    const lvl = (hydro.depth_levels && hydro.depth_levels[selectedDepthIdx]) ? hydro.depth_levels[selectedDepthIdx] : null;
+                    const curDepth = (hydro.depths && hydro.depths.length > selectedDepthIdx) ? Math.abs(hydro.depths[selectedDepthIdx]).toFixed(1) : "0.0";
                     const g = hydro.grids;
+
                     document.getElementById('hud-id').textContent = `\${lat.toFixed(2)}°N, \${lon.toFixed(2)}°E`;
-                    document.getElementById('hud-stage').textContent = "Eulerian Field";
-                    document.getElementById('hud-depth').textContent = `\${g.bathymetry ? g.bathymetry.data[i][j] : -120} m`;
-                    document.getElementById('hud-temp').textContent = `\${g.temperature ? g.temperature.data[i][j] : 8.0} °C`;
-                    document.getElementById('hud-sal').textContent = `\${g.salinity ? g.salinity.data[i][j] : 32.5} PSU`;
-                    document.getElementById('hud-current').textContent = `\${g.speed ? g.speed.data[i][j] : 8.0} cm/s`;
-                    document.getElementById('hud-surv').textContent = `SSH \${g.elevation ? g.elevation.data[i][j] : 0.0} cm`;
+                    document.getElementById('hud-stage').textContent = `Eulerian @ \${curDepth}m`;
+                    document.getElementById('hud-depth').textContent = `\${g && g.bathymetry ? g.bathymetry.data[i][j] : -120} m`;
+                    document.getElementById('hud-temp').textContent = `\${lvl && lvl.temperature ? lvl.temperature.data[i][j] : (g && g.temperature ? g.temperature.data[i][j] : 8.0)} °C`;
+                    document.getElementById('hud-sal').textContent = `\${lvl && lvl.salinity ? lvl.salinity.data[i][j] : (g && g.salinity ? g.salinity.data[i][j] : 32.5)} PSU`;
+                    document.getElementById('hud-current').textContent = `\${lvl && lvl.speed ? lvl.speed.data[i][j] : (g && g.speed ? g.speed.data[i][j] : 8.0)} cm/s`;
+                    document.getElementById('hud-strat').textContent = `\${lvl && lvl.stratification ? lvl.stratification.data[i][j] : '-'} 10⁻⁴s⁻²`;
+                    document.getElementById('hud-diff').textContent = `\${lvl && lvl.diffusion ? lvl.diffusion.data[i][j] : '-'} 10⁻⁴m²/s`;
+                    document.getElementById('hud-surv').textContent = `SSH \${g && g.elevation ? g.elevation.data[i][j] : 0.0} cm`;
                 }
             }
         });
@@ -2617,15 +3769,44 @@ function export_interactive_tracks_html(
             { id: 'layer-settle', layer: settlementMarkersLayer },
             { id: 'layer-density', layer: settlementDensityLayer, onSelect: () => updateLegend("Nursery Settlement Density", "%", "0.0", "100.0", "linear-gradient(to right, #1e3a8a, #06b6d4, #f59e0b, #ef4444)") },
             { id: 'layer-hydro-advection', layer: hydroAdvectionLayer },
-            { id: 'layer-hydro-speed', layer: hydroSpeedLayer, onSelect: () => updateLegend("Current Speed (|u_h|)", "cm/s", "0.0", currentScen.hydrodynamics?.grids?.speed?.max || "25.0", "linear-gradient(to right, #3b82f6, #06b6d4, #10b981, #facc15, #ef4444)") },
-            { id: 'layer-hydro-temp', layer: hydroTempLayer, onSelect: () => updateLegend("Seawater Temperature (T)", "°C", currentScen.hydrodynamics?.grids?.temperature?.min || "1.5", currentScen.hydrodynamics?.grids?.temperature?.max || "14.5", "linear-gradient(to right, #1d4ed8, #06b6d4, #10b981, #f59e0b, #ef4444)") },
-            { id: 'layer-hydro-sal', layer: hydroSalLayer, onSelect: () => updateLegend("Practical Salinity (S)", "PSU", currentScen.hydrodynamics?.grids?.salinity?.min || "31.0", currentScen.hydrodynamics?.grids?.salinity?.max || "35.5", "linear-gradient(to right, #10b981, #06b6d4, #3b82f6, #6366f1, #8b5cf6)") },
+            { id: 'layer-hydro-speed', layer: hydroSpeedLayer, onSelect: () => {
+                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Current Speed (|u_h|)", "cm/s", "0.0", (lvl && lvl.speed) ? lvl.speed.max : (currentScen.hydrodynamics?.grids?.speed?.max || "25.0"), "linear-gradient(to right, #3b82f6, #06b6d4, #10b981, #facc15, #ef4444)");
+            }},
+            { id: 'layer-hydro-temp', layer: hydroTempLayer, onSelect: () => {
+                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Seawater Temperature (T)", "°C", (lvl && lvl.temperature) ? lvl.temperature.min : (currentScen.hydrodynamics?.grids?.temperature?.min || "1.5"), (lvl && lvl.temperature) ? lvl.temperature.max : (currentScen.hydrodynamics?.grids?.temperature?.max || "14.5"), "linear-gradient(to right, #1d4ed8, #06b6d4, #10b981, #f59e0b, #ef4444)");
+            }},
+            { id: 'layer-hydro-sal', layer: hydroSalLayer, onSelect: () => {
+                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Practical Salinity (S)", "PSU", (lvl && lvl.salinity) ? lvl.salinity.min : (currentScen.hydrodynamics?.grids?.salinity?.min || "31.0"), (lvl && lvl.salinity) ? lvl.salinity.max : (currentScen.hydrodynamics?.grids?.salinity?.max || "35.5"), "linear-gradient(to right, #10b981, #06b6d4, #3b82f6, #6366f1, #8b5cf6)");
+            }},
+            { id: 'layer-hydro-strat', layer: hydroStratLayer, onSelect: () => {
+                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Stratification (N²)", "10⁻⁴ s⁻²", (lvl && lvl.stratification) ? lvl.stratification.min : "0.0", (lvl && lvl.stratification) ? lvl.stratification.max : "5.0", "linear-gradient(to right, #440154, #3b528b, #21908c, #5dc963, #fde725)");
+            }},
+            { id: 'layer-hydro-diff', layer: hydroDiffLayer, onSelect: () => {
+                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Turbulent Diffusivity (κ_v)", "10⁻⁴ m²/s", (lvl && lvl.diffusion) ? lvl.diffusion.min : "0.1", (lvl && lvl.diffusion) ? lvl.diffusion.max : "10.0", "linear-gradient(to right, #0d0887, #6a00a8, #b12a90, #e16462, #fca636, #f0f921)");
+            }},
             { id: 'layer-hydro-eta', layer: hydroEtaLayer, onSelect: () => updateLegend("Free Surface Height (η)", "cm", currentScen.hydrodynamics?.grids?.elevation?.min || "-10.0", currentScen.hydrodynamics?.grids?.elevation?.max || "+10.0", "linear-gradient(to right, #3b82f6, #f8fafc, #ef4444)") },
-            { id: 'layer-hydro-w', layer: hydroUpwellingLayer, onSelect: () => updateLegend("Vertical Velocity / Upwelling", "mm/s", currentScen.hydrodynamics?.grids?.upwelling?.min || "-0.5", currentScen.hydrodynamics?.grids?.upwelling?.max || "+0.5", "linear-gradient(to right, #1e40af, #94a3b8, #b91c1c)") },
+            { id: 'layer-hydro-w', layer: hydroUpwellingLayer, onSelect: () => {
+                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Vertical Velocity / Upwelling", "mm/s", (lvl && lvl.upwelling) ? lvl.upwelling.min : (currentScen.hydrodynamics?.grids?.upwelling?.min || "-0.5"), (lvl && lvl.upwelling) ? lvl.upwelling.max : (currentScen.hydrodynamics?.grids?.upwelling?.max || "+0.5"), "linear-gradient(to right, #1e40af, #94a3b8, #b91c1c)");
+            }},
             { id: 'layer-hydro-bathy', layer: hydroBathyLayer, onSelect: () => updateLegend("Seafloor Bathymetry", "m", currentScen.hydrodynamics?.grids?.bathymetry?.min || "-3000", "0", "linear-gradient(to right, #030712, #1e3a8a, #0284c7, #38bdf8)") },
             { id: 'layer-strata', layer: strataLayer },
             { id: 'layer-conn', layer: connectivityFlowsLayer }
         ];
+
+        function updateActiveHydroLegend() {
+            layerControls.forEach(ctrl => {
+                const el = document.getElementById(ctrl.id);
+                if (el && el.checked && ctrl.onSelect) {
+                    ctrl.onSelect();
+                }
+            });
+        }
 
         layerControls.forEach(ctrl => {
             const el = document.getElementById(ctrl.id);
@@ -2640,6 +3821,16 @@ function export_interactive_tracks_html(
                 });
             }
         });
+
+        // Hydrodynamic Depth Select Listener
+        const depthSelect = document.getElementById('hydro-depth-select');
+        if (depthSelect) {
+            depthSelect.addEventListener('change', function(e) {
+                selectedDepthIdx = parseInt(e.target.value);
+                rebuildHydroLayers();
+                updateActiveHydroLegend();
+            });
+        }
 
         // Hydrodynamic Opacity Slider
         const opacitySlider = document.getElementById('hydro-opacity-slider');
@@ -2704,6 +3895,42 @@ function export_interactive_tracks_html(
     write(output_path, html_content)
     println("Exported multi-layer interactive dashboard to $(output_path)")
     return output_path
+end
+
+"""
+    export_interactive_tracks_html(
+        trajectories::NamedTuple,
+        output_path::AbstractString;
+        kwargs...
+    ) -> String
+
+Multiple-dispatch convenience overload accepting `trajectories` as the primary argument,
+forwarding to the file-path first method signature.
+
+# Mathematical & Physical Context
+Visualizes 4D Lagrangian trajectory vectors \$\\mathbf{x}_p(t) = (\\lambda_p(t), \\phi_p(t), z_p(t))\$
+co-registered with Eulerian hydrodynamic fields (advection currents \$\\boldsymbol{u}_h\$,
+temperature \$T\$, salinity \$S\$, stratification \$N^2\$, and turbulent diffusivity \$\\kappa_v\$)
+across discrete depth levels and simulation epochs.
+
+# Inputs
+- `trajectories::NamedTuple`: Particle tracking output containing `lons`, `lats`, `depths`, `times`.
+- `output_path::AbstractString`: Output path for the generated standalone HTML file.
+- `kwargs...`: Additional keyword arguments forwarded to the file-path primary signature.
+
+# Outputs
+- `String`: Canonical file path to the generated HTML dashboard.
+"""
+function export_interactive_tracks_html(
+    trajectories::NamedTuple,
+    output_path::AbstractString;
+    kwargs...
+)::String
+    return export_interactive_tracks_html(
+        output_path;
+        trajectories = trajectories,
+        kwargs...
+    )
 end
 
 """
