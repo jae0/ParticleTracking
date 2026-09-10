@@ -36,6 +36,7 @@ z \\in [z_{\\text{bottom}}, z_{\\text{surface}}]
 - `lon_range::Tuple{Real, Real}`: Longitude bounds in degrees East.
 - `lat_range::Tuple{Real, Real}`: Latitude bounds in degrees North.
 - `z_range::Tuple{Real, Real}`: Vertical bounds in meters (bottom, top).
+- `z_faces::Union{Nothing, AbstractVector, Function}`: Custom stretched vertical face coordinates.
 - `grid_size::Tuple{Int, Int, Int}`: Number of grid cells `(Nx, Ny, Nz)`.
 - `topology::Tuple`: Oceananigans boundary topology (default Bounded in all 3 dirs).
 - `fallback_to_cpu::Bool`: If true, falls back to CPU when GPU is requested on non-CUDA systems.
@@ -48,6 +49,7 @@ function build_shelf_grid(;
     lon_range::Tuple{Real, Real} = (-71.0, -53.0),
     lat_range::Tuple{Real, Real} = (40.0, 48.5),
     z_range::Tuple{Real, Real} = (-3500.0, 0.0),
+    z_faces::Union{Nothing, AbstractVector, Function} = nothing,
     grid_size::Tuple{Int, Int, Int} = (50, 50, 10),
     topology::Tuple = (Bounded, Bounded, Bounded),
     fallback_to_cpu::Bool = false
@@ -58,25 +60,71 @@ function build_shelf_grid(;
     if lat_range[1] >= lat_range[2]
         error("Invalid latitude range: $(lat_range). lat_min must be < lat_max.")
     end
-    if z_range[1] >= z_range[2]
-        error("Invalid vertical range: $(z_range). z_min must be < z_max.")
-    end
     if any(s <= 0 for s in grid_size)
         error("Grid size dimensions must all be positive integers: $(grid_size)")
     end
 
-    arch = resolve_architecture(architecture; fallback_to_cpu = fallback_to_cpu)
+    z_specification = if !isnothing(z_faces)
+        if z_faces isa AbstractVector
+            if length(z_faces) != grid_size[3] + 1
+                error("Custom z_faces length $(length(z_faces)) must equal Nz + 1 = $(grid_size[3] + 1)")
+            end
+            if !issorted(z_faces)
+                error("Custom z_faces must be strictly monotonically increasing.")
+            end
+        end
+        z_faces
+    else
+        if z_range[1] >= z_range[2]
+            error("Invalid vertical range: $(z_range). z_min must be < z_max.")
+        end
+        z_range
+    end
 
+    arch = resolve_architecture(:cpu; fallback_to_cpu = fallback_to_cpu)
+     
     grid = LatitudeLongitudeGrid(
         arch;
         size = grid_size,
         longitude = lon_range,
         latitude = lat_range,
-        z = z_range,
+        z = z_specification,
         topology = topology
     )
     return grid
 end
+
+"""
+    load_vertical_grid_csv(filepath::AbstractString) -> Vector{Float64}
+
+Load vertical layer face coordinates from a CSV file (e.g. `scotian_shelf_vertical_grid.csv`).
+"""
+function load_vertical_grid_csv(filepath::AbstractString)::Vector{Float64}
+    if !isfile(filepath)
+        error("Vertical grid file does not exist: $(filepath)")
+    end
+    lines = readlines(filepath)
+    if length(lines) < 2
+        error("Vertical grid file $(filepath) is empty or missing data.")
+    end
+    faces = Float64[]
+    for l in lines[2:end]
+        parts = split(strip(l), ',')
+        if length(parts) >= 3
+            bot_val = parse(Float64, parts[2])
+            top_val = parse(Float64, parts[3])
+            if isempty(faces)
+                push!(faces, bot_val)
+            end
+            push!(faces, top_val)
+        end
+    end
+    if !issorted(faces)
+        error("Parsed vertical grid faces from $(filepath) are not monotonically sorted.")
+    end
+    return faces
+end
+
 
 """
     load_bathymetry_from_netcdf(filepath::AbstractString, varname::AbstractString="elevation")

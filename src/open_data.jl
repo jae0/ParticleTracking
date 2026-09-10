@@ -229,8 +229,6 @@ function fetch_open_bathymetry(; lon_range::Tuple{Real, Real} = (-68.0, -57.0), 
 end
 
 
-using Downloads
-using NCDatasets
 
 
 """
@@ -905,4 +903,3 @@ function fetch_open_woa_climatology(;
         salinity_fn      = s_fn
     )
 end
-

@@ -1,3 +1,32 @@
+# Auto-discover and activate the project environment if not already loaded
+import Pkg
+
+if Base.find_package("ParticleTracking") === nothing
+    let
+        curr_dir = @__DIR__
+        repo_root = nothing
+        for _ in 1:6
+            proj = joinpath(curr_dir, "Project.toml")
+            if isfile(proj)
+                txt = read(proj, String)
+                if occursin("name = \"ParticleTracking\"", txt)  
+                    repo_root = curr_dir
+                    break
+                end
+            end
+            parent = dirname(curr_dir)
+            parent == curr_dir && break
+            curr_dir = parent
+        end
+        if repo_root !== nothing
+            Pkg.activate(repo_root)
+        else
+            Pkg.activate(normpath(joinpath(@__DIR__, "..", "..")))
+        end
+    end
+end
+
+
 """
     ParticleTrackingRun.jl
 
@@ -37,8 +66,9 @@ julia --project=. ParticleTrackingRun.jl --viz
 """
 
 # Load the ParticleTracking module
-import Pkg
 Pkg.activate(@__DIR__, io = devnull)
+
+Pkg.instantiate()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fast CLI Help Handler (Dispatched before loading Oceananigans / CairoMakie)
@@ -209,6 +239,7 @@ using
     LinearAlgebra,
     TOML,
     JLD2,
+    TaylorSeries,
     Oceananigans,
     Oceananigans.Units,
     Oceananigans.Utils,

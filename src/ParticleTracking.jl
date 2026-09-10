@@ -28,17 +28,13 @@ The module provides:
   *Canadian Journal of Fisheries and Aquatic Sciences*, 56(11), 2181-2193.
 """
 module ParticleTracking
-
-using Oceananigans.Units
-using Oceananigans.Utils: prettytime
-using Oceananigans
-
+ 
 using
   Random,
   CairoMakie,
+  CUDA,
   NCDatasets,
   Downloads,
-  Random,
   DuckDB,
   DataFrames,
   DBInterface,
@@ -46,9 +42,15 @@ using
   Statistics,
   LinearAlgebra,
   TOML,
-  JLD2
+  JLD2,
+  TaylorSeries 
+
+using Oceananigans.Units
+using Oceananigans.Utils: prettytime
+using Oceananigans
 
 # Sub-components (in src/)
+include("numerical_earth.jl")
 include("configuration.jl")
 include("open_data.jl")
 include("synthetic_data.jl")
@@ -65,8 +67,16 @@ include("visualization.jl")
 
 # Exported APIs
 export
-    # Centralized configuration management
+    # NumericalEarth and DataWrangling subsystem
+    NumericalEarth,
+
+    # Centralized and decoupled configuration management
     HydrodynamicOptions,
+    HydrodynamicConfig,
+    LarvalDispersalConfig,
+    CoupledSimulationConfig,
+    to_hydrodynamic_config,
+    to_larval_config,
     load_configuration,
     save_configuration,
     configuration_to_options,
@@ -78,6 +88,7 @@ export
 
     # Architecture and device resolution
     resolve_architecture,
+
 
     # Open real-world data and regridding
     fetch_open_bathymetry,
@@ -97,6 +108,7 @@ export
     # Grid, bathymetry & coastline geometry
     REGIONAL_COASTLINE,
     build_shelf_grid,
+    load_vertical_grid_csv,
     load_bathymetry_from_netcdf,
     get_bathymetry_interpolator,
     load_coastline_polygons,

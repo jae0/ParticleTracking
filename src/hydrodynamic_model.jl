@@ -80,8 +80,10 @@ function build_hydrodynamic_model(
     surface_wind_stress_y::Union{Real, AbstractMatrix, Function} = 0.0,
     surface_heat_flux::Union{Real, AbstractMatrix, Function} = 0.0,
     tidal_forcing::Union{Nothing, NamedTuple} = nothing,
+    open_boundary_conditions = nothing,
+    sponge_forcing::Union{Nothing, NamedTuple} = nothing,
     bottom_drag::Real = 1e-4,
-    cd_drag::Real = 1e-3,
+    cd_drag::Real = 2.5e-3,
     ν::Real = 1e-2,
     κ::Real = 1e-2,
     closure = nothing,
@@ -92,8 +94,8 @@ function build_hydrodynamic_model(
     u_top_bc = FluxBoundaryCondition(surface_wind_stress_x)
     v_top_bc = FluxBoundaryCondition(surface_wind_stress_y)
 
-    u_bcs = FieldBoundaryConditions(top = u_top_bc)
-    v_bcs = FieldBoundaryConditions(top = v_top_bc)
+    u_bcs_dict = Dict{Symbol, Any}(:top => u_top_bc)
+    v_bcs_dict = Dict{Symbol, Any}(:top => v_top_bc)
 
     # Net surface heat flux: J_T = -Q_net / (ρ₀ * c_p) [°C m s⁻¹] (upward positive in Oceananigans)
     rho0_cp = 1025.0 * 3990.0 # volumetric heat capacity ~4.09e6 J/(m³ °C)
@@ -105,30 +107,70 @@ function build_hydrodynamic_model(
         -Float64(surface_heat_flux) / rho0_cp
     end
     T_top_bc = FluxBoundaryCondition(kinematic_T_flux)
-    T_bcs = FieldBoundaryConditions(top = T_top_bc)
+    T_bcs_dict = Dict{Symbol, Any}(:top => T_top_bc)
+    S_bcs_dict = Dict{Symbol, Any}()
+
+    # Attach lateral open boundary conditions if supplied (e.g. from NumericalEarth)
+    if !isnothing(open_boundary_conditions)
+        obc = open_boundary_conditions
+        if hasproperty(obc, :u_east)
+            u_bcs_dict[:east] = OpenBoundaryCondition(obc.u_east)
+            v_bcs_dict[:east] = OpenBoundaryCondition(obc.v_east)
+            T_bcs_dict[:east] = OpenBoundaryCondition(obc.T_east)
+            S_bcs_dict[:east] = OpenBoundaryCondition(obc.S_east)
+        end
+        if hasproperty(obc, :u_south)
+            u_bcs_dict[:south] = OpenBoundaryCondition(obc.u_south)
+            v_bcs_dict[:south] = OpenBoundaryCondition(obc.v_south)
+            T_bcs_dict[:south] = OpenBoundaryCondition(obc.T_south)
+            S_bcs_dict[:south] = OpenBoundaryCondition(obc.S_south)
+        end
+        if hasproperty(obc, :u_west)
+            u_bcs_dict[:west] = OpenBoundaryCondition(obc.u_west)
+            v_bcs_dict[:west] = OpenBoundaryCondition(obc.v_west)
+            T_bcs_dict[:west] = OpenBoundaryCondition(obc.T_west)
+            S_bcs_dict[:west] = OpenBoundaryCondition(obc.S_west)
+        end
+    end
+
+    u_bcs = FieldBoundaryConditions(; u_bcs_dict...)
+    v_bcs = FieldBoundaryConditions(; v_bcs_dict...)
+    T_bcs = FieldBoundaryConditions(; T_bcs_dict...)
 
     boundary_conditions = Dict{Symbol, Any}(:u => u_bcs, :v => v_bcs)
     if :T in tracers
         boundary_conditions[:T] = T_bcs
+    end
+    if :S in tracers && !isempty(S_bcs_dict)
+        boundary_conditions[:S] = FieldBoundaryConditions(; S_bcs_dict...)
     end
 
     coriolis = FPlane(latitude = coriolis_latitude)
     buoyancy = SeawaterBuoyancy()
     active_closure = isnothing(closure) ? ScalarDiffusivity(ν = ν, κ = κ) : closure
 
-    # Momentum forcing combining tidal oscillations and bottom boundary layer drag
+    # Momentum forcing combining tidal oscillations, BBL drag, and sponge layer relaxation
     total_Fu(x, y, z, t, u, v) = begin
         tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.u(x, y, z, t)
         speed = sqrt(u^2 + v^2)
         drag_val = -(bottom_drag + cd_drag * speed) * u
-        return tide_val + drag_val
+        sponge_val = 0.0
+        if !isnothing(sponge_forcing) && hasproperty(sponge_forcing, :u)
+            # Sponge forcing callable evaluation if present
+            sponge_val = sponge_forcing.u isa Function ? sponge_forcing.u(x, y, z, t, u) : 0.0
+        end
+        return tide_val + drag_val + sponge_val
     end
 
     total_Fv(x, y, z, t, u, v) = begin
         tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.v(x, y, z, t)
         speed = sqrt(u^2 + v^2)
         drag_val = -(bottom_drag + cd_drag * speed) * v
-        return tide_val + drag_val
+        sponge_val = 0.0
+        if !isnothing(sponge_forcing) && hasproperty(sponge_forcing, :v)
+            sponge_val = sponge_forcing.v isa Function ? sponge_forcing.v(x, y, z, t, v) : 0.0
+        end
+        return tide_val + drag_val + sponge_val
     end
 
     momentum_forcing = (
@@ -150,6 +192,7 @@ function build_hydrodynamic_model(
 
     return model
 end
+
 
 """
     set_initial_stratification!(

@@ -1,81 +1,43 @@
-"""
-    architecture.jl
-
-Computational architecture abstraction and hardware resolution (CPU vs NVIDIA GPU/CUDA)
-for Oceananigans.jl hydrodynamic simulations and Lagrangian particle tracking.
-"""
 
 using Oceananigans
 using Oceananigans.Architectures: AbstractArchitecture, CPU, GPU
+using CUDA
 
 """
-    resolve_architecture(
-        arch::Union{Symbol, String, Bool, AbstractArchitecture} = :cpu;
-        fallback_to_cpu::Bool = false
-    ) -> AbstractArchitecture
+    resolve_architecture(arch::Union{Symbol, String, Bool, AbstractArchitecture} = :cpu; 
+                         fallback_to_cpu::Bool = false) -> AbstractArchitecture
 
-Resolve and instantiate the computational architecture (`CPU()` or `GPU(...)`) for
-Oceananigans hydrodynamic simulations and particle tracking routines.
-
-# Mathematical & System Architecture
-Oceananigans supports multi-threaded CPU execution and massively parallel NVIDIA CUDA GPU
-acceleration through Julia's GPUCompiler / CUDA.jl backend. On GPUs, array allocations
-use unified device memory and compute kernels run asynchronously across streaming multiprocessors.
-
-```math
-\\text{Architecture} \\in \\{ \\text{CPU}(), \\text{GPU}(\\text{device}) \\}
-```
-
-# Arguments
-- `arch`: Architecture descriptor. Supported values:
-  - `:cpu`, `"cpu"`, or `false`: Explicit multi-threaded CPU architecture (`CPU()`).
-  - `:gpu`, `:cuda`, `"gpu"`, `"cuda"`, or `true`: NVIDIA CUDA GPU architecture (`GPU()`).
-  - `Oceananigans.Architectures.AbstractArchitecture`: Pre-constructed architecture instance.
-- `fallback_to_cpu::Bool`: If `true`, issues an informative warning and returns `CPU()`
-  when GPU is requested on hardware without functional CUDA drivers. If `false` (default),
-  raises an informative `ErrorException`.
-
-# Returns
-- `AbstractArchitecture`: Concrete instantiated architecture (`CPU()` or `GPU(...)`).
-
-# Throws
-- `ErrorException`: When GPU is requested without functional CUDA runtime and `fallback_to_cpu=false`.
+Resolve and instantiate the computational architecture (`CPU()` or `GPU(...)`) for 
+Oceananigans hydrodynamic simulations and particle tracking routines, with world-age safety for Julia 1.12+.
 """
 function resolve_architecture(
-    arch::Union{Symbol, String, Bool, AbstractArchitecture} = :cpu;
+    arch::Union{Symbol, String, Bool, AbstractArchitecture} = :cpu; 
     fallback_to_cpu::Bool = false
 )::AbstractArchitecture
-    if arch isa AbstractArchitecture
-        return arch
+    if arch isa AbstractArchitecture 
+        return arch 
     end
 
-    is_gpu_req = (arch === true) || (arch === :gpu) || (arch === :cuda) ||
+    is_gpu_req = (arch === true) || (arch === :gpu) || (arch === :cuda) || 
                  (arch isa String && lowercase(arch) in ["gpu", "cuda"])
-
-    if !is_gpu_req
-        return CPU()
+    
+    if !is_gpu_req 
+        return CPU() 
     end
 
-    # Check CUDA availability
+    # Check CUDA availability safely avoiding world-age issues under Julia 1.12+ and Revise
     cuda_functional = false
-    if !isdefined(Main, :CUDA)
-        try
-            # Attempt to dynamically import CUDA if installed in the environment
-            if Base.find_package("CUDA") !== nothing
-                @eval Main import CUDA
-            end
-        catch err
-            @debug "Dynamic CUDA import skipped: $(err)"
-        end
-    end
-
     try
-        if isdefined(Main, :CUDA)
-            cuda_functional = Main.CUDA.functional()
-        elseif isdefined(Oceananigans, :CUDA)
-            cuda_functional = Oceananigans.CUDA.functional()
+        if isdefined(Main, :CUDA) && isdefined(Main.CUDA, :functional)
+            cuda_functional = Base.invokelatest(Main.CUDA.functional)
+        elseif isdefined(Oceananigans, :CUDA) && isdefined(Oceananigans.CUDA, :functional)
+            cuda_functional = Base.invokelatest(Oceananigans.CUDA.functional)
+        else
+            # Attempt dynamic check if CUDA package is loaded or loadable
+            cuda_functional = Base.invokelatest(CUDA.functional)
         end
-    catch
+    catch err
+        @debug "CUDA availability check encountered an error: $(err)"
         cuda_functional = false
     end
 

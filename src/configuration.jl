@@ -769,3 +769,260 @@ function SnowCrabRunOptions(; kwargs...)::HydrodynamicOptions
     return configuration_to_options(cfg; kwargs...)
 end
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Formally Decoupled Configuration Architecture
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    HydrodynamicConfig
+
+Physical parameters specifying Eulerian ocean circulation, lateral boundary
+conditions, atmospheric fluxes, and numerical time integration.
+"""
+struct HydrodynamicConfig
+    domain_lon               :: Tuple{Float64, Float64}
+    domain_lat               :: Tuple{Float64, Float64}
+    domain_z                 :: Tuple{Float64, Float64}
+    grid_size                :: Tuple{Int, Int, Int}
+    vertical_stretching_mode :: Symbol
+    vertical_grid_file       :: String
+    resolution_scale         :: Float64
+    bathymetry_source        :: Symbol
+    bathy_dataset_id         :: String
+    inshore_depth            :: Float64
+    shelf_slope              :: Float64
+    atmospheric_source       :: Symbol
+    drag_formulation         :: Symbol
+    bulk_heat_flux           :: Bool
+    climatology              :: Bool
+    mhw_temp_anomaly         :: Float64
+    ocean_boundary_source    :: Symbol
+    obc_type                 :: Symbol
+    sponge_layer_width       :: Float64
+    sponge_timescale         :: Float64
+    enable_tides             :: Bool
+    tides_source             :: Symbol
+    tidal_constituents       :: Vector{Symbol}
+    tidal_u_amp              :: Float64
+    tidal_v_amp              :: Float64
+    cd_drag                  :: Float64
+    bottom_drag              :: Float64
+    bbl_mixing_closure       :: Symbol
+    sim_duration_seconds     :: Float64
+    sim_dt_seconds           :: Float64
+    adaptive_cfl             :: Bool
+    target_cfl               :: Float64
+    target_wave_cfl          :: Float64
+    max_dt_seconds           :: Float64
+    min_dt_seconds           :: Float64
+    coriolis_latitude        :: Float64
+    divergence_limit         :: Float64
+    output_dir               :: String
+    output_filename          :: String
+    output_schedule_seconds  :: Float64
+    use_gpu                  :: Bool
+    fallback_to_cpu          :: Bool
+end
+
+"""
+    LarvalDispersalConfig
+
+Biological parameters specifying Lagrangian particle tracking, active vertical
+locomotion, degree-day molting, thermal mortality, and benthic settlement.
+"""
+struct LarvalDispersalConfig
+    n_particles              :: Int
+    track_duration_seconds   :: Float64
+    track_dt_seconds         :: Float64
+    diffusivity_h            :: Float64
+    diffusivity_v            :: Float64
+    min_seabed_depth         :: Float64
+    buffer_km                :: Float64
+    release_depth_mode       :: Symbol
+    bottom_release_offset    :: Tuple{Float64, Float64}
+    enable_initial_ascent    :: Bool
+    ascent_speed             :: Float64
+    ascent_target_depth      :: Float64
+    enable_dvm               :: Bool
+    megalopa_day_depth       :: Float64
+    megalopa_night_depth     :: Float64
+    zoea2_depth_factor       :: Float64
+    megalopa_swim_factor     :: Float64
+    enable_molting           :: Bool
+    t_base                   :: Float64
+    dd_zoea1_to_zoea2        :: Float64
+    dd_zoea2_to_megalopa     :: Float64
+    dd_megalopa_to_settle    :: Float64
+    mortality_base           :: Float64
+    mortality_thermal_thresh :: Float64
+    mortality_thermal_sens   :: Float64
+    mortality_cold_thresh    :: Float64
+    mortality_cold_sens      :: Float64
+    settlement_min_depth     :: Float64
+    settlement_max_depth     :: Float64
+    settlement_max_temp      :: Float64
+    enable_duckdb            :: Bool
+    duckdb_path              :: String
+    run_id                   :: String
+    seed                     :: Int
+end
+
+"""
+    CoupledSimulationConfig
+
+Unified configuration aggregating physical `HydrodynamicConfig` and biological
+`LarvalDispersalConfig` for integrated end-to-end simulations.
+"""
+struct CoupledSimulationConfig
+    hydro  :: HydrodynamicConfig
+    larval :: LarvalDispersalConfig
+end
+
+"""
+    to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...) -> HydrodynamicConfig
+
+Extract and convert a `HydrodynamicOptions` instance into a pure `HydrodynamicConfig`.
+"""
+function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::HydrodynamicConfig
+    d = Dict{Symbol, Any}(
+        :domain_lon               => opts.domain_lon,
+        :domain_lat               => opts.domain_lat,
+        :domain_z                 => opts.domain_z,
+        :grid_size                => opts.grid_size,
+        :vertical_stretching_mode => :tanh,
+        :vertical_grid_file       => joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
+        :resolution_scale         => 1.0,
+        :bathymetry_source        => opts.data_mode == :real ? :gebco : :synthetic,
+        :bathy_dataset_id         => "etopo180",
+        :inshore_depth            => -20.0,
+        :shelf_slope              => 500.0,
+        :atmospheric_source       => opts.data_mode == :real ? :era5 : :synthetic,
+        :drag_formulation         => :garratt_1977,
+        :bulk_heat_flux           => true,
+        :climatology              => false,
+        :mhw_temp_anomaly         => opts.scenario == :mhw ? 3.5 : 0.0,
+        :ocean_boundary_source    => :glorys12v1,
+        :obc_type                 => :flather_chapman,
+        :sponge_layer_width       => 0.25,
+        :sponge_timescale         => 3600.0,
+        :enable_tides             => opts.enable_tides,
+        :tides_source             => :tpxo9_atlas,
+        :tidal_constituents       => [:M2, :S2],
+        :tidal_u_amp              => opts.tidal_u_amp,
+        :tidal_v_amp              => opts.tidal_v_amp,
+        :cd_drag                  => 0.0025,
+        :bottom_drag              => 0.0001,
+        :bbl_mixing_closure       => :tke,
+        :sim_duration_seconds     => opts.sim_duration,
+        :sim_dt_seconds           => opts.sim_dt,
+        :adaptive_cfl             => opts.adaptive_cfl,
+        :target_cfl               => opts.target_cfl,
+        :target_wave_cfl          => 0.20,
+        :max_dt_seconds           => 90.0,
+        :min_dt_seconds           => 2.0,
+        :coriolis_latitude        => 44.5,
+        :divergence_limit         => 20.0,
+        :output_dir               => opts.output_dir,
+        :output_filename          => isempty(opts.hydro_model_file) ?
+                                     "hydrodynamics_output.jld2" :
+                                     basename(opts.hydro_model_file),
+        :output_schedule_seconds  => 21600.0,
+        :use_gpu                  => opts.use_gpu,
+        :fallback_to_cpu          => opts.fallback_to_cpu
+    )
+    for (k, v) in kwargs
+        d[k] = v
+    end
+
+    return HydrodynamicConfig(
+        d[:domain_lon], d[:domain_lat], d[:domain_z], d[:grid_size],
+        Symbol(d[:vertical_stretching_mode]), String(d[:vertical_grid_file]),
+        Float64(d[:resolution_scale]), Symbol(d[:bathymetry_source]),
+        String(d[:bathy_dataset_id]), Float64(d[:inshore_depth]),
+        Float64(d[:shelf_slope]), Symbol(d[:atmospheric_source]),
+        Symbol(d[:drag_formulation]), Bool(d[:bulk_heat_flux]),
+        Bool(d[:climatology]), Float64(d[:mhw_temp_anomaly]),
+        Symbol(d[:ocean_boundary_source]), Symbol(d[:obc_type]),
+        Float64(d[:sponge_layer_width]), Float64(d[:sponge_timescale]),
+        Bool(d[:enable_tides]), Symbol(d[:tides_source]),
+        Vector{Symbol}(d[:tidal_constituents]), Float64(d[:tidal_u_amp]),
+        Float64(d[:tidal_v_amp]), Float64(d[:cd_drag]),
+        Float64(d[:bottom_drag]), Symbol(d[:bbl_mixing_closure]),
+        Float64(d[:sim_duration_seconds]), Float64(d[:sim_dt_seconds]),
+        Bool(d[:adaptive_cfl]), Float64(d[:target_cfl]),
+        Float64(d[:target_wave_cfl]), Float64(d[:max_dt_seconds]),
+        Float64(d[:min_dt_seconds]), Float64(d[:coriolis_latitude]),
+        Float64(d[:divergence_limit]), String(d[:output_dir]),
+        String(d[:output_filename]), Float64(d[:output_schedule_seconds]),
+        Bool(d[:use_gpu]), Bool(d[:fallback_to_cpu])
+    )
+end
+
+"""
+    to_larval_config(opts::HydrodynamicOptions; kwargs...) -> LarvalDispersalConfig
+
+Extract and convert a `HydrodynamicOptions` instance into a pure `LarvalDispersalConfig`.
+"""
+function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersalConfig
+    d = Dict{Symbol, Any}(
+        :n_particles              => opts.n_particles,
+        :track_duration_seconds   => opts.track_duration,
+        :track_dt_seconds         => opts.track_dt,
+        :diffusivity_h            => opts.diffusivity_h,
+        :diffusivity_v            => opts.diffusivity_v,
+        :min_seabed_depth         => opts.min_seabed_depth,
+        :buffer_km                => opts.buffer_km,
+        :release_depth_mode       => opts.release_depth_mode,
+        :bottom_release_offset    => opts.bottom_release_offset,
+        :enable_initial_ascent    => opts.enable_initial_ascent,
+        :ascent_speed             => opts.ascent_speed,
+        :ascent_target_depth      => opts.ascent_target_depth,
+        :enable_dvm               => opts.enable_dvm,
+        :megalopa_day_depth       => -120.0,
+        :megalopa_night_depth     => -60.0,
+        :zoea2_depth_factor       => 1.2,
+        :megalopa_swim_factor     => 1.5,
+        :enable_molting           => opts.enable_molting,
+        :t_base                   => -1.5,
+        :dd_zoea1_to_zoea2        => 65.0,
+        :dd_zoea2_to_megalopa     => 130.0,
+        :dd_megalopa_to_settle    => 200.0,
+        :mortality_base           => 0.02,
+        :mortality_thermal_thresh => 7.0,
+        :mortality_thermal_sens   => 0.35,
+        :mortality_cold_thresh    => -1.5,
+        :mortality_cold_sens      => 0.02,
+        :settlement_min_depth     => -250.0,
+        :settlement_max_depth     => -50.0,
+        :settlement_max_temp      => 6.0,
+        :enable_duckdb            => opts.enable_duckdb,
+        :duckdb_path              => opts.duckdb_path,
+        :run_id                   => opts.run_id,
+        :seed                     => opts.seed
+    )
+    for (k, v) in kwargs
+        d[k] = v
+    end
+
+    return LarvalDispersalConfig(
+        Int(d[:n_particles]), Float64(d[:track_duration_seconds]),
+        Float64(d[:track_dt_seconds]), Float64(d[:diffusivity_h]),
+        Float64(d[:diffusivity_v]), Float64(d[:min_seabed_depth]),
+        Float64(d[:buffer_km]), Symbol(d[:release_depth_mode]),
+        (Float64(d[:bottom_release_offset][1]), Float64(d[:bottom_release_offset][2])),
+        Bool(d[:enable_initial_ascent]), Float64(d[:ascent_speed]),
+        Float64(d[:ascent_target_depth]), Bool(d[:enable_dvm]),
+        Float64(d[:megalopa_day_depth]), Float64(d[:megalopa_night_depth]),
+        Float64(d[:zoea2_depth_factor]), Float64(d[:megalopa_swim_factor]),
+        Bool(d[:enable_molting]), Float64(d[:t_base]),
+        Float64(d[:dd_zoea1_to_zoea2]), Float64(d[:dd_zoea2_to_megalopa]),
+        Float64(d[:dd_megalopa_to_settle]), Float64(d[:mortality_base]),
+        Float64(d[:mortality_thermal_thresh]), Float64(d[:mortality_thermal_sens]),
+        Float64(d[:mortality_cold_thresh]), Float64(d[:mortality_cold_sens]),
+        Float64(d[:settlement_min_depth]), Float64(d[:settlement_max_depth]),
+        Float64(d[:settlement_max_temp]), Bool(d[:enable_duckdb]),
+        String(d[:duckdb_path]), String(d[:run_id]), Int(d[:seed])
+    )
+end
+
+
