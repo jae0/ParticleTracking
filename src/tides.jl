@@ -46,6 +46,76 @@ function get_tidal_frequency(constituent::Symbol)
 end
 
 """
+    TidalBodyForcingU{N}
+
+Bitstype callable struct representing zonal tidal body forcing from harmonic synthesis.
+Stored as compile-time static tuples to ensure zero-allocation GPU kernel compilation.
+
+# Mathematical Formulation
+```math
+F_u(x, y, z, t) = \\sum_{i=1}^N u_{a,i} \\sqrt{\\omega_i^2 + r^2} \\cos(\\omega_i t + \\phi_i)
+```
+
+# Inputs
+- `u_amps::NTuple{N, Float64}`: Harmonic zonal velocity amplitudes (\$m s^{-1}\$).
+- `scales::NTuple{N, Float64}`: Linear bottom drag scaling coefficients (\$s^{-1}\$).
+- `freqs::NTuple{N, Float64}`: Angular constituent frequencies (\$rad s^{-1}\$).
+- `phases::NTuple{N, Float64}`: Initial Greenwich constituent phase offsets (\$rad\$).
+
+# Outputs
+- `Float64`: Instantaneous zonal acceleration (\$m s^{-2}\$).
+"""
+struct TidalBodyForcingU{N}
+    u_amps :: NTuple{N, Float64}
+    scales :: NTuple{N, Float64}
+    freqs  :: NTuple{N, Float64}
+    phases :: NTuple{N, Float64}
+end
+
+@inline function (f::TidalBodyForcingU{N})(x, y, z, t) where {N}
+    val = 0.0
+    for i in 1:N
+        val += @inbounds f.u_amps[i] * f.scales[i] * cos(f.freqs[i] * t + f.phases[i])
+    end
+    return val
+end
+
+"""
+    TidalBodyForcingV{N}
+
+Bitstype callable struct representing meridional tidal body forcing from harmonic synthesis.
+Stored as compile-time static tuples to ensure zero-allocation GPU kernel compilation.
+
+# Mathematical Formulation
+```math
+F_v(x, y, z, t) = \\sum_{i=1}^N v_{a,i} \\sqrt{\\omega_i^2 + r^2} \\sin(\\omega_i t + \\phi_i)
+```
+
+# Inputs
+- `v_amps::NTuple{N, Float64}`: Harmonic meridional velocity amplitudes (\$m s^{-1}\$).
+- `scales::NTuple{N, Float64}`: Linear bottom drag scaling coefficients (\$s^{-1}\$).
+- `freqs::NTuple{N, Float64}`: Angular constituent frequencies (\$rad s^{-1}\$).
+- `phases::NTuple{N, Float64}`: Initial Greenwich constituent phase offsets (\$rad\$).
+
+# Outputs
+- `Float64`: Instantaneous meridional acceleration (\$m s^{-2}\$).
+"""
+struct TidalBodyForcingV{N}
+    v_amps :: NTuple{N, Float64}
+    scales :: NTuple{N, Float64}
+    freqs  :: NTuple{N, Float64}
+    phases :: NTuple{N, Float64}
+end
+
+@inline function (f::TidalBodyForcingV{N})(x, y, z, t) where {N}
+    val = 0.0
+    for i in 1:N
+        val += @inbounds f.v_amps[i] * f.scales[i] * sin(f.freqs[i] * t + f.phases[i])
+    end
+    return val
+end
+
+"""
     build_tidal_body_forcing(;
         constituents::Vector{Symbol} = [:M2],
         u_amplitudes::Dict{Symbol, Float64} = Dict(:M2 => 0.25),
@@ -77,7 +147,6 @@ resulting body force amplitude is \$\\approx 3.5 \\times 10^{-5}\$ m s⁻², con
 with observed tidal acceleration magnitudes on the Scotian Shelf.
 
 # Inputs
-# Inputs
 - `constituents::Vector{Symbol}`: List of constituents to include (e.g. `[:M2, :S2]`).
 - `u_amplitudes::Dict{Symbol, Float64}`: Zonal tidal velocity amplitudes in \$m s^{-1}\$.
 - `v_amplitudes::Dict{Symbol, Float64}`: Meridional tidal velocity amplitudes in \$m s^{-1}\$.
@@ -95,6 +164,7 @@ with observed tidal acceleration magnitudes on the Scotian Shelf.
   ocean tides. *Journal of Atmospheric and Oceanic Technology*, 19(2), 183-204.
   DOI: 10.1175/1520-0426(2002)019<0183:EIMOBO>2.0.CO;2
 """
+
 function build_tidal_body_forcing(;
     constituents::Vector{Symbol} = [:M2],
     u_amplitudes::AbstractDict{Symbol, <:Real} = Dict(:M2 => 0.25),
@@ -103,7 +173,7 @@ function build_tidal_body_forcing(;
     bottom_drag_linear::Real = 0.0,
     bottom_drag::Union{Nothing, Real} = nothing
 )
-    freqs = [get_tidal_frequency(c) for c in constituents]
+    freqs = [Float64(get_tidal_frequency(c)) for c in constituents]
     u_amps = [Float64(get(u_amplitudes, c, 0.0)) for c in constituents]
     v_amps = [Float64(get(v_amplitudes, c, 0.0)) for c in constituents]
     phs = [Float64(get(phases, c, 0.0)) for c in constituents]
@@ -113,21 +183,9 @@ function build_tidal_body_forcing(;
     # In the absence of drag (r = 0), this simplifies to ω.
     scales = [sqrt(ω^2 + r_linear^2) for ω in freqs]
 
-    F_u(x, y, z, t) = begin
-        val = 0.0
-        for i in eachindex(constituents)
-            val += u_amps[i] * scales[i] * cos(freqs[i] * t + phs[i])
-        end
-        val
-    end
-
-    F_v(x, y, z, t) = begin
-        val = 0.0
-        for i in eachindex(constituents)
-            val += v_amps[i] * scales[i] * sin(freqs[i] * t + phs[i])
-        end
-        val
-    end
+    N = length(constituents)
+    F_u = TidalBodyForcingU{N}(Tuple(u_amps), Tuple(scales), Tuple(freqs), Tuple(phs))
+    F_v = TidalBodyForcingV{N}(Tuple(v_amps), Tuple(scales), Tuple(freqs), Tuple(phs))
 
     return (u = F_u, v = F_v)
 end

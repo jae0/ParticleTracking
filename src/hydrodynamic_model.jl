@@ -9,6 +9,101 @@ using Oceananigans
 using Oceananigans.Units
 
 """
+    ZeroForcing
+
+Bitstype placeholder representing zero forcing acceleration.
+Callable with arbitrary continuous arguments `(x, y, z, t)` or `(x, y, z, t, ...)`.
+"""
+struct ZeroForcing end
+@inline (::ZeroForcing)(x, y, z, t) = 0.0
+@inline (::ZeroForcing)(x, y, z, t, u) = 0.0
+@inline (::ZeroForcing)(x, y, z, t, u, v) = 0.0
+
+"""
+    HorizontalMomentumForcingU{TF}
+
+Bitstype callable struct for zonal momentum forcing on GPU/CPU without field dependencies.
+Combines harmonic tidal body forcing and lateral open boundary sponge relaxation.
+"""
+struct HorizontalMomentumForcingU{TF}
+    tidal          :: TF
+    has_sponge     :: Bool
+    sponge_bound   :: Float64
+    sponge_width   :: Float64
+    sponge_tau     :: Float64
+    climatology    :: Bool
+    u_inflow_mean  :: Float64
+    u_inflow_decay :: Float64
+    omega_M2       :: Float64
+    omega_S2       :: Float64
+    bottom_drag    :: Float64
+    cd_drag        :: Float64
+end
+
+@inline function (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
+    tide_val = m.tidal(x, y, z, t)
+    sponge_val = 0.0
+    if m.has_sponge && x > m.sponge_bound
+        gamma = clamp((x - m.sponge_bound) / m.sponge_width, 0.0, 1.0)
+        t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
+        u_target = m.u_inflow_mean * exp(Float64(z) / m.u_inflow_decay) +
+                   0.12 * sin(m.omega_M2 * t_eff) + 0.05 * sin(m.omega_S2 * t_eff)
+        sponge_val = -gamma * (u - u_target) / m.sponge_tau
+    end
+    speed = sqrt(u^2 + v^2)
+    tau_ref = 120.0
+    drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
+                 (1.0 + (m.bottom_drag + m.cd_drag * speed) * tau_ref)
+    drag_val = -drag_coeff * u
+    return tide_val + sponge_val + drag_val
+end
+
+@inline (m::HorizontalMomentumForcingU)(x, y, z, t, u) = m(x, y, z, t, u, 0.0)
+@inline (m::HorizontalMomentumForcingU)(x, y, z, t) = m(x, y, z, t, 0.0, 0.0)
+
+"""
+    HorizontalMomentumForcingV{TF}
+
+Bitstype callable struct for meridional momentum forcing on GPU/CPU with field dependencies.
+Combines harmonic tidal body forcing, lateral sponge relaxation, and quadratic bottom drag.
+"""
+struct HorizontalMomentumForcingV{TF}
+    tidal          :: TF
+    has_sponge     :: Bool
+    sponge_bound   :: Float64
+    sponge_width   :: Float64
+    sponge_tau     :: Float64
+    climatology    :: Bool
+    v_inflow_mean  :: Float64
+    v_inflow_decay :: Float64
+    omega_M2       :: Float64
+    omega_S2       :: Float64
+    bottom_drag    :: Float64
+    cd_drag        :: Float64
+end
+
+@inline function (m::HorizontalMomentumForcingV)(x, y, z, t, u, v)
+    tide_val = m.tidal(x, y, z, t)
+    sponge_val = 0.0
+    if m.has_sponge && y < m.sponge_bound
+        gamma = clamp((m.sponge_bound - y) / m.sponge_width, 0.0, 1.0)
+        t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
+        v_target = m.v_inflow_mean * exp(Float64(z) / m.v_inflow_decay) +
+                   0.06 * cos(m.omega_M2 * t_eff)
+        sponge_val = -gamma * (v - v_target) / m.sponge_tau
+    end
+    speed = sqrt(u^2 + v^2)
+    tau_ref = 120.0
+    drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
+                 (1.0 + (m.bottom_drag + m.cd_drag * speed) * tau_ref)
+    drag_val = -drag_coeff * v
+    return tide_val + sponge_val + drag_val
+end
+
+@inline (m::HorizontalMomentumForcingV)(x, y, z, t, v) = m(x, y, z, t, 0.0, v)
+@inline (m::HorizontalMomentumForcingV)(x, y, z, t) = m(x, y, z, t, 0.0, 0.0)
+
+"""
     build_hydrodynamic_model(
         grid;
         coriolis_latitude::Real = 45.0,
@@ -76,9 +171,9 @@ is the Coriolis parameter, \$b = -g (\\rho - \\rho_0)/\\rho_0\$ is buoyancy,
 function build_hydrodynamic_model(
     grid;
     coriolis_latitude::Real = 45.0,
-    surface_wind_stress_x::Union{Real, AbstractMatrix, Function} = 0.0001,
-    surface_wind_stress_y::Union{Real, AbstractMatrix, Function} = 0.0,
-    surface_heat_flux::Union{Real, AbstractMatrix, Function} = 0.0,
+    surface_wind_stress_x = 0.0001,
+    surface_wind_stress_y = 0.0,
+    surface_heat_flux = 0.0,
     tidal_forcing::Union{Nothing, NamedTuple} = nothing,
     open_boundary_conditions = nothing,
     sponge_forcing::Union{Nothing, NamedTuple} = nothing,
@@ -91,8 +186,10 @@ function build_hydrodynamic_model(
     free_surface = ImplicitFreeSurface()
 )
     # Surface kinematic boundary conditions for horizontal momentum
-    u_top_bc = FluxBoundaryCondition(surface_wind_stress_x)
-    v_top_bc = FluxBoundaryCondition(surface_wind_stress_y)
+    u_top_bc = surface_wind_stress_x isa BoundaryCondition ?
+        surface_wind_stress_x : FluxBoundaryCondition(surface_wind_stress_x)
+    v_top_bc = surface_wind_stress_y isa BoundaryCondition ?
+        surface_wind_stress_y : FluxBoundaryCondition(surface_wind_stress_y)
 
     u_bcs_dict = Dict{Symbol, Any}(:top => u_top_bc)
     v_bcs_dict = Dict{Symbol, Any}(:top => v_top_bc)
@@ -110,29 +207,6 @@ function build_hydrodynamic_model(
     T_bcs_dict = Dict{Symbol, Any}(:top => T_top_bc)
     S_bcs_dict = Dict{Symbol, Any}()
 
-    # Attach lateral open boundary conditions if supplied (e.g. from NumericalEarth)
-    if !isnothing(open_boundary_conditions)
-        obc = open_boundary_conditions
-        if hasproperty(obc, :u_east)
-            u_bcs_dict[:east] = OpenBoundaryCondition(obc.u_east)
-            v_bcs_dict[:east] = OpenBoundaryCondition(obc.v_east)
-            T_bcs_dict[:east] = OpenBoundaryCondition(obc.T_east)
-            S_bcs_dict[:east] = OpenBoundaryCondition(obc.S_east)
-        end
-        if hasproperty(obc, :u_south)
-            u_bcs_dict[:south] = OpenBoundaryCondition(obc.u_south)
-            v_bcs_dict[:south] = OpenBoundaryCondition(obc.v_south)
-            T_bcs_dict[:south] = OpenBoundaryCondition(obc.T_south)
-            S_bcs_dict[:south] = OpenBoundaryCondition(obc.S_south)
-        end
-        if hasproperty(obc, :u_west)
-            u_bcs_dict[:west] = OpenBoundaryCondition(obc.u_west)
-            v_bcs_dict[:west] = OpenBoundaryCondition(obc.v_west)
-            T_bcs_dict[:west] = OpenBoundaryCondition(obc.T_west)
-            S_bcs_dict[:west] = OpenBoundaryCondition(obc.S_west)
-        end
-    end
-
     u_bcs = FieldBoundaryConditions(; u_bcs_dict...)
     v_bcs = FieldBoundaryConditions(; v_bcs_dict...)
     T_bcs = FieldBoundaryConditions(; T_bcs_dict...)
@@ -145,38 +219,108 @@ function build_hydrodynamic_model(
         boundary_conditions[:S] = FieldBoundaryConditions(; S_bcs_dict...)
     end
 
+    # Grid-aware domain boundaries for lateral relaxation sponges
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    lon_max_grid = hasproperty(base_g, :λᶠᵃᵃ) ?
+        Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]) : -57.0
+    lat_min_grid = hasproperty(base_g, :φᵃᶠᵃ) ?
+        Float64(base_g.φᵃᶠᵃ[1]) : 42.0
+    sponge_width = 0.3
+    sponge_bound_x = lon_max_grid - sponge_width
+    sponge_bound_y = lat_min_grid + sponge_width
+
+    # Active sponge relaxation for open boundary conditions on bounded regional domains
+    active_sponge = if !isnothing(sponge_forcing)
+        sponge_forcing
+    elseif !isnothing(open_boundary_conditions)
+        obc = open_boundary_conditions
+        u_ext = hasproperty(obc, :u_east) ? obc.u_east : nothing
+        v_ext = hasproperty(obc, :v_south) ? obc.v_south : nothing
+        (
+            u = (x, y, z, t, u) -> begin
+                γ = clamp((x - sponge_bound_x) / sponge_width, 0.0, 1.0)
+                γ > 0.0 && !isnothing(u_ext) ?
+                    -γ * (u - Float64(u_ext(y, z, t))) / 3600.0 : 0.0
+            end,
+            v = (x, y, z, t, v) -> begin
+                γ = clamp((sponge_bound_y - y) / sponge_width, 0.0, 1.0)
+                γ > 0.0 && !isnothing(v_ext) ?
+                    -γ * (v - Float64(v_ext(x, z, t))) / 3600.0 : 0.0
+            end
+        )
+    else
+        nothing
+    end
+
     coriolis = FPlane(latitude = coriolis_latitude)
     buoyancy = SeawaterBuoyancy()
     active_closure = isnothing(closure) ? ScalarDiffusivity(ν = ν, κ = κ) : closure
 
-    # Momentum forcing combining tidal oscillations, BBL drag, and sponge layer relaxation
-    total_Fu(x, y, z, t, u, v) = begin
-        tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.u(x, y, z, t)
-        speed = sqrt(u^2 + v^2)
-        drag_val = -(bottom_drag + cd_drag * speed) * u
-        sponge_val = 0.0
-        if !isnothing(sponge_forcing) && hasproperty(sponge_forcing, :u)
-            # Sponge forcing callable evaluation if present
-            sponge_val = sponge_forcing.u isa Function ? sponge_forcing.u(x, y, z, t, u) : 0.0
-        end
-        return tide_val + drag_val + sponge_val
-    end
+    # Momentum forcing: GPU uses bitstype continuous forcing; CPU supports drag closures
+    arch = architecture(grid)
+    is_gpu = !(arch isa CPU)
 
-    total_Fv(x, y, z, t, u, v) = begin
-        tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.v(x, y, z, t)
-        speed = sqrt(u^2 + v^2)
-        drag_val = -(bottom_drag + cd_drag * speed) * v
-        sponge_val = 0.0
-        if !isnothing(sponge_forcing) && hasproperty(sponge_forcing, :v)
-            sponge_val = sponge_forcing.v isa Function ? sponge_forcing.v(x, y, z, t, v) : 0.0
-        end
-        return tide_val + drag_val + sponge_val
-    end
+    momentum_forcing = if is_gpu
+        tf_u = !isnothing(tidal_forcing) && hasproperty(tidal_forcing, :u) ?
+            tidal_forcing.u : ZeroForcing()
+        tf_v = !isnothing(tidal_forcing) && hasproperty(tidal_forcing, :v) ?
+            tidal_forcing.v : ZeroForcing()
 
-    momentum_forcing = (
-        u = Forcing(total_Fu, field_dependencies = (:u, :v)),
-        v = Forcing(total_Fv, field_dependencies = (:u, :v))
-    )
+        has_obc = !isnothing(open_boundary_conditions) || !isnothing(sponge_forcing)
+        obc = open_boundary_conditions
+        clim = !isnothing(obc) && hasproperty(obc, :climatology) ? obc.climatology : false
+
+        fu_gpu = HorizontalMomentumForcingU(
+            tf_u, has_obc, sponge_bound_x, sponge_width, 3600.0, clim,
+            -0.15, 200.0, 2π / 44712.0, 2π / 43200.0,
+            Float64(bottom_drag), Float64(cd_drag)
+        )
+        fv_gpu = HorizontalMomentumForcingV(
+            tf_v, has_obc, sponge_bound_y, sponge_width, 3600.0, clim,
+            0.05, 500.0, 2π / 44712.0, 2π / 43200.0,
+            Float64(bottom_drag), Float64(cd_drag)
+        )
+
+        (u = Forcing(fu_gpu, field_dependencies = (:u, :v)),
+         v = Forcing(fv_gpu, field_dependencies = (:u, :v)))
+    else
+        total_Fu(x, y, z, t, u, v) = begin
+            tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.u(x, y, z, t)
+            speed = sqrt(u^2 + v^2)
+            # Patankar-type quasi-implicit limiter (tau_ref = 120s) prevents numerical
+            # sign reversal and runaway during explicit Adams-Bashforth time stepping
+            tau_ref = 120.0
+            drag_coeff = (bottom_drag + cd_drag * speed) /
+                         (1.0 + (bottom_drag + cd_drag * speed) * tau_ref)
+            drag_val = -drag_coeff * u
+            sponge_val = 0.0
+            if !isnothing(active_sponge) && hasproperty(active_sponge, :u)
+                sponge_val = active_sponge.u isa Function ?
+                    active_sponge.u(x, y, z, t, u) : 0.0
+            end
+            return tide_val + drag_val + sponge_val
+        end
+
+        total_Fv(x, y, z, t, u, v) = begin
+            tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.v(x, y, z, t)
+            speed = sqrt(u^2 + v^2)
+            tau_ref = 120.0
+            drag_coeff = (bottom_drag + cd_drag * speed) /
+                         (1.0 + (bottom_drag + cd_drag * speed) * tau_ref)
+            drag_val = -drag_coeff * v
+            sponge_val = 0.0
+            if !isnothing(active_sponge) && hasproperty(active_sponge, :v)
+                sponge_val = active_sponge.v isa Function ?
+                    active_sponge.v(x, y, z, t, v) : 0.0
+            end
+            return tide_val + drag_val + sponge_val
+        end
+
+        (
+            u = Forcing(total_Fu, field_dependencies = (:u, :v)),
+            v = Forcing(total_Fv, field_dependencies = (:u, :v))
+        )
+    end
 
     model_kwargs = Dict{Symbol, Any}(
         :coriolis => coriolis,

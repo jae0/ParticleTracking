@@ -6,7 +6,7 @@ Grid construction and immersed boundary setup for shelf hydrodynamic modeling.
 
 using Oceananigans
 using Oceananigans.Grids: Face, Center, znode
-using Oceananigans.Architectures: architecture, on_architecture
+using Oceananigans.Architectures: architecture, on_architecture, CPU, GPU
 using NCDatasets
 
 """
@@ -81,7 +81,7 @@ function build_shelf_grid(;
         z_range
     end
 
-    arch = resolve_architecture(:cpu; fallback_to_cpu = fallback_to_cpu)
+    arch = resolve_architecture(architecture; fallback_to_cpu = fallback_to_cpu)
      
     grid = LatitudeLongitudeGrid(
         arch;
@@ -1104,7 +1104,8 @@ function build_immersed_grid(
 
     # Check for topography exceeding surface
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    z_max = znode(base_g.Nz + 1, base_g, Face())
+    arch = architecture(grid)
+    z_max = arch isa GPU ? 0.0 : znode(base_g.Nz + 1, base_g, Face())
     max_topo = maximum(topo_matrix)
     if max_topo > z_max
         @warn "Maximum bathymetry elevation ($(max_topo) m) exceeds surface " *
@@ -1253,22 +1254,23 @@ Retrieves cell-center spatial nodes \$\\lambda_i = \\text{xnode}(i, \\text{grid}
 """
 function extract_grid_coordinates(grid)
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    nx, ny, nz = base_g.Nx, base_g.Ny, base_g.Nz
+    cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
+    nx, ny, nz = cpu_g.Nx, cpu_g.Ny, cpu_g.Nz
 
     lons = try
-        [Float64(Oceananigans.Grids.xnode(i, base_g, Oceananigans.Grids.Center())) for i in 1:nx]
+        [Float64(Oceananigans.Grids.xnode(i, cpu_g, Oceananigans.Grids.Center())) for i in 1:nx]
     catch
-        collect(Float64, range(base_g.λᶠᵃᵃ[1], base_g.λᶠᵃᵃ[base_g.Nx + 1], length = nx))
+        collect(Float64, range(cpu_g.λᶠᵃᵃ[1], cpu_g.λᶠᵃᵃ[cpu_g.Nx + 1], length = nx))
     end
 
     lats = try
-        [Float64(Oceananigans.Grids.ynode(j, base_g, Oceananigans.Grids.Center())) for j in 1:ny]
+        [Float64(Oceananigans.Grids.ynode(j, cpu_g, Oceananigans.Grids.Center())) for j in 1:ny]
     catch
-        collect(Float64, range(base_g.φᵃᶠᵃ[1], base_g.φᵃᶠᵃ[base_g.Ny + 1], length = ny))
+        collect(Float64, range(cpu_g.φᵃᶠᵃ[1], cpu_g.φᵃᶠᵃ[cpu_g.Ny + 1], length = ny))
     end
 
     depths = try
-        [Float64(Oceananigans.Grids.znode(k, base_g, Oceananigans.Grids.Center())) for k in 1:nz]
+        [Float64(Oceananigans.Grids.znode(k, cpu_g, Oceananigans.Grids.Center())) for k in 1:nz]
     catch
         collect(Float64, range(-1000.0, 0.0, length = nz))
     end

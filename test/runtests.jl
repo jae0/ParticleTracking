@@ -24,7 +24,6 @@ using Oceananigans.Grids: LatitudeLongitudeGrid
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid
 using Oceananigans.Architectures
 using DataFrames: DataFrame, nrow
-using DataAPI
 using DBInterface  # ← ADD THIS
 using NCDatasets
 using JLD2
@@ -113,6 +112,11 @@ using ParticleTracking
         mort_base = larval_thermal_mortality_rate(6.0)
         mort_stressed = larval_thermal_mortality_rate(14.0)
         @test mort_stressed > mort_base # Elevated mortality past 10°C
+
+        # Test composite CFL and stability metric calculation
+        cfl_init = compute_advective_cfl(model, 10.0)
+        @test cfl_init >= 0.0
+        @test !isnan(cfl_init)
     end
 
     @testset "5. Tidal Dynamics & Simpson-Hunter Parameter" begin
@@ -473,9 +477,16 @@ using ParticleTracking
         @test resolve_architecture(:gpu, fallback_to_cpu = true) isa Oceananigans.Architectures.AbstractArchitecture
         @test resolve_architecture("cuda", fallback_to_cpu = true) isa Oceananigans.Architectures.AbstractArchitecture
 
-        # Error without fallback on systems without functional CUDA
-        if !isdefined(Main, :CUDA) || !Main.CUDA.functional()
+        # Behavior without fallback depends on whether CUDA is functional on this system
+        cuda_avail = try
+            ParticleTracking.CUDA.functional()
+        catch
+            false
+        end
+        if !cuda_avail
             @test_throws ErrorException resolve_architecture(:gpu, fallback_to_cpu = false)
+        else
+            @test resolve_architecture(:gpu, fallback_to_cpu = false) isa Oceananigans.Architectures.GPU
         end
     end
 
@@ -1174,6 +1185,65 @@ using ParticleTracking
         @test size(conn_demo.matrix, 1) == length(conn_demo.strata_names)
         @test all(conn_demo.matrix .>= 0.0)
         @test all(conn_demo.matrix .<= 1.0)
+    end
+
+    @testset "Hydrodynamic Field & Dashboard Visualizations and Animations" begin
+        # 1. Configuration options verification
+        opts_default = HydrodynamicOptions()
+        @test opts_default.animate_hydro == false
+        @test opts_default.anim_variable == :dashboard
+        @test opts_default.anim_fps == 10
+        @test opts_default.anim_format == "mp4"
+        @test opts_default.anim_depth == -2.5
+
+        opts_custom = HydrodynamicOptions(
+            animate_hydro = true,
+            anim_variable = :speed,
+            anim_fps = 15,
+            anim_format = "gif",
+            anim_depth = -10.0,
+            anim_overlay_particles = true
+        )
+        @test opts_custom.animate_hydro == true
+        @test opts_custom.anim_variable == :speed
+        @test opts_custom.anim_fps == 15
+        @test opts_custom.anim_format == "gif"
+        @test opts_custom.anim_depth == -10.0
+        @test opts_custom.anim_overlay_particles == true
+
+        cfg_dict = options_to_configuration(opts_custom)
+        @test cfg_dict["visualization"]["animate_hydro"] == true
+        @test cfg_dict["visualization"]["anim_variable"] == "speed"
+        @test cfg_dict["visualization"]["anim_fps"] == 15
+
+        opts_restored = configuration_to_options(cfg_dict)
+        @test opts_restored.animate_hydro == true
+        @test opts_restored.anim_variable == :speed
+
+        # 2. Field animation generation (GIF test)
+        tmp_anim_gif = joinpath(tempdir(), "test_anim_speed.gif")
+        res_gif = animate_hydrodynamic_field(
+            nothing;
+            variable = :speed,
+            n_frames = 2,
+            framerate = 2,
+            output_path = tmp_anim_gif
+        )
+        @test isfile(res_gif)
+        @test filesize(res_gif) > 0
+        rm(res_gif, force = true)
+
+        # 3. Dashboard animation generation (GIF test)
+        tmp_dash_gif = joinpath(tempdir(), "test_anim_dashboard.gif")
+        res_dash = animate_hydrodynamic_dashboard(
+            nothing;
+            n_frames = 2,
+            framerate = 2,
+            output_path = tmp_dash_gif
+        )
+        @test isfile(res_dash)
+        @test filesize(res_dash) > 0
+        rm(res_dash, force = true)
     end
 
 end

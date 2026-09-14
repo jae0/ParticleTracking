@@ -55,13 +55,16 @@ function get_climate_scenario_deltas(
     span = horizon_year - baseline_year
     time_factor = span > 0.0 ? clamp((Float64(year) - Float64(baseline_year)) / span, 0.0, 5.0) : 1.0
 
-    if scenario == :historical || scenario == :baseline
+    if scenario == :historical || scenario == :baseline || scenario == :climatology
+        desc = scenario == :climatology ?
+            "Climatological baseline (repeating annual cycle)" :
+            "Historical / present-day climatological baseline"
         return (
             ΔT_surface = 0.0,
             ΔT_deep = 0.0,
             ΔS_surface = 0.0,
             Δwind_factor = 1.0,
-            description = "Historical / present-day climatological baseline"
+            description = desc
         )
     elseif scenario == :ssp126
         return (
@@ -106,7 +109,8 @@ function get_climate_scenario_deltas(
     else
         error(
             "Unknown climate scenario '$(scenario)'. " *
-            "Available: :historical, :ssp126, :ssp245, :ssp370, :ssp585, :marine_heatwave"
+            "Available: :historical, :baseline, :climatology, :ssp126, :ssp245, " *
+            ":ssp370, :ssp585, :marine_heatwave, :mhw"
         )
     end
 end

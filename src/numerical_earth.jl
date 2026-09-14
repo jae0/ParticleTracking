@@ -116,12 +116,134 @@ Q_{\\text{SH}} = \\rho_{\\text{air}} c_{p,\\text{air}} C_H U_{10} (T_{\\text{air
 end
 
 """
+    AnalyticalWindU
+
+Bitstype callable struct for 10-meter zonal wind component representing Scotian Shelf meteorology.
+"""
+struct AnalyticalWindU
+    climatology  :: Bool
+    year_seconds :: Float64
+    mean_u       :: Float64
+    seasonal_amp :: Float64
+    synoptic_amp :: Float64
+    synoptic_per :: Float64
+end
+
+@inline function (w::AnalyticalWindU)(x, y, t)
+    t_eff = w.climatology ? mod(Float64(t), w.year_seconds) : Float64(t)
+    doy_phase = 2π * t_eff / w.year_seconds
+    mean_val = w.mean_u + w.seasonal_amp * cos(doy_phase)
+    synoptic = w.synoptic_amp * sin(2π * t_eff / w.synoptic_per)
+    return mean_val + synoptic
+end
+
+"""
+    AnalyticalWindV
+
+Bitstype callable struct for 10-meter meridional wind component representing Scotian Shelf meteorology.
+"""
+struct AnalyticalWindV
+    climatology  :: Bool
+    year_seconds :: Float64
+    mean_v       :: Float64
+    seasonal_amp :: Float64
+    synoptic_amp :: Float64
+    synoptic_per :: Float64
+end
+
+@inline function (w::AnalyticalWindV)(x, y, t)
+    t_eff = w.climatology ? mod(Float64(t), w.year_seconds) : Float64(t)
+    doy_phase = 2π * t_eff / w.year_seconds
+    mean_val = w.mean_v - w.seasonal_amp * cos(doy_phase)
+    synoptic = w.synoptic_amp * cos(2π * t_eff / w.synoptic_per)
+    return mean_val + synoptic
+end
+
+"""
+    era5_surface_stress_x(x, y, t, p) -> Float64
+
+Top-level parameterized surface kinematic zonal momentum flux function for Oceananigans
+boundary conditions on both GPU and CPU architectures.
+
+# Arguments
+- `x, y, t`: Grid coordinates and simulation time in seconds.
+- `p::NamedTuple`: Wind parameters (climatology, year_seconds, mean winds,
+  seasonal and synoptic amplitudes and periods).
+"""
+@inline function era5_surface_stress_x(x, y, t, p)::Float64
+    t_eff = p.climatology ? mod(Float64(t), p.year_seconds) : Float64(t)
+    doy = 2π * t_eff / p.year_seconds
+    u = p.mean_u + p.seasonal_u * cos(doy) + p.synoptic_u * sin(2π * t_eff / p.synoptic_period)
+    v = p.mean_v - p.seasonal_v * cos(doy) + p.synoptic_v * cos(2π * t_eff / p.synoptic_period)
+    U10 = sqrt(u^2 + v^2)
+    cd = drag_coefficient(U10)
+    return (ρ_air * cd * U10 * u) / ρ_ocean
+end
+
+"""
+    era5_surface_stress_y(x, y, t, p) -> Float64
+
+Top-level parameterized surface kinematic meridional momentum flux function for Oceananigans
+boundary conditions on both GPU and CPU architectures.
+
+# Arguments
+- `x, y, t`: Grid coordinates and simulation time in seconds.
+- `p::NamedTuple`: Wind parameters (climatology, year_seconds, mean winds,
+  seasonal and synoptic amplitudes and periods).
+"""
+@inline function era5_surface_stress_y(x, y, t, p)::Float64
+    t_eff = p.climatology ? mod(Float64(t), p.year_seconds) : Float64(t)
+    doy = 2π * t_eff / p.year_seconds
+    u = p.mean_u + p.seasonal_u * cos(doy) + p.synoptic_u * sin(2π * t_eff / p.synoptic_period)
+    v = p.mean_v - p.seasonal_v * cos(doy) + p.synoptic_v * cos(2π * t_eff / p.synoptic_period)
+    U10 = sqrt(u^2 + v^2)
+    cd = drag_coefficient(U10)
+    return (ρ_air * cd * U10 * v) / ρ_ocean
+end
+
+"""
+    SurfaceStressX{Fu, Fv}
+
+Bitstype surface kinematic zonal momentum flux calculator for GPU/CPU boundary conditions.
+"""
+struct SurfaceStressX{Fu, Fv}
+    u10 :: Fu
+    v10 :: Fv
+end
+
+@inline function (s::SurfaceStressX)(x, y, t)
+    u = Float64(s.u10(x, y, t))
+    v = Float64(s.v10(x, y, t))
+    U10 = sqrt(u^2 + v^2)
+    cd = drag_coefficient(U10)
+    return (ρ_air * cd * U10 * u) / ρ_ocean
+end
+
+"""
+    SurfaceStressY{Fu, Fv}
+
+Bitstype surface kinematic meridional momentum flux calculator for GPU/CPU boundary conditions.
+"""
+struct SurfaceStressY{Fu, Fv}
+    u10 :: Fu
+    v10 :: Fv
+end
+
+@inline function (s::SurfaceStressY)(x, y, t)
+    u = Float64(s.u10(x, y, t))
+    v = Float64(s.v10(x, y, t))
+    U10 = sqrt(u^2 + v^2)
+    cd = drag_coefficient(U10)
+    return (ρ_air * cd * U10 * v) / ρ_ocean
+end
+
+"""
     AtmosphericForcingCraft
 
 Structured atmospheric forcing provider containing field closures, wind stress
 functions, and bulk thermodynamic air-sea exchange calculators.
 """
-struct AtmosphericForcingCraft{Fu, Fv, Ft, Fsw, Flw}
+struct AtmosphericForcingCraft{Fu, Fv, Ft, Fsw, Flw, Fsx, Fsy, Fhf}
     source       :: Symbol
     climatology  :: Bool
     scenario     :: Symbol
@@ -130,9 +252,9 @@ struct AtmosphericForcingCraft{Fu, Fv, Ft, Fsw, Flw}
     t2m          :: Ft
     ssrd         :: Fsw
     strd         :: Flw
-    stress_x     :: Function
-    stress_y     :: Function
-    heat_flux    :: Function
+    stress_x     :: Fsx
+    stress_y     :: Fsy
+    heat_flux    :: Fhf
 end
 
 """
@@ -213,14 +335,10 @@ function AtmosphericForcing(;
     ]
     active_nc = findfirst(isfile, netcdf_candidates)
 
-    u10_fn = u10_base
-    v10_fn = v10_base
-    t2m_fn = t2m_base
-    ssrd_fn = ssrd_base
-    strd_fn = strd_base
-
-    if !isnothing(active_nc)
+    u10_craft, v10_craft = if !isnothing(active_nc)
         nc_file = netcdf_candidates[active_nc]
+        nc_u = 4.5
+        nc_v = 1.0
         try
             NCDatasets.Dataset(nc_file, "r") do ds
                 has_u = haskey(ds, "u10") || haskey(ds, "wind_u") || haskey(ds, "u")
@@ -230,27 +348,45 @@ function AtmosphericForcing(;
                     v_var = haskey(ds, "v10") ? "v10" : (haskey(ds, "wind_v") ? "wind_v" : "v")
                     raw_u = Array{Float64}(ds[u_var][:, :])
                     raw_v = Array{Float64}(ds[v_var][:, :])
-                    mean_u = mean(filter(!isnan, raw_u))
-                    mean_v = mean(filter(!isnan, raw_v))
-                    u10_fn = (x, y, t) -> mean_u + 1.2 * sin(2π * Float64(t) / (7.0 * 86400.0))
-                    v10_fn = (x, y, t) -> mean_v + 1.2 * cos(2π * Float64(t) / (5.0 * 86400.0))
+                    nc_u = mean(filter(!isnan, raw_u))
+                    nc_v = mean(filter(!isnan, raw_v))
                 end
             end
         catch e
-            # Preserve robust analytical fallbacks if NetCDF parsing encounters any issues
         end
+        (
+            AnalyticalWindU(climatology, year_seconds, nc_u, 1.2, 1.2, 7.0 * 86400.0),
+            AnalyticalWindV(climatology, year_seconds, nc_v, 1.2, 1.2, 5.0 * 86400.0)
+        )
+    else
+        (
+            AnalyticalWindU(climatology, year_seconds, 4.5, 2.5, 2.0, 5.0 * 86400.0),
+            AnalyticalWindV(climatology, year_seconds, 1.0, 2.0, 2.0, 4.0 * 86400.0)
+        )
     end
 
-    stress_x_fn(x, y, t) = surface_stress_x(x, y, t, u10_fn, v10_fn)
-    stress_y_fn(x, y, t) = surface_stress_y(x, y, t, u10_fn, v10_fn)
-    heat_flux_fn(x, y, t, T_surf) = surface_heat_flux(
-        x, y, t, T_surf, t2m_fn, ssrd_fn, strd_fn, u10_fn, v10_fn
+    wind_params = (
+        climatology = climatology,
+        year_seconds = Float64(year_seconds),
+        mean_u = Float64(u10_craft.mean_u),
+        mean_v = Float64(v10_craft.mean_v),
+        seasonal_u = Float64(u10_craft.seasonal_amp),
+        seasonal_v = Float64(v10_craft.seasonal_amp),
+        synoptic_u = Float64(u10_craft.synoptic_amp),
+        synoptic_v = Float64(v10_craft.synoptic_amp),
+        synoptic_period = Float64(u10_craft.synoptic_per)
+    )
+
+    stress_x_bc = FluxBoundaryCondition(era5_surface_stress_x, parameters = wind_params)
+    stress_y_bc = FluxBoundaryCondition(era5_surface_stress_y, parameters = wind_params)
+    heat_flux_fn = (x, y, t, T_surf) -> surface_heat_flux(
+        x, y, t, T_surf, t2m_base, ssrd_base, strd_base, u10_craft, v10_craft
     )
 
     return AtmosphericForcingCraft(
         source, climatology, scenario,
-        u10_fn, v10_fn, t2m_fn, ssrd_fn, strd_fn,
-        stress_x_fn, stress_y_fn, heat_flux_fn
+        u10_craft, v10_craft, t2m_base, ssrd_base, strd_base,
+        stress_x_bc, stress_y_bc, heat_flux_fn
     )
 end
 
@@ -272,11 +408,12 @@ function stretched_tanh_z_faces(
     nz::Int = 20,
     Lz::Real = 5000.0;
     csv_path::AbstractString = joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
-    scaling::Real = 2.5,
+    scaling::Real = 2.0,
     linear_weight::Real = 0.8,
     tanh_weight::Real = 0.2
 )::Vector{Float64}
-    if isfile(csv_path)
+    target_depth = abs(Float64(Lz))
+    if !isempty(csv_path) && isfile(csv_path)
         try
             lines = readlines(csv_path)
             if length(lines) >= nz + 1
@@ -293,24 +430,31 @@ function stretched_tanh_z_faces(
                     end
                 end
                 if length(faces) == nz + 1 && issorted(faces)
+                    csv_depth = abs(faces[1])
+                    if abs(csv_depth - target_depth) > 1e-3 && csv_depth > 0.0
+                        faces = faces .* (target_depth / csv_depth)
+                    end
+                    faces[1] = -target_depth
+                    faces[end] = 0.0
                     return faces
                 end
             end
         catch err
-            @warn "Failed reading $(csv_path): $(err). Computing analytical tanh stretching."
+            @warn "Failed reading $(csv_path): $(err). Computing analytical surface-stretched grid."
         end
     end
 
-    # Analytical tanh stretching formulation
+    # Analytical exponential/tanh surface-refinement: thin layers near z=0
     faces = Vector{Float64}(undef, nz + 1)
-    norm_factor = tanh(Float64(scaling))
+    s = max(0.01, Float64(scaling))
+    denom = exp(s) - 1.0
     for k in 0:nz
-        sigma = (Float64(k) - Float64(nz)) / Float64(nz) # in [-1, 0]
-        tanh_term = norm_factor == 0.0 ? sigma : tanh(Float64(scaling) * sigma) / norm_factor
-        val = Float64(Lz) * (Float64(linear_weight) * sigma + Float64(tanh_weight) * tanh_term)
-        faces[k + 1] = val
+        xi = Float64(k) / Float64(nz)
+        y = 1.0 - xi
+        y_str = (exp(s * y) - 1.0) / denom
+        faces[k + 1] = -target_depth * y_str
     end
-    faces[1] = -abs(Float64(Lz))
+    faces[1] = -target_depth
     faces[end] = 0.0
 
     return faces
@@ -438,6 +582,157 @@ function regrid_bathymetry(
 
     return bathy
 end
+
+"""
+    load_regional_bathymetry(;
+        filepath::Union{Nothing, AbstractString} = nothing,
+        source::Symbol = :gebco,
+        lon_range::Tuple{Real, Real} = (-68.0, -57.0),
+        lat_range::Tuple{Real, Real} = (42.0, 47.5),
+        input_dir::AbstractString = "inputs"
+    ) -> NamedTuple
+
+Ingest and standardize regional seabed bathymetry via NumericalEarth from high-resolution
+GEBCO, ETOPO, or active NetCDF caches (`bathymetry_active.nc`, `real_bathymetry.nc`).
+
+# Mathematical Representation
+Extracts discrete seabed elevation \$z(\\lambda, \\phi)\$ on spherical coordinates:
+```math
+\\lambda \\in [\\lambda_{\\min}, \\lambda_{\\max}], \\quad
+\\phi \\in [\\phi_{\\min}, \\phi_{\\max}], \\quad
+z \\le 0\\text{ (meters below sea surface)}
+```
+
+# Inputs
+- `filepath::Union{Nothing, AbstractString}`: Path to bathymetry NetCDF.
+- `source::Symbol`: Bathymetry provider (`:gebco`, `:etopo`, `:synthetic`).
+- `lon_range, lat_range`: Geographic bounding box coordinates.
+- `input_dir::AbstractString`: Search directory for bathymetry NetCDF datasets.
+
+# Outputs
+- `NamedTuple`: `(elevation = Matrix{Float64}, lon = Vector{Float64}, lat = Vector{Float64})`
+"""
+function load_regional_bathymetry(;
+    filepath::Union{Nothing, AbstractString} = nothing,
+    source::Symbol = :gebco,
+    lon_range::Tuple{Real, Real} = (-68.0, -57.0),
+    lat_range::Tuple{Real, Real} = (42.0, 47.5),
+    input_dir::AbstractString = "inputs"
+)::NamedTuple{(:elevation, :lon, :lat), Tuple{Matrix{Float64}, Vector{Float64}, Vector{Float64}}}
+    candidates = isnothing(filepath) ? [
+        joinpath(input_dir, "bathymetry_active.nc"),
+        joinpath(input_dir, "real_bathymetry.nc"),
+        joinpath(input_dir, "nova_scotia_bathymetry.nc")
+    ] : [filepath]
+
+    active_file = findfirst(isfile, candidates)
+    if !isnothing(active_file)
+        target_file = candidates[active_file]
+        return NCDatasets.Dataset(target_file, "r") do ds
+            ev_name = haskey(ds, "elevation") ? "elevation" :
+                      (haskey(ds, "z") ? "z" :
+                       (haskey(ds, "altitude") ? "altitude" : "topo"))
+            lo_name = haskey(ds, "lon") ? "lon" :
+                      (haskey(ds, "longitude") ? "longitude" : "x")
+            la_name = haskey(ds, "lat") ? "lat" :
+                      (haskey(ds, "latitude") ? "latitude" : "y")
+
+            raw_e = Array{Float64}(ds[ev_name][:, :])
+            lo = collect(Float64, ds[lo_name][:])
+            la = collect(Float64, ds[la_name][:])
+
+            # Transpose if first dimension is latitude
+            dim_names = NCDatasets.dimnames(ds[ev_name])
+            lat_like = ["lat", "latitude", "y", "nav_lat"]
+            needs_t = (length(dim_names) >= 1 &&
+                       lowercase(string(dim_names[1])) in lat_like)
+            elevation = needs_t ? permutedims(raw_e, (2, 1)) : raw_e
+
+            return (elevation = elevation, lon = lo, lat = la)
+        end
+    end
+
+    # Fallback to analytical Scotian Shelf bathymetric profile
+    nx, ny = 345, 245
+    lons = range(lon_range[1], lon_range[2], length = nx) |> collect
+    lats = range(lat_range[1], lat_range[2], length = ny) |> collect
+    elev = Matrix{Float64}(undef, nx, ny)
+
+    for j in 1:ny
+        y_norm = clamp((lats[j] - lat_range[1]) /
+                       max(1e-3, lat_range[2] - lat_range[1]), 0.0, 1.0)
+        for i in 1:nx
+            x_norm = clamp((lons[i] - lon_range[1]) /
+                           max(1e-3, lon_range[2] - lon_range[1]), 0.0, 1.0)
+            shelf_depth = -20.0 - 450.0 * (1.0 - y_norm)^1.5
+            if y_norm < 0.35
+                shelf_depth -= 3500.0 * ((0.35 - y_norm) / 0.35)^1.8
+            end
+            if x_norm > 0.65 && y_norm > 0.45
+                channel_fac = sin(π * clamp((x_norm - 0.65) / 0.35, 0.0, 1.0))
+                shelf_depth -= 350.0 * channel_fac
+            end
+            elev[i, j] = clamp(shelf_depth, -5000.0, -5.0)
+        end
+    end
+    return (elevation = elev, lon = lons, lat = lats)
+end
+
+"""
+    get_bathymetry_interpolator(
+        bathymetry = :numerical_earth;
+        lon_range::Tuple{Real, Real} = (-68.0, -57.0),
+        lat_range::Tuple{Real, Real} = (42.0, 47.5),
+        input_dir::AbstractString = "inputs"
+    ) -> Function
+
+Construct a continuous 2D spatial bilinear interpolation function `(lon, lat) -> z_bed`
+mediated by NumericalEarth seabed bathymetry.
+"""
+function get_bathymetry_interpolator(
+    bathymetry = :numerical_earth;
+    lon_range::Tuple{Real, Real} = (-68.0, -57.0),
+    lat_range::Tuple{Real, Real} = (42.0, 47.5),
+    input_dir::AbstractString = "inputs"
+)
+    if bathymetry isa Function
+        return bathymetry
+    end
+
+    bathy_data = if bathymetry isa NamedTuple && haskey(bathymetry, :elevation)
+        bathymetry
+    elseif bathymetry isa AbstractString && isfile(bathymetry)
+        load_regional_bathymetry(filepath = bathymetry)
+    else
+        load_regional_bathymetry(
+            lon_range = lon_range,
+            lat_range = lat_range,
+            input_dir = input_dir
+        )
+    end
+
+    lons = bathy_data.lon
+    lats = bathy_data.lat
+    elev = bathy_data.elevation
+    n_lon = length(lons)
+    n_lat = length(lats)
+
+    return (x, y) -> begin
+        i = clamp(searchsortedlast(lons, Float64(x)), 1, n_lon - 1)
+        j = clamp(searchsortedlast(lats, Float64(y)), 1, n_lat - 1)
+        Δx = lons[i + 1] - lons[i]
+        Δy = lats[j + 1] - lats[j]
+        s = Δx == 0.0 ? 0.0 : clamp((Float64(x) - lons[i]) / Δx, 0.0, 1.0)
+        t = Δy == 0.0 ? 0.0 : clamp((Float64(y) - lats[j]) / Δy, 0.0, 1.0)
+        e00 = elev[i, j]
+        e10 = elev[i + 1, j]
+        e01 = elev[i, j + 1]
+        e11 = elev[i + 1, j + 1]
+        return (1.0 - s) * (1.0 - t) * e00 + s * (1.0 - t) * e10 +
+               (1.0 - s) * t * e01 + s * t * e11
+    end
+end
+
 
 """
     FlatherBoundaryCondition
@@ -747,4 +1042,22 @@ end
 
 end # module DataWrangling
 
+import .DataWrangling: regrid_bathymetry,
+                      load_regional_bathymetry,
+                      get_bathymetry_interpolator,
+                      OpenBoundaryConditions,
+                      AtmosphericForcing,
+                      interpolate_ocean_state,
+                      build_sponge_layer_forcing
+
+export DataWrangling,
+       regrid_bathymetry,
+       load_regional_bathymetry,
+       get_bathymetry_interpolator,
+       OpenBoundaryConditions,
+       AtmosphericForcing,
+       interpolate_ocean_state,
+       build_sponge_layer_forcing
+
 end # module NumericalEarth
+

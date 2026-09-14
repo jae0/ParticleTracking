@@ -62,6 +62,7 @@ include("climate_scenarios.jl")
 include("simulation.jl")
 include("larval_behavior.jl")
 include("empirical_analysis.jl")
+include("voronoi_tessellation.jl")
 include("storage_duckdb.jl")
 include("visualization.jl")
 
@@ -83,8 +84,11 @@ export
     options_to_configuration,
     get_default_configuration,
     get_snowcrab_configuration,
+    get_snowcrab_tesselated_configuration,
     SnowCrabRunOptions,
+    SnowCrabTesselatedRunOptions,
     find_default_config_path,
+    resolve_config_name,
 
     # Architecture and device resolution
     resolve_architecture,
@@ -146,6 +150,10 @@ export
     setup_hydrodynamic_simulation,
     run_hydrodynamic_simulation!,
     create_flow_interpolator_from_jld2,
+    find_latest_checkpoint,
+    inspect_hydrodynamic_checkpoint,
+    inspect_hydrodynamic_file,
+    verify_checkpoint_compatibility,
 
     # Larval behavior and particle tracking
     larval_ascent_velocity,
@@ -173,6 +181,15 @@ export
     compute_empirical_connectivity,
     export_larval_dispersal_netcdf,
     export_larval_dispersal_jld2,
+
+    # Depth-stratified Voronoi tessellation & multi-resolution areal units
+    VoronoiUnit,
+    VoronoiTessellation,
+    generate_depth_stratified_voronoi_units,
+    find_voronoi_cell,
+    find_voronoi_cells,
+    compute_tesselated_connectivity_matrix,
+    export_voronoi_geojson,
 
     # DuckDB analytical storage, scenario management & model averaging
     open_duckdb_storage,
@@ -210,6 +227,8 @@ export
     plot_hydrodynamic_section,
     plot_hydrodynamic_timeseries,
     plot_hydrodynamic_field,
+    animate_hydrodynamic_field,
+    animate_hydrodynamic_dashboard,
     export_interactive_tracks_html,
     plot_interactive_trajectories_map
 

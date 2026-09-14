@@ -97,7 +97,15 @@ Decoupled Hydrodynamics & Multi-Cohort Tracking:
                           Default: outputs/hydrodynamics_<scenario>_<year>.jld2.
   --hydro-only            Run hydrodynamics only (Segments 1-5) and save to --hydro-model.
   --track-only            Run larval tracking only (Segments 6-8) using --hydro-model.
-  --reuse-hydro           Reuse existing --hydro-model checkpoint if present; else simulate.
+  --reuse-hydro           Reuse existing --hydro-model flow file if completed; else simulate.
+  --restart               Gracefully resume hydrodynamic simulation from latest checkpoint (default: true).
+  --no-restart, --force-new
+                          Do not resume from checkpoint; overwrite and start fresh from t=0.
+  --checkpoint            Enable prognostic state checkpoints (default: true).
+  --no-checkpoint         Disable prognostic state checkpoints.
+  --checkpoint-interval=<val>
+                          State checkpoint interval in seconds, hours (e.g. 6h), or days (e.g. 1d).
+  --checkpoints-dir=<dir> Custom directory for storing restart checkpoints.
   --run-id=<string>       Unique cohort run identifier for DuckDB persistence and figures.
 
 Individual Segment Flags:
@@ -132,6 +140,9 @@ Ecosystem & Species Configurations:
                           Additional CLI arguments override these defaults.
   --snowcrab              Alias for --snowcrab-settings.
   --snowcrab-mode         Alias for --snowcrab-settings.
+  --tesselated            Snow crab configuration with depth-stratified Voronoi tessellation:
+                          N=5000 units, 80% core (50-350m, 1.5km min res), 10% shallow (0-50m,
+                          5km min res), 10% deep (>350m, 10km min res) and DuckDB archiving.
   --real-5yr              Execute 5-Year physical hydrodynamic cycle scenario.
   --climatology-2yr       Execute 2-Year climatological average cycle scenario.
   --climatology-1.5yr     Execute 1.5-Year (18-Month) climatological cycle scenario.
@@ -143,9 +154,19 @@ Computational Architecture:
   --cpu                   Execute on multi-threaded CPU (default).
   --fallback-cpu          Automatically fall back to CPU if CUDA GPU is not functional.
 
-Visualization Options:
+Visualization & Hydrodynamic Animation Options:
   --interactive           Export standalone interactive HTML5 Leaflet map (default).
   --no-interactive        Disable interactive HTML map generation.
+  --animate-hydro, --anim-hydro
+                          Render animated MP4/GIF video of hydrodynamic fields.
+  --no-animate-hydro      Disable hydrodynamic animation generation (default).
+  --anim-variable=<name>  Field variable to animate: dashboard, speed, vorticity,
+                          temperature, salinity, elevation, w (default: dashboard).
+  --anim-fps=<int>        Animation playback framerate in frames/sec (default: 10).
+  --anim-format=<mp4|gif> Video container format: mp4, gif (default: mp4).
+  --anim-depth=<meters>   Depth slice in meters for 2D horizontal fields (default: -2.5).
+  --anim-overlay-particles
+                          Synchronously overlay Lagrangian larvae drifting with currents.
 
 Spatial Domain & Grid Discretization:
   --lon=<min,max>         Longitude bounding range in degrees East (default: -68.0,-57.0).
@@ -155,6 +176,10 @@ Spatial Domain & Grid Discretization:
   --nx=<int>              Zonal grid cells (default: 50).
   --ny=<int>              Meridional grid cells (default: 50).
   --nz=<int>              Vertical grid layers (default: 10).
+  --res-scale=<val>       Resolution scaling factor (e.g. 2.5 for ~2.5km calibrated grid).
+  --stretched-z           Enable hyperbolic tangent vertical layer stretching (default).
+  --uniform-z             Use uniform vertical layer thicknesses.
+  --z-file=<path>         Path to vertical layer coordinate CSV file.
 
 Environmental Data & Forcing:
   --real                  Fetch real-world NOAA ERDDAP bathymetry and winds.
@@ -163,6 +188,10 @@ Environmental Data & Forcing:
   --no-tides              Disable tidal body forcing.
   --tidal-u=<val>         Semi-major tidal current amplitude in m/s (default: 0.25).
   --tidal-v=<val>         Semi-minor tidal current amplitude in m/s (default: 0.12).
+  --era5-forcing          Enable NumericalEarth ERA5 atmospheric surface forcing.
+  --no-era5               Use analytical wind stress forcing.
+  --obc                   Enable NumericalEarth GLORYS12V1 open boundary conditions.
+  --no-obc                Disable open boundary conditions.
 
 Climate Scenarios & Thermal Biology:
   --scenario=<name>       Climate scenario: historical, ssp126, ssp245, ssp585, mhw.
@@ -240,6 +269,7 @@ using
     TOML,
     JLD2,
     TaylorSeries,
+    CUDA,
     Oceananigans,
     Oceananigans.Units,
     Oceananigans.Utils,
@@ -382,10 +412,6 @@ function run_segment_grid(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     bathy_file::Union{Nothing, String} = nothing
 )
-    println("\n=================================================================")
-    println(" [Segment 2/8] Spherical Grid & Immersed Boundary Construction")
-    println("=================================================================")
-
     target_bathy = isnothing(bathy_file) ?
                    joinpath(opts.input_dir, "bathymetry_active.nc") : bathy_file
 
@@ -395,13 +421,31 @@ function run_segment_grid(;
         target_bathy = data_res.bathy_file
     end
 
+    println("\n=================================================================")
+    println(" [Segment 2/8] Spherical Grid & Immersed Boundary Construction")
+    println("=================================================================")
+
     arch_label = opts.use_gpu ? "GPU (CUDA)" : "CPU"
     println("Building base spherical grid on $(arch_label): $(opts.grid_size) cells...")
+
+    z_faces = if opts.vertical_stretching_mode in (:tanh, :csv, :stretched)
+        Lz = abs(opts.domain_z[1] - opts.domain_z[2])
+        println("Applying stretched vertical coordinates ($(opts.vertical_stretching_mode), Lz=$(Lz)m)...")
+        NumericalEarth.DataWrangling.stretched_tanh_z_faces(
+            opts.grid_size[3],
+            Lz;
+            csv_path = opts.vertical_grid_file
+        )
+    else
+        nothing
+    end
+
     base_grid = build_shelf_grid(
         architecture = opts.use_gpu ? :gpu : :cpu,
         lon_range = opts.domain_lon,
         lat_range = opts.domain_lat,
         z_range = opts.domain_z,
+        z_faces = z_faces,
         grid_size = opts.grid_size,
         fallback_to_cpu = opts.fallback_to_cpu
     )
@@ -413,6 +457,9 @@ function run_segment_grid(;
     println("  Longitude: $(opts.domain_lon[1])°E to $(opts.domain_lon[2])°E (Nx=$(opts.grid_size[1]))")
     println("  Latitude:  $(opts.domain_lat[1])°N to $(opts.domain_lat[2])°N (Ny=$(opts.grid_size[2]))")
     println("  Depth:     $(opts.domain_z[1]) m to $(opts.domain_z[2]) m (Nz=$(opts.grid_size[3]))")
+    if !isnothing(z_faces)
+        println("  Vertical:  Stretched tanh/CSV (surface dz=$(round(z_faces[end]-z_faces[end-1], digits=1))m, bed dz=$(round(z_faces[2]-z_faces[1], digits=1))m)")
+    end
 
     return (base_grid = base_grid, immersed_grid = immersed_grid)
 end
@@ -446,16 +493,16 @@ function run_segment_model(;
     tau_x::Real = 1e-4,
     tau_y::Real = 0.0
 )
-    println("\n=================================================================")
-    println(" [Segment 3/8] Hydrodynamic Model & Tidal Forcing Setup")
-    println("=================================================================")
-
     target_grid = if isnothing(immersed_grid)
         grid_res = run_segment_grid(opts = opts)
         grid_res.immersed_grid
     else
         immersed_grid
     end
+
+    println("\n=================================================================")
+    println(" [Segment 3/8] Hydrodynamic Model & Tidal Forcing Setup")
+    println("=================================================================")
 
     tidal_forcing = if opts.enable_tides
         println("Configuring astronomical tidal body forcing (M2 + S2 spring-neap envelope)...")
@@ -471,27 +518,75 @@ function run_segment_model(;
     end
 
     coriolis_lat = 0.5 * (opts.domain_lat[1] + opts.domain_lat[2])
+
+    # Configure NumericalEarth open boundary conditions if requested
+    obc_craft = if opts.ocean_boundary_source in (:glorys12v1, :glorys_climatology)
+        is_clim = opts.scenario == :climatology ||
+                  opts.ocean_boundary_source == :glorys_climatology
+        println("Attaching NumericalEarth GLORYS open boundary conditions " *
+                "(Flather/Chapman, climatology=$(is_clim), scenario=$(opts.scenario))...")
+        NumericalEarth.DataWrangling.OpenBoundaryConditions(
+            target_grid,
+            parent_ocean = opts.ocean_boundary_source,
+            climatology = is_clim,
+            scenario = opts.scenario
+        )
+    else
+        nothing
+    end
+
+    # Configure NumericalEarth atmospheric forcing if requested
+    atmo_craft = if opts.atmospheric_source in (:era5, :era5_climatology, :mhw)
+        is_clim = opts.scenario == :climatology ||
+                  opts.atmospheric_source == :era5_climatology
+        println("Attaching NumericalEarth atmospheric surface fluxes " *
+                "($(opts.atmospheric_source), climatology=$(is_clim), scenario=$(opts.scenario))...")
+        NumericalEarth.DataWrangling.AtmosphericForcing(
+            source = opts.atmospheric_source,
+            climatology = is_clim,
+            scenario = opts.scenario
+        )
+    else
+        nothing
+    end
+
+    wind_x = isnothing(atmo_craft) ? tau_x : atmo_craft.stress_x
+    wind_y = isnothing(atmo_craft) ? tau_y : atmo_craft.stress_y
+
     println("Building HydrostaticFreeSurfaceModel (Coriolis at $(coriolis_lat)°N, summer surface heat flux)...")
     model = build_hydrodynamic_model(
         target_grid,
         coriolis_latitude = coriolis_lat,
-        surface_wind_stress_x = tau_x,
-        surface_wind_stress_y = tau_y,
+        surface_wind_stress_x = wind_x,
+        surface_wind_stress_y = wind_y,
         surface_heat_flux = opts.surface_heat_flux,
         tidal_forcing = tidal_forcing,
+        open_boundary_conditions = obc_craft,
         ν = 1e-2,
         κ = 1e-2,
         tracers = (:T, :S)
     )
 
     # Initialize thermal and haline stratification
-    println("Applying baseline thermal stratification (T_surf=15°C, dT/dz=0.01°C/m)...")
-    set_initial_stratification!(
-        model,
-        surface_temperature = 15.0,
-        temperature_gradient = 0.01,
-        salinity = 35.0
-    )
+    if opts.ocean_boundary_source in (:glorys12v1, :glorys_climatology)
+        println("Applying NumericalEarth GLORYS 3D hydrographic state initial fields " *
+                "(scenario=$(opts.scenario))...")
+        ocean_state = NumericalEarth.DataWrangling.interpolate_ocean_state(
+            target_grid,
+            source = opts.ocean_boundary_source,
+            scenario = opts.scenario
+        )
+        set!(model, T = ocean_state.temperature, S = ocean_state.salinity,
+             u = ocean_state.u, v = ocean_state.v)
+    else
+        println("Applying baseline thermal stratification (T_surf=15°C, dT/dz=0.01°C/m)...")
+        set_initial_stratification!(
+            model,
+            surface_temperature = 15.0,
+            temperature_gradient = 0.01,
+            salinity = 35.0
+        )
+    end
 
     # Calculate Simpson-Hunter tidal mixing front parameters
     chi_bank  = simpson_hunter_parameter(40.0, 1.1)  # Shallow bank (mixed)
@@ -540,7 +635,8 @@ function run_segment_climate(;
     println("  Surface Salinity Anomaly:    $(round(deltas.ΔS_surface, digits=2)) PSU")
     println("  Atmospheric Wind Factor:     x$(round(deltas.Δwind_factor, digits=2))")
 
-    if !isnothing(model)
+    if !isnothing(model) && opts.scenario ∉ (:baseline, :historical, :climatology) &&
+       opts.ocean_boundary_source ∉ (:glorys12v1, :glorys_climatology)
         println("Applying climate anomalies to model stratification...")
         apply_climate_scenario!(model, scenario = opts.scenario, year = opts.projection_year)
     end
@@ -589,34 +685,67 @@ function run_segment_simulation(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     model = nothing
 )
-    println("\n=================================================================")
-    println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
-    println("=================================================================")
-    mkpath(opts.output_dir)
+    default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
+    jld2_path, jld2_filename = resolve_hydro_model_path(opts, default_jld2)
+
+    # Inspect existing target hydrodynamic file
+    file_info = inspect_hydrodynamic_file(jld2_path, expected_stop_time = opts.sim_duration)
+
+    # If track-only: require existing valid file with snapshots
+    if opts.track_only
+        println("\n=================================================================")
+        println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
+        println("=================================================================")
+        if file_info.exists && file_info.n_timesteps > 0
+            println("Using existing hydrodynamic flow solution from: $(jld2_path)")
+            return (simulation = nothing, jld2_output_path = jld2_path)
+        else
+            error("Cannot run in --track-only mode: hydrodynamic model file does not exist or has no time snapshots: $(jld2_path)\n" *
+                  "Please run with --hydro-only first or specify an existing file with --hydro-model=<path>.")
+        end
+    end
+
+    # If reuse-hydro requested and file is complete: reuse it
+    if opts.reuse_hydro && file_info.is_complete
+        println("\n=================================================================")
+        println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
+        println("=================================================================")
+        println("Reusing completed hydrodynamic flow solution from: $(jld2_path)")
+        println("  (simulated $(round(file_info.last_time / 3600.0, digits=2)) / $(round(opts.sim_duration / 3600.0, digits=2)) hours, $(file_info.n_timesteps) snapshots)")
+        return (simulation = nothing, jld2_output_path = jld2_path)
+    end
 
     target_model = if isnothing(model)
         model_res = run_segment_model(opts = opts)
+        run_segment_climate(opts = opts, model = model_res.model)
         model_res.model
     else
         model
     end
 
-    default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
-    jld2_path, jld2_filename = resolve_hydro_model_path(opts, default_jld2)
+    println("\n=================================================================")
+    println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
+    println("=================================================================")
+    mkpath(opts.output_dir)
 
-    # If track-only or reuse-hydro with an existing checkpoint, skip hydrodynamics integration
-    if opts.track_only || (opts.reuse_hydro && isfile(jld2_path))
-        if isfile(jld2_path)
-            println("Reusing existing hydrodynamic flow solution from: $(jld2_path)")
-            return (simulation = nothing, jld2_output_path = jld2_path)
+    # If file exists but is incomplete
+    if file_info.exists && !file_info.is_complete
+        if opts.auto_restart
+            println("Found interrupted hydrodynamic simulation at: $(jld2_path)")
+            println("  (progress: $(round(file_info.last_time / 3600.0, digits=2)) of $(round(opts.sim_duration / 3600.0, digits=2)) hours)")
+            println("Resuming simulation gracefully from latest checkpoint...")
         else
-            error("Cannot run in --track-only mode: hydrodynamic model file does not exist: $(jld2_path)\n" *
-                  "Please run with --hydro-only first or specify an existing file with --hydro-model=<path>.")
+            println("Found incomplete simulation at $(jld2_path), but auto-restart is disabled.")
+            println("Starting fresh simulation from t = 0...")
         end
     end
 
     out_dir_target = dirname(jld2_path)
     mkpath(out_dir_target)
+
+    # Checkpoint storage directory
+    cp_dir_target = isempty(opts.checkpoint_dir) ?
+        joinpath(out_dir_target, "checkpoints") : opts.checkpoint_dir
 
     println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt=$(opts.sim_dt)s)...")
     sim = setup_hydrodynamic_simulation(
@@ -628,12 +757,28 @@ function run_segment_simulation(;
         output_dir = out_dir_target,
         output_filename = jld2_filename,
         output_schedule = 50,
-        progress_schedule = 20
+        progress_schedule = 20,
+        enable_checkpoint = opts.enable_checkpoint,
+        checkpoint_dir = cp_dir_target,
+        checkpoint_prefix = opts.checkpoint_prefix,
+        checkpoint_schedule = opts.checkpoint_schedule > 0 ? opts.checkpoint_schedule : nothing,
+        cleanup_checkpoints = opts.checkpoint_cleanup,
+        pickup = opts.auto_restart ? :auto : false
     )
 
     println("Integrating hydrostatic primitive equations...")
-    run_hydrodynamic_simulation!(sim, verbose = true)
-    println("Simulation fields successfully saved to: $(jld2_path)")
+    run_hydrodynamic_simulation!(
+        sim,
+        pickup = opts.auto_restart ? :auto : false,
+        verbose = true
+    )
+
+    completed_sim = sim.model.clock.time >= (sim.stop_time - 1e-3)
+    if completed_sim
+        println("Simulation completed successfully; fields saved to: $(jld2_path)")
+    else
+        println("Simulation paused/interrupted at $(prettytime(sim.model.clock.time)); state saved to checkpoints.")
+    end
 
     # Archive hydrodynamic snapshot fields to DuckDB
     if opts.enable_duckdb
@@ -943,10 +1088,6 @@ function run_segment_metrics(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     trajectories = nothing
 )
-    println("\n=================================================================")
-    println(" [Segment 7/8] Empirical Movement, Recruitment & Connectivity")
-    println("=================================================================")
-
     target_trajs = if isnothing(trajectories)
         target_run_id = !isempty(opts.run_id) ? opts.run_id :
             "run_$(opts.scenario)_$(opts.projection_year)"
@@ -997,6 +1138,10 @@ function run_segment_metrics(;
     else
         trajectories
     end
+
+    println("\n=================================================================")
+    println(" [Segment 7/8] Empirical Movement, Recruitment & Connectivity")
+    println("=================================================================")
 
     lon_b = range(opts.domain_lon[1], opts.domain_lon[2], length = opts.grid_size[1])
     lat_b = range(opts.domain_lat[1], opts.domain_lat[2], length = opts.grid_size[2])
@@ -1034,7 +1179,46 @@ function run_segment_metrics(;
         println("  $(rpad(conn.strata_names[i], 28)) -> [$(row_str)]")
     end
 
-    # 5. Export comprehensive multi-variable NetCDF and JLD2 archives
+    # 5. Depth-stratified Voronoi Tessellation & Multi-Resolution Connectivity
+    voronoi_res = if opts.enable_voronoi
+        println("\nComputing depth-stratified Voronoi tessellation ($(opts.voronoi_n_units) units)...")
+        v_tess = generate_depth_stratified_voronoi_units(
+            :numerical_earth;
+            lon_range = opts.domain_lon,
+            lat_range = opts.domain_lat,
+            n_units = opts.voronoi_n_units,
+            prob_core = opts.voronoi_prob_core,
+            prob_shallow = opts.voronoi_prob_shallow,
+            prob_deep = opts.voronoi_prob_deep,
+            min_res_core_km = opts.voronoi_min_res_core_km,
+            min_res_shallow_km = opts.voronoi_min_res_shallow_km,
+            min_res_deep_km = opts.voronoi_min_res_deep_km,
+            slope_weighting = true,
+            seed = opts.seed
+        )
+        println("Generated $(length(v_tess.units)) Voronoi units across depth strata.")
+
+        # Export Voronoi polygons to standard GeoJSON format for GIS integration
+        geojson_export_path = joinpath(opts.output_dir, "voronoi_units.geojson")
+        try
+            export_voronoi_geojson(v_tess, geojson_export_path)
+            println("Exported Voronoi polygons to GeoJSON -> $(geojson_export_path)")
+        catch geo_err
+            @warn "Failed exporting Voronoi GeoJSON: $(geo_err)"
+        end
+
+        v_metrics = compute_tesselated_connectivity_matrix(target_trajs, v_tess)
+        println("Voronoi Macro-Strata Transition Matrix (3x3):")
+        for (idx, st) in enumerate(v_metrics.strata_names)
+            row_str = join([string(round(v_metrics.macro_matrix[idx, j], digits = 3)) for j in 1:length(v_metrics.strata_names)], ", ")
+            println("  $(rpad(string(st), 12)) -> [$(row_str)]")
+        end
+        (tessellation = v_tess, metrics = v_metrics)
+    else
+        nothing
+    end
+
+    # 6. Export comprehensive multi-variable NetCDF and JLD2 archives
     nc_export_path = joinpath(opts.output_dir, "larval_dispersal_analysis.nc")
     jld_export_path = joinpath(opts.output_dir, "larval_dispersal_analysis.jld2")
     active_config = options_to_configuration(opts)
@@ -1059,7 +1243,7 @@ function run_segment_metrics(;
         config = active_config
     )
 
-    # 6. Archive simulation run, trajectories, metrics & connectivity in DuckDB
+    # 7. Archive simulation run, trajectories, metrics & connectivity in DuckDB
     if opts.enable_duckdb
         try
             println("Archiving simulation run and metrics to DuckDB -> $(opts.duckdb_path)...")
@@ -1092,6 +1276,45 @@ function run_segment_metrics(;
                     notes = "Hydrodynamic workflow run ($(opts.scenario), $(opts.projection_year))" *
                             (!isempty(opts.run_id) ? " [$(opts.run_id)]" : "")
                 )
+                if opts.enable_voronoi && !isnothing(voronoi_res)
+                    try
+                        DBInterface.execute(db, """
+                            CREATE TABLE IF NOT EXISTS voronoi_units (
+                                run_id VARCHAR,
+                                unit_id INTEGER,
+                                lon DOUBLE,
+                                lat DOUBLE,
+                                depth DOUBLE,
+                                stratum VARCHAR,
+                                area_km2 DOUBLE,
+                                settlement_count INTEGER,
+                                retention_index DOUBLE
+                            )
+                        """)
+                        v_t = voronoi_res.tessellation
+                        v_m = voronoi_res.metrics
+                        appender = DuckDB.Appender(db, "voronoi_units")
+                        for u in v_t.units
+                            s_cnt = u.id <= length(v_m.settlement_counts) ? v_m.settlement_counts[u.id] : 0
+                            r_idx = u.id <= length(v_m.retention_indices) ? v_m.retention_indices[u.id] : 0.0
+                            DuckDB.append(appender, target_run_id)
+                            DuckDB.append(appender, u.id)
+                            DuckDB.append(appender, u.lon)
+                            DuckDB.append(appender, u.lat)
+                            DuckDB.append(appender, u.depth)
+                            DuckDB.append(appender, string(u.stratum))
+                            DuckDB.append(appender, u.area_km2)
+                            DuckDB.append(appender, s_cnt)
+                            DuckDB.append(appender, r_idx)
+                            DuckDB.end_row(appender)
+                        end
+                        DuckDB.flush(appender)
+                        DuckDB.close(appender)
+                        println("Archived $(length(v_t.units)) Voronoi units to DuckDB table 'voronoi_units'.")
+                    catch v_err
+                        @warn "Failed to archive Voronoi units to DuckDB: $(v_err)"
+                    end
+                end
                 println("DuckDB run '$(target_run_id)' successfully archived.")
             finally
                 close_duckdb_storage(db)
@@ -1106,6 +1329,7 @@ function run_segment_metrics(;
         recruitment_metrics = rec_metrics,
         thermal_metrics = therm_metrics,
         connectivity = conn,
+        voronoi = voronoi_res,
         netcdf_path = nc_export_path,
         jld2_path = jld_export_path,
         duckdb_path = opts.enable_duckdb ? opts.duckdb_path : nothing
@@ -1133,11 +1357,6 @@ function run_segment_visualize(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     trajectories = nothing
 )
-    println("\n=================================================================")
-    println(" [Segment 8/8] Scientific Visualizations & Spatial Figures")
-    println("=================================================================")
-    mkpath(opts.output_dir)
-
     target_trajs = if isnothing(trajectories)
         target_run_id = !isempty(opts.run_id) ? opts.run_id :
             "run_$(opts.scenario)_$(opts.projection_year)"
@@ -1188,6 +1407,11 @@ function run_segment_visualize(;
     else
         trajectories
     end
+
+    println("\n=================================================================")
+    println(" [Segment 8/8] Scientific Visualizations & Spatial Figures")
+    println("=================================================================")
+    mkpath(opts.output_dir)
 
  
 
@@ -1310,6 +1534,50 @@ function run_segment_visualize(;
         output_path = fig_sec_path
     )
 
+    # 9. Hydrodynamic Field & Dashboard Animation (Oceananigans / CairoMakie)
+    anim_file_path = nothing
+    if opts.animate_hydro
+        anim_fmt = lowercase(opts.anim_format) == "gif" ? "gif" : "mp4"
+        hydro_source = if !isnothing(active_hydro)
+            active_hydro
+        else
+            default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
+            resolved_jld2, _ = resolve_hydro_model_path(opts, default_jld2)
+            isfile(resolved_jld2) ? resolved_jld2 : nothing
+        end
+
+        if opts.anim_variable == :dashboard
+            anim_file_path = joinpath(opts.output_dir, "hydrodynamic_dashboard_animation.$(anim_fmt)")
+            println("Rendering animated hydrodynamic simulation dashboard -> $(anim_file_path)...")
+            animate_hydrodynamic_dashboard(
+                hydro_source;
+                depth = opts.anim_depth,
+                trajectories = target_trajs,
+                bathymetry_data = bathy_data,
+                output_path = anim_file_path,
+                framerate = opts.anim_fps,
+                show_trajectories = opts.anim_overlay_particles,
+                domain_lon = opts.domain_lon,
+                domain_lat = opts.domain_lat
+            )
+        else
+            anim_file_path = joinpath(opts.output_dir, "hydrodynamic_$(opts.anim_variable)_animation.$(anim_fmt)")
+            println("Rendering animated hydrodynamic $(opts.anim_variable) field -> $(anim_file_path)...")
+            animate_hydrodynamic_field(
+                hydro_source;
+                variable = opts.anim_variable,
+                depth = opts.anim_depth,
+                trajectories = target_trajs,
+                bathymetry_data = bathy_data,
+                output_path = anim_file_path,
+                framerate = opts.anim_fps,
+                show_trajectories = opts.anim_overlay_particles,
+                domain_lon = opts.domain_lon,
+                domain_lat = opts.domain_lat
+            )
+        end
+    end
+
     # 9. Query Archived Scenarios from DuckDB for Cross-Scenario Comparison & Multi-Layer Interactive Map
     scenarios_bundle = Dict{String, Any}()
     if opts.enable_duckdb && isfile(opts.duckdb_path)
@@ -1408,6 +1676,45 @@ function run_segment_visualize(;
         )
     end
 
+    # 11. Depth-Stratified Voronoi Units Spatial Distribution
+    fig_voronoi_path = nothing
+    if opts.enable_voronoi
+        fig_voronoi_path = joinpath(opts.output_dir, "voronoi_units_distribution.png")
+        println("Rendering Voronoi units spatial distribution -> $(fig_voronoi_path)...")
+        try
+            target_bathy_path = joinpath(opts.input_dir, "bathymetry_active.nc")
+            if !isfile(target_bathy_path)
+                real_b = joinpath(opts.input_dir, "real_bathymetry.nc")
+                target_bathy_path = isfile(real_b) ? real_b : target_bathy_path
+            end
+            v_tess = generate_depth_stratified_voronoi_units(
+                target_bathy_path;
+                n_units = opts.voronoi_n_units,
+                prob_core = opts.voronoi_prob_core,
+                prob_shallow = opts.voronoi_prob_shallow,
+                prob_deep = opts.voronoi_prob_deep,
+                min_res_core_km = opts.voronoi_min_res_core_km,
+                min_res_shallow_km = opts.voronoi_min_res_shallow_km,
+                min_res_deep_km = opts.voronoi_min_res_deep_km,
+                seed = opts.seed
+            )
+            fig_v = CairoMakie.Figure(size = (1000, 750), fontsize = 13)
+            ax_v = CairoMakie.Axis(
+                fig_v[1, 1],
+                title = "Depth-Stratified Voronoi Units (N=$(length(v_tess.units)))",
+                xlabel = "Longitude (°E)",
+                ylabel = "Latitude (°N)"
+            )
+            lons = [u.lon for u in v_tess.units]
+            lats = [u.lat for u in v_tess.units]
+            strata_codes = [u.stratum == :core ? 1 : (u.stratum == :shallow ? 2 : 3) for u in v_tess.units]
+            CairoMakie.scatter!(ax_v, lons, lats, color = strata_codes, colormap = :viridis, markersize = 6)
+            CairoMakie.save(fig_voronoi_path, fig_v)
+        catch v_err
+            @warn "Failed to render Voronoi unit distribution figure: $(v_err)"
+        end
+    end
+
     println("All visualization figures and interactive maps successfully generated.")
     return (
         fig_trajectories = fig1_path,
@@ -1420,7 +1727,9 @@ function run_segment_visualize(;
         fig_hydro_advection = fig8_path,
         fig_hydro_tracers = fig9_path,
         fig_comparison = fig10_path,
-        interactive_map = opts.interactive_map ? html_path : nothing
+        fig_voronoi = fig_voronoi_path,
+        interactive_map = opts.interactive_map ? html_path : nothing,
+        animation = anim_file_path
     )
 end
 
@@ -1664,14 +1973,25 @@ function main(args = ARGS)
     end
 
     # 1. Resolve configuration file path and load centralized configuration
-    is_snowcrab = "--snowcrab-settings" in args || "--snowcrab" in args || "--snowcrab-mode" in args
-    config_file = is_snowcrab ? joinpath("inputs", "snowcrab.config") : find_default_config_path()
+    is_snowcrab_tesselated = "--tesselated" in args || "--snowcrab-tesselated" in args ||
+                             "--tessellated" in args || "--snowcrab-tessellated" in args
+    is_snowcrab = is_snowcrab_tesselated || "--snowcrab-settings" in args ||
+                  "--snowcrab" in args || "--snowcrab-mode" in args
+    config_file = if is_snowcrab_tesselated
+        joinpath("inputs", "snowcrab_tesselated.config")
+    elseif is_snowcrab
+        joinpath("inputs", "snowcrab.config")
+    else
+        find_default_config_path()
+    end
     for a in args
         if startswith(a, "--config=")
             config_file = String(split(a, "=")[2])
         end
     end
-    cfg = if is_snowcrab && !isfile(config_file)
+    cfg = if is_snowcrab_tesselated && !isfile(config_file)
+        get_snowcrab_tesselated_configuration()
+    elseif is_snowcrab && !isfile(config_file)
         get_snowcrab_configuration()
     else
         load_configuration(config_file)
@@ -1691,6 +2011,17 @@ function main(args = ARGS)
     hw_cfg = get(cfg, "hardware", Dict())
     vis_cfg = get(cfg, "visualization", Dict())
     paths_cfg = get(cfg, "paths", Dict())
+    tess_cfg = get(cfg, "tessellation", Dict())
+
+    # Voronoi tessellation defaults from config
+    enable_voronoi = Bool(get(tess_cfg, "enable_voronoi", is_snowcrab_tesselated))
+    voronoi_n_units = Int(get(tess_cfg, "n_units", 5000))
+    voronoi_p_core = Float64(get(tess_cfg, "prob_core", 0.8))
+    voronoi_p_shallow = Float64(get(tess_cfg, "prob_shallow", 0.1))
+    voronoi_p_deep = Float64(get(tess_cfg, "prob_deep", 0.1))
+    voronoi_min_core = Float64(get(tess_cfg, "min_res_core_km", 1.5))
+    voronoi_min_shallow = Float64(get(tess_cfg, "min_res_shallow_km", 5.0))
+    voronoi_min_deep = Float64(get(tess_cfg, "min_res_deep_km", 10.0))
 
     # Baseline options from config
     lon_range = (Float64(get(dom_cfg, "lon_min", -68.0)), Float64(get(dom_cfg, "lon_max", -57.0)))
@@ -1709,7 +2040,7 @@ function main(args = ARGS)
     adaptive_cfl = Bool(get(hydro_cfg, "adaptive_cfl", true))
     target_cfl = Float64(get(hydro_cfg, "target_cfl", 0.2))
     surface_heat_flux = Float64(get(hydro_cfg, "surface_heat_flux", 50.0))
-    hydro_model_file = String(get(hydro_cfg, "hydro_model_file", ""))
+    hydro_model_file = String(get(hydro_cfg, "hydro_model_file", get(store_cfg, "output_filename", "")))
     hydro_only = Bool(get(hydro_cfg, "hydro_only", false))
     track_only = Bool(get(hydro_cfg, "track_only", false))
     reuse_hydro = Bool(get(hydro_cfg, "reuse_hydro", false))
@@ -1737,6 +2068,38 @@ function main(args = ARGS)
     input_dir = String(get(paths_cfg, "input_dir", "inputs"))
     seed = Int(get(paths_cfg, "seed", 42))
 
+    enable_cp = Bool(get(store_cfg, "enable_checkpoint", get(hydro_cfg, "enable_checkpoint", true)))
+    cp_prefix_default = "checkpoint_$(resolve_config_name(config_file))"
+    cp_prefix = String(get(store_cfg, "checkpoint_prefix",
+                           get(hydro_cfg, "checkpoint_prefix", cp_prefix_default)))
+    if isempty(strip(cp_prefix)) || cp_prefix == "checkpoint"
+        cp_prefix = cp_prefix_default
+    end
+    cp_sched = Float64(get(store_cfg, "checkpoint_schedule_seconds", get(hydro_cfg, "checkpoint_schedule_seconds", 0.0)))
+    cp_dir = String(get(store_cfg, "checkpoint_dir", get(paths_cfg, "checkpoint_dir", "")))
+    cp_clean = Bool(get(store_cfg, "checkpoint_cleanup", true))
+    auto_res = Bool(get(hydro_cfg, "auto_restart", true))
+
+    res_scale = Float64(get(grid_cfg, "resolution_scale", 1.0))
+    v_mode_raw = String(get(grid_cfg, "vertical_stretching_mode", "tanh"))
+    v_mode = Symbol(lowercase(v_mode_raw))
+    v_file = String(get(grid_cfg, "vertical_grid_file",
+                        joinpath("inputs", "scotian_shelf_vertical_grid.csv")))
+    atmo_cfg = get(cfg, "atmosphere", Dict())
+    atmo_src = Symbol(lowercase(String(get(atmo_cfg, "source", "era5"))))
+    bnd_cfg = get(cfg, "boundaries", Dict())
+    obc_src = Symbol(lowercase(String(get(bnd_cfg, "ocean_boundary_source", "glorys12v1"))))
+    obc_tp = Symbol(lowercase(String(get(bnd_cfg, "obc_type", "flather_chapman"))))
+
+    # Visualization and animation defaults
+    interactive = Bool(get(vis_cfg, "interactive_map", true))
+    anim_hydro = Bool(get(vis_cfg, "animate_hydro", false))
+    anim_var = Symbol(lowercase(String(get(vis_cfg, "anim_variable", "dashboard"))))
+    anim_fps = Int(get(vis_cfg, "anim_fps", 10))
+    anim_fmt = String(lowercase(get(vis_cfg, "anim_format", "mp4")))
+    anim_depth = Float64(get(vis_cfg, "anim_depth", -2.5))
+    anim_overlay_parts = Bool(get(vis_cfg, "anim_overlay_particles", false))
+
     # 3. Parse modifier flags that override config defaults
     is_quick = "--quick" in args || "-q" in args
     if "--real" in args
@@ -1752,10 +2115,35 @@ function main(args = ARGS)
     if "--fallback-cpu" in args
         fallback_cpu = true
     end
+    if "--stretched-z" in args || "--vertical-tanh" in args
+        v_mode = :tanh
+    elseif "--uniform-z" in args
+        v_mode = :uniform
+    end
+    if "--obc" in args
+        obc_src = :glorys12v1
+    elseif "--no-obc" in args
+        obc_src = :none
+    end
+    if "--era5-forcing" in args || "--era5" in args
+        atmo_src = :era5
+    elseif "--no-era5" in args
+        atmo_src = :synthetic
+    end
     if "--interactive" in args
         interactive = true
     elseif "--no-interactive" in args
         interactive = false
+    end
+    if "--animate-hydro" in args || "--anim-hydro" in args
+        anim_hydro = true
+    elseif "--no-animate-hydro" in args || "--no-anim-hydro" in args
+        anim_hydro = false
+    end
+    if "--anim-overlay-particles" in args || "--anim-particles" in args
+        anim_overlay_parts = true
+    elseif "--no-anim-overlay-particles" in args
+        anim_overlay_parts = false
     end
     if "--duckdb" in args
         enable_duckdb = true
@@ -1787,6 +2175,11 @@ function main(args = ARGS)
     elseif "--no-ascent" in args
         init_ascent = false
     end
+    if "--tesselated" in args || "--tessellated" in args || "--voronoi" in args
+        enable_voronoi = true
+    elseif "--no-tesselated" in args || "--no-tessellated" in args || "--no-voronoi" in args
+        enable_voronoi = false
+    end
     if "--hydro-only" in args
         hydro_only = true
     end
@@ -1795,6 +2188,21 @@ function main(args = ARGS)
     end
     if "--reuse-hydro" in args
         reuse_hydro = true
+    end
+    if "--restart" in args
+        auto_res = true
+    elseif "--no-restart" in args || "--force-new" in args
+        auto_res = false
+    end
+    if "--checkpoint" in args
+        enable_cp = true
+    elseif "--no-checkpoint" in args
+        enable_cp = false
+    end
+    if "--checkpoint-cleanup" in args
+        cp_clean = true
+    elseif "--no-checkpoint-cleanup" in args
+        cp_clean = false
     end
     if "--real-5yr" in args
         scenario = :historical
@@ -1808,9 +2216,9 @@ function main(args = ARGS)
             hydro_model_file = "hydrodynamics_real_5yr.jld2"
         end
     elseif "--climatology-2yr" in args
-        scenario = :ssp245
+        scenario = :climatology
         proj_year = 2022
-        is_real = false
+        is_real = true
         sim_dur = is_quick ? 172800.0 : 63115200.0
         if isempty(run_id_val)
             run_id_val = "snowcrab_climatology_2yr"
@@ -1819,9 +2227,9 @@ function main(args = ARGS)
             hydro_model_file = "hydrodynamics_climatology_2yr.jld2"
         end
     elseif "--climatology-1.5yr" in args || "--climatology-18mo" in args
-        scenario = :ssp245
+        scenario = :climatology
         proj_year = 2022
-        is_real = false
+        is_real = true
         sim_dur = is_quick ? 172800.0 : 47336400.0
         if isempty(run_id_val)
             run_id_val = "snowcrab_climatology_1.5yr"
@@ -1899,8 +2307,56 @@ function main(args = ARGS)
             asc_spd = parse(Float64, split(a, "=")[2])
         elseif startswith(a, "--ascent-target=")
             asc_target = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--checkpoint-interval=") || startswith(a, "--checkpoint-schedule=")
+            raw_cp = split(a, "=")[2]
+            cp_sched = if endswith(raw_cp, "h")
+                parse(Float64, raw_cp[1:end-1]) * 3600.0
+            elseif endswith(raw_cp, "m")
+                parse(Float64, raw_cp[1:end-1]) * 60.0
+            elseif endswith(raw_cp, "d")
+                parse(Float64, raw_cp[1:end-1]) * 86400.0
+            else
+                parse(Float64, raw_cp)
+            end
+        elseif startswith(a, "--checkpoints-dir=") || startswith(a, "--checkpoint-dir=")
+            cp_dir = String(split(a, "=")[2])
+        elseif startswith(a, "--checkpoint-prefix=") || startswith(a, "--cp-prefix=")
+            cp_prefix = String(split(a, "=")[2])
+        elseif startswith(a, "--res-scale=") || startswith(a, "--resolution-scale=")
+            res_scale = parse(Float64, split(a, "=")[2])
+            grid_dim = (max(10, round(Int, grid_dim[1] / res_scale)),
+                        max(10, round(Int, grid_dim[2] / res_scale)),
+                        grid_dim[3])
+        elseif startswith(a, "--z-file=") || startswith(a, "--vertical-grid-file=")
+            v_file = String(split(a, "=")[2])
+        elseif startswith(a, "--obc-source=")
+            obc_src = Symbol(split(a, "=")[2])
+        elseif startswith(a, "--obc-type=")
+            obc_tp = Symbol(split(a, "=")[2])
         elseif startswith(a, "--seed=")
             seed = parse(Int, split(a, "=")[2])
+        elseif startswith(a, "--voronoi-units=") || startswith(a, "--n-units=")
+            voronoi_n_units = parse(Int, split(a, "=")[2])
+        elseif startswith(a, "--voronoi-prob-core=")
+            voronoi_p_core = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--voronoi-prob-shallow=")
+            voronoi_p_shallow = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--voronoi-prob-deep=")
+            voronoi_p_deep = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--voronoi-min-core=")
+            voronoi_min_core = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--voronoi-min-shallow=")
+            voronoi_min_shallow = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--voronoi-min-deep=")
+            voronoi_min_deep = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--anim-variable=") || startswith(a, "--anim-var=")
+            anim_var = Symbol(lowercase(split(a, "=")[2]))
+        elseif startswith(a, "--anim-fps=") || startswith(a, "--anim-framerate=")
+            anim_fps = parse(Int, split(a, "=")[2])
+        elseif startswith(a, "--anim-format=") || startswith(a, "--anim-fmt=")
+            anim_fmt = String(lowercase(split(a, "=")[2]))
+        elseif startswith(a, "--anim-depth=")
+            anim_depth = parse(Float64, split(a, "=")[2])
         end
     end
 
@@ -1915,6 +2371,7 @@ function main(args = ARGS)
         grid_dim = is_snowcrab ? (40, 40, 10) : (15, 15, 5)
         sim_dur = min(sim_dur, is_snowcrab ? 432000.0 : 3600.0)
         track_dur = min(track_dur, 86400.0 * 5)
+        voronoi_n_units = min(voronoi_n_units, 200)
     end
 
     opts = HydrodynamicOptions(
@@ -1960,8 +2417,67 @@ function main(args = ARGS)
         config_file = config_file,
         output_dir = output_dir,
         input_dir = input_dir,
-        seed = seed
+        enable_checkpoint = enable_cp,
+        checkpoint_prefix = cp_prefix,
+        checkpoint_schedule = cp_sched,
+        checkpoint_dir = cp_dir,
+        checkpoint_cleanup = cp_clean,
+        auto_restart = auto_res,
+        seed = seed,
+        vertical_stretching_mode = v_mode,
+        vertical_grid_file = v_file,
+        resolution_scale = res_scale,
+        atmospheric_source = atmo_src,
+        ocean_boundary_source = obc_src,
+        obc_type = obc_tp,
+        enable_voronoi = enable_voronoi,
+        voronoi_n_units = voronoi_n_units,
+        voronoi_prob_core = voronoi_p_core,
+        voronoi_prob_shallow = voronoi_p_shallow,
+        voronoi_prob_deep = voronoi_p_deep,
+        voronoi_min_res_core_km = voronoi_min_core,
+        voronoi_min_res_shallow_km = voronoi_min_shallow,
+        voronoi_min_res_deep_km = voronoi_min_deep,
+        animate_hydro = anim_hydro,
+        anim_variable = anim_var,
+        anim_fps = anim_fps,
+        anim_format = anim_fmt,
+        anim_depth = anim_depth,
+        anim_overlay_particles = anim_overlay_parts
     )
+
+    # Executive Hardware & Workflow Summary Banner
+    println("\n=================================================================")
+    println(" ParticleTracking Regional Hydrodynamic & Transport Engine")
+    println("=================================================================")
+    println(" Active Configuration: $(config_file)")
+    if opts.use_gpu
+        cuda_ok = false
+        cuda_name = "NVIDIA CUDA Device"
+        cuda_vram = ""
+        try
+            if CUDA.functional()
+                cuda_ok = true
+                cuda_name = CUDA.name(CUDA.device())
+                cuda_vram = " ($(round(CUDA.totalmem(CUDA.device()) / 1024^3, digits=1)) GB VRAM)"
+            end
+        catch
+        end
+        if cuda_ok
+            println(" Compute Architecture: GPU ($(cuda_name)$(cuda_vram))")
+            println(" Host CPU Worker Pool: $(Threads.nthreads()) threads (active for NetCDF I/O & preprocessing)")
+        else
+            println(" Compute Architecture: GPU requested, but CUDA unavailable (fallback = $(opts.fallback_to_cpu))")
+        end
+    else
+        println(" Compute Architecture: CPU ($(Threads.nthreads()) worker threads)")
+    end
+    println(" Domain Discretization: $(opts.grid_size[1]) × $(opts.grid_size[2]) × $(opts.grid_size[3]) cells")
+    println(" Geographic Extent:     Lon [$(opts.domain_lon[1]), $(opts.domain_lon[2])]°E, Lat [$(opts.domain_lat[1]), $(opts.domain_lat[2])]°N")
+    if opts.enable_checkpoint
+        println(" State Checkpointing:   Enabled (prefix: $(opts.checkpoint_prefix))")
+    end
+    println("=================================================================\n")
 
     # Check for --save-config request
     save_cfg_flag = filter(a -> startswith(a, "--save-config"), args)
@@ -2012,9 +2528,10 @@ function main(args = ARGS)
             println(" Target Model File: $(opts.hydro_model_file)")
         end
         println("=================================================================")
-        run_segment_data(opts = opts)
-        run_segment_grid(opts = opts)
-        m_res = run_segment_model(opts = opts)
+        d_res = run_segment_data(opts = opts)
+        g_res = run_segment_grid(opts = opts, bathy_file = d_res.bathy_file)
+        m_res = run_segment_model(opts = opts, immersed_grid = g_res.immersed_grid,
+                                  tau_x = d_res.tau_x, tau_y = d_res.tau_y)
         run_segment_climate(opts = opts, model = m_res.model)
         s_res = run_segment_simulation(opts = opts, model = m_res.model)
         println("\nHydrodynamic simulation completed successfully.")

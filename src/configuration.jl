@@ -32,6 +32,25 @@ function find_default_config_path()::String
 end
 
 """
+    resolve_config_name(config_file::AbstractString = "") -> String
+
+Extract the base configuration name from a config file path, or return
+the default configuration name (`"ParticleTracking"`) if unspecified or empty.
+
+# Inputs
+- `config_file::AbstractString`: Path to a `.config` file or empty string.
+
+# Outputs
+- `String`: Clean configuration identifier without directory or extension.
+"""
+function resolve_config_name(config_file::AbstractString = "")::String
+    cfg_path = isempty(strip(config_file)) ? find_default_config_path() : String(config_file)
+    base = basename(cfg_path)
+    stem = splitext(base)[1]
+    return isempty(stem) ? "ParticleTracking" : stem
+end
+
+"""
     HydrodynamicOptions
 
 Runtime parameter specification for regional hydrodynamic circulation,
@@ -80,52 +99,97 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `hydro_only::Bool`: Run hydrodynamics only and persist to JLD2 checkpoint.
 - `track_only::Bool`: Track larvae only using flow fields from hydro_model_file.
 - `reuse_hydro::Bool`: Reuse existing hydro_model_file if present on disk; else run.
+- `enable_checkpoint::Bool`: Whether to attach Oceananigans Checkpointer for state serialization.
+- `checkpoint_schedule::Float64`: State checkpoint frequency in seconds (0.0 = match output schedule).
+- `checkpoint_dir::String`: Directory where state checkpoints are archived.
+- `checkpoint_cleanup::Bool`: Whether older intermediate checkpoints are automatically deleted.
+- `auto_restart::Bool`: Automatically detect and pick up from existing checkpoints if available.
 - `run_id::String`: Unique cohort identifier for DuckDB persistence and figures.
+- `vertical_stretching_mode::Symbol`: Vertical grid stretching mode (:tanh, :uniform, or :csv).
+- `vertical_grid_file::String`: Path to CSV file specifying vertical layer boundary faces.
+- `resolution_scale::Float64`: Horizontal grid resolution scale multiplier / divisor.
+- `atmospheric_source::Symbol`: Atmospheric forcing provider (:era5, :synthetic, :climatology).
+- `ocean_boundary_source::Symbol`: Open boundary hydrographic data provider (:glorys12v1, :synthetic).
+- `obc_type::Symbol`: Lateral open boundary formulation (:flather_chapman, :radiation, :clamped).
+- `enable_voronoi::Bool`: Whether to compute multi-resolution Voronoi tessellation analysis.
+- `voronoi_n_units::Int`: Number of Voronoi units/centroids to generate across strata.
+- `voronoi_prob_core::Float64`: Sampling probability weight for core depth stratum (50 to 350 m).
+- `voronoi_prob_shallow::Float64`: Sampling probability weight for shallow stratum (0 to 50 m).
+- `voronoi_prob_deep::Float64`: Sampling probability weight for deep stratum (> 350 m).
+- `voronoi_min_res_core_km::Float64`: Minimum Poisson-disc separation distance in core zone (km).
+- `voronoi_min_res_shallow_km::Float64`: Minimum separation distance in shallow zone (km).
+- `voronoi_min_res_deep_km::Float64`: Minimum separation distance in deep zone (km).
 """
 struct HydrodynamicOptions
-    domain_lon            :: Tuple{Float64, Float64}
-    domain_lat            :: Tuple{Float64, Float64}
-    domain_z              :: Tuple{Float64, Float64}
-    grid_size             :: Tuple{Int, Int, Int}
-    data_mode             :: Symbol
-    enable_tides          :: Bool
-    tidal_u_amp           :: Float64
-    tidal_v_amp           :: Float64
-    scenario              :: Symbol
-    projection_year       :: Int
-    sim_dt                :: Float64
-    sim_duration          :: Float64
-    adaptive_cfl          :: Bool
-    target_cfl            :: Float64
-    surface_heat_flux     :: Float64
-    n_particles           :: Int
-    track_duration        :: Float64
-    track_dt              :: Float64
-    diffusivity_h         :: Float64
-    diffusivity_v         :: Float64
-    enable_dvm            :: Bool
-    enable_molting        :: Bool
-    min_seabed_depth      :: Float64
-    buffer_km             :: Float64
-    release_depth_mode    :: Symbol
-    bottom_release_offset :: Tuple{Float64, Float64}
-    enable_initial_ascent :: Bool
-    ascent_speed          :: Float64
-    ascent_target_depth   :: Float64
-    use_gpu               :: Bool
-    fallback_to_cpu       :: Bool
-    interactive_map       :: Bool
-    enable_duckdb         :: Bool
-    duckdb_path           :: String
-    config_file           :: String
-    output_dir            :: String
-    input_dir             :: String
-    seed                  :: Int
-    hydro_model_file      :: String
-    hydro_only            :: Bool
-    track_only            :: Bool
-    reuse_hydro           :: Bool
-    run_id                :: String
+    domain_lon               :: Tuple{Float64, Float64}
+    domain_lat               :: Tuple{Float64, Float64}
+    domain_z                 :: Tuple{Float64, Float64}
+    grid_size                :: Tuple{Int, Int, Int}
+    data_mode                :: Symbol
+    enable_tides             :: Bool
+    tidal_u_amp              :: Float64
+    tidal_v_amp              :: Float64
+    scenario                 :: Symbol
+    projection_year          :: Int
+    sim_dt                   :: Float64
+    sim_duration             :: Float64
+    adaptive_cfl             :: Bool
+    target_cfl               :: Float64
+    surface_heat_flux        :: Float64
+    n_particles              :: Int
+    track_duration           :: Float64
+    track_dt                 :: Float64
+    diffusivity_h            :: Float64
+    diffusivity_v            :: Float64
+    enable_dvm               :: Bool
+    enable_molting           :: Bool
+    min_seabed_depth         :: Float64
+    buffer_km                :: Float64
+    release_depth_mode       :: Symbol
+    bottom_release_offset    :: Tuple{Float64, Float64}
+    enable_initial_ascent    :: Bool
+    ascent_speed             :: Float64
+    ascent_target_depth      :: Float64
+    use_gpu                  :: Bool
+    fallback_to_cpu          :: Bool
+    interactive_map          :: Bool
+    enable_duckdb            :: Bool
+    duckdb_path              :: String
+    config_file              :: String
+    output_dir               :: String
+    input_dir                :: String
+    seed                     :: Int
+    hydro_model_file         :: String
+    hydro_only               :: Bool
+    track_only               :: Bool
+    reuse_hydro              :: Bool
+    enable_checkpoint        :: Bool
+    checkpoint_prefix        :: String
+    checkpoint_schedule      :: Float64
+    checkpoint_dir           :: String
+    checkpoint_cleanup       :: Bool
+    auto_restart             :: Bool
+    run_id                   :: String
+    vertical_stretching_mode :: Symbol
+    vertical_grid_file       :: String
+    resolution_scale         :: Float64
+    atmospheric_source       :: Symbol
+    ocean_boundary_source    :: Symbol
+    obc_type                 :: Symbol
+    enable_voronoi           :: Bool
+    voronoi_n_units          :: Int
+    voronoi_prob_core        :: Float64
+    voronoi_prob_shallow     :: Float64
+    voronoi_prob_deep        :: Float64
+    voronoi_min_res_core_km  :: Float64
+    voronoi_min_res_shallow_km :: Float64
+    voronoi_min_res_deep_km  :: Float64
+    animate_hydro            :: Bool
+    anim_variable            :: Symbol
+    anim_fps                 :: Int
+    anim_format              :: String
+    anim_depth               :: Float64
+    anim_overlay_particles   :: Bool
 end
 
 function HydrodynamicOptions(;
@@ -171,8 +235,41 @@ function HydrodynamicOptions(;
     hydro_only            :: Bool = false,
     track_only            :: Bool = false,
     reuse_hydro           :: Bool = false,
-    run_id                :: AbstractString = ""
+    enable_checkpoint     :: Bool = true,
+    checkpoint_prefix     :: AbstractString = "",
+    checkpoint_schedule   :: Real = 0.0,
+    checkpoint_dir        :: AbstractString = "",
+    checkpoint_cleanup    :: Bool = true,
+    auto_restart             :: Bool = true,
+    run_id                   :: AbstractString = "",
+    vertical_stretching_mode :: Symbol = :tanh,
+    vertical_grid_file       :: AbstractString = joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
+    resolution_scale         :: Real = 1.0,
+    atmospheric_source       :: Symbol = :era5,
+    ocean_boundary_source    :: Symbol = :glorys12v1,
+    obc_type                 :: Symbol = :flather_chapman,
+    enable_voronoi           :: Bool = false,
+    voronoi_n_units          :: Int = 5000,
+    voronoi_prob_core        :: Real = 0.8,
+    voronoi_prob_shallow     :: Real = 0.1,
+    voronoi_prob_deep        :: Real = 0.1,
+    voronoi_min_res_core_km  :: Real = 1.5,
+    voronoi_min_res_shallow_km :: Real = 5.0,
+    voronoi_min_res_deep_km  :: Real = 10.0,
+    animate_hydro            :: Bool = false,
+    anim_variable            :: Symbol = :dashboard,
+    anim_fps                 :: Int = 10,
+    anim_format              :: AbstractString = "mp4",
+    anim_depth               :: Real = -2.5,
+    anim_overlay_particles   :: Bool = false
 )
+    resolved_cp_prefix = if !isempty(strip(checkpoint_prefix)) && checkpoint_prefix != "checkpoint"
+        String(checkpoint_prefix)
+    else
+        cfg_name = resolve_config_name(config_file)
+        "checkpoint_$(cfg_name)"
+    end
+
     return HydrodynamicOptions(
         (Float64(domain_lon[1]), Float64(domain_lon[2])),
         (Float64(domain_lat[1]), Float64(domain_lat[2])),
@@ -216,7 +313,33 @@ function HydrodynamicOptions(;
         hydro_only,
         track_only,
         reuse_hydro,
-        String(run_id)
+        enable_checkpoint,
+        resolved_cp_prefix,
+        Float64(checkpoint_schedule),
+        String(checkpoint_dir),
+        checkpoint_cleanup,
+        auto_restart,
+        String(run_id),
+        vertical_stretching_mode,
+        String(vertical_grid_file),
+        Float64(resolution_scale),
+        atmospheric_source,
+        ocean_boundary_source,
+        obc_type,
+        enable_voronoi,
+        voronoi_n_units,
+        Float64(voronoi_prob_core),
+        Float64(voronoi_prob_shallow),
+        Float64(voronoi_prob_deep),
+        Float64(voronoi_min_res_core_km),
+        Float64(voronoi_min_res_shallow_km),
+        Float64(voronoi_min_res_deep_km),
+        animate_hydro,
+        anim_variable,
+        anim_fps,
+        String(anim_format),
+        Float64(anim_depth),
+        anim_overlay_particles
     )
 end
 
@@ -232,16 +355,30 @@ If the requested file does not exist, returns the default parameter configuratio
 # Outputs
 - `Dict{String, Any}`: Nested dictionary containing all sectioned parameter settings.
 """
-function load_configuration(config_path::AbstractString = find_default_config_path())::Dict{String, Any}
+function load_configuration(
+    config_path::AbstractString = find_default_config_path()
+)::Dict{String, Any}
     if isfile(config_path)
         try
             return TOML.parsefile(config_path)
         catch err
             @warn "Failed to parse configuration file at $(config_path): $(err). Using defaults."
-            return occursin("snowcrab", lowercase(config_path)) ? get_snowcrab_configuration() : get_default_configuration()
+            if occursin("snowcrab_tesselated", lowercase(config_path))
+                return get_snowcrab_tesselated_configuration()
+            elseif occursin("snowcrab", lowercase(config_path))
+                return get_snowcrab_configuration()
+            else
+                return get_default_configuration()
+            end
         end
     else
-        return occursin("snowcrab", lowercase(config_path)) ? get_snowcrab_configuration() : get_default_configuration()
+        if occursin("snowcrab_tesselated", lowercase(config_path))
+            return get_snowcrab_tesselated_configuration()
+        elseif occursin("snowcrab", lowercase(config_path))
+            return get_snowcrab_configuration()
+        else
+            return get_default_configuration()
+        end
     end
 end
 
@@ -293,7 +430,10 @@ function get_default_configuration()::Dict{String, Any}
         "grid" => Dict{String, Any}(
             "nx" => 50,
             "ny" => 50,
-            "nz" => 10
+            "nz" => 10,
+            "resolution_scale" => 1.0,
+            "vertical_stretching_mode" => "tanh",
+            "vertical_grid_file" => "inputs/scotian_shelf_vertical_grid.csv"
         ),
         "data" => Dict{String, Any}(
             "data_mode" => "synthetic",
@@ -362,7 +502,12 @@ function get_default_configuration()::Dict{String, Any}
         "storage" => Dict{String, Any}(
             "enable_duckdb" => true,
             "duckdb_path" => "outputs/particle_tracking.duckdb",
-            "export_parquet" => false
+            "export_parquet" => false,
+            "enable_checkpoint" => true,
+            "checkpoint_prefix" => "checkpoint_ParticleTracking",
+            "checkpoint_schedule_seconds" => 21600.0,
+            "checkpoint_dir" => "outputs/checkpoints",
+            "checkpoint_cleanup" => true
         ),
         "hardware" => Dict{String, Any}(
             "use_gpu" => false,
@@ -370,7 +515,13 @@ function get_default_configuration()::Dict{String, Any}
         ),
         "visualization" => Dict{String, Any}(
             "interactive_map" => true,
-            "title" => "Scotian Shelf Snow Crab Larval Dispersal & Demographic Connectivity"
+            "animate_hydro" => false,
+            "anim_variable" => "dashboard",
+            "anim_fps" => 10,
+            "anim_format" => "mp4",
+            "anim_depth" => -2.5,
+            "anim_overlay_particles" => false,
+            "title" => "Regional Marine Lagrangian Particle Tracking & Dispersion"
         ),
         "paths" => Dict{String, Any}(
             "output_dir" => "outputs",
@@ -412,9 +563,12 @@ function get_snowcrab_configuration()::Dict{String, Any}
             "buffer_km" => 100.0
         ),
         "grid" => Dict{String, Any}(
-            "nx" => 100,
-            "ny" => 100,
-            "nz" => 20
+            "nx" => 345,
+            "ny" => 245,
+            "nz" => 20,
+            "resolution_scale" => 2.5,
+            "vertical_stretching_mode" => "tanh",
+            "vertical_grid_file" => "inputs/scotian_shelf_vertical_grid.csv"
         ),
         "data" => Dict{String, Any}(
             "data_mode" => "real",
@@ -488,11 +642,28 @@ function get_snowcrab_configuration()::Dict{String, Any}
         "storage" => Dict{String, Any}(
             "enable_duckdb" => true,
             "duckdb_path" => "outputs/snowcrab_tracking.duckdb",
-            "export_parquet" => false
+            "export_parquet" => false,
+            "enable_checkpoint" => true,
+            "checkpoint_prefix" => "checkpoint_snowcrab",
+            "checkpoint_schedule_seconds" => 21600.0,
+            "checkpoint_dir" => "outputs/checkpoints",
+            "checkpoint_cleanup" => true
         ),
         "hardware" => Dict{String, Any}(
-            "use_gpu" => false,
+            "use_gpu" => true,
             "fallback_to_cpu" => true
+        ),
+        "atmosphere" => Dict{String, Any}(
+            "source" => "era5",
+            "drag_formulation" => "garratt_1977",
+            "bulk_heat_flux" => true,
+            "climatology" => false
+        ),
+        "boundaries" => Dict{String, Any}(
+            "ocean_boundary_source" => "glorys12v1",
+            "obc_type" => "flather_chapman",
+            "sponge_layer_width" => 0.25,
+            "sponge_timescale" => 3600.0
         ),
         "visualization" => Dict{String, Any}(
             "interactive_map" => true,
@@ -504,6 +675,46 @@ function get_snowcrab_configuration()::Dict{String, Any}
             "seed" => 42
         )
     )
+end
+
+"""
+    get_snowcrab_tesselated_configuration() -> Dict{String, Any}
+
+Generate a configuration dictionary calibrated specifically for snow crab (*Chionoecetes opilio*)
+larval transport with multi-resolution, depth-stratified Voronoi tessellation analysis.
+
+# Biophysical Calibration & Parameters
+- Inherits all baseline Scotian Shelf biophysical calibrations from `get_snowcrab_configuration()`.
+- Incorporates a dedicated `[tessellation]` block configuring \$N = 5000\$ Voronoi units:
+  - **Core Nursery Strata** (50 to 350 m depth): Probability weight \$p = 0.8\$, minimum
+    separation distance 1.5 km (resolving complex banks, gullies, and nursery depressions).
+  - **Shallow Coastal Strata** (0 to 50 m depth): Probability weight \$p = 0.1\$, minimum
+    separation distance 5.0 km.
+  - **Deep Slope & Basin Strata** (> 350 m depth): Probability weight \$p = 0.1\$, minimum
+    separation distance 10.0 km.
+- Persistence configured to `outputs/snowcrab_tesselated.duckdb`.
+
+# Outputs
+- `Dict{String, Any}`: Nested dictionary containing snow crab tessellated parameter settings.
+"""
+function get_snowcrab_tesselated_configuration()::Dict{String, Any}
+    cfg = get_snowcrab_configuration()
+    cfg["storage"]["duckdb_path"] = "outputs/snowcrab_tesselated.duckdb"
+    cfg["storage"]["checkpoint_prefix"] = "checkpoint_snowcrab_tesselated"
+    cfg["visualization"]["title"] = "Scotian Shelf Snow Crab Multi-Resolution Voronoi Dispersal & Connectivity"
+    cfg["tessellation"] = Dict{String, Any}(
+        "enable_voronoi" => true,
+        "n_units" => 5000,
+        "prob_core" => 0.8,
+        "prob_shallow" => 0.1,
+        "prob_deep" => 0.1,
+        "min_res_core_km" => 1.5,
+        "min_res_shallow_km" => 5.0,
+        "min_res_deep_km" => 10.0,
+        "core_depth_min" => -350.0,
+        "core_depth_max" => -50.0
+    )
+    return cfg
 end
 
 """
@@ -583,6 +794,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     use_gpu      = Bool(get_val("hardware", "use_gpu", false))
     fallback_cpu = Bool(get_val("hardware", "fallback_to_cpu", true))
     interactive  = Bool(get_val("visualization", "interactive_map", true))
+    anim_hydro   = Bool(get_val("visualization", "animate_hydro", false))
+    anim_var     = Symbol(lowercase(String(get_val("visualization", "anim_variable", "dashboard"))))
+    anim_fps     = Int(get_val("visualization", "anim_fps", 10))
+    anim_fmt     = String(get_val("visualization", "anim_format", "mp4"))
+    anim_depth   = Float64(get_val("visualization", "anim_depth", -2.5))
+    anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
 
     enable_duckdb = Bool(get_val("storage", "enable_duckdb", true))
     duckdb_path   = String(get_val("storage", "duckdb_path", "outputs/particle_tracking.duckdb"))
@@ -591,8 +808,39 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     input_dir  = String(get_val("paths", "input_dir", "inputs"))
     seed       = Int(get_val("paths", "seed", 42))
 
-    hydro_file = String(get_val("hydrodynamics", "hydro_model_file", ""))
+    hydro_file = String(get_val("hydrodynamics", "hydro_model_file",
+                                get_val("storage", "output_filename", "")))
     run_id_val = String(get_val("storage", "run_id", ""))
+
+    enable_cp = Bool(get_val("storage", "enable_checkpoint",
+                             get_val("hydrodynamics", "enable_checkpoint", true)))
+    cp_pfx_raw = String(get_val("storage", "checkpoint_prefix",
+                                get_val("hydrodynamics", "checkpoint_prefix", "")))
+    cp_sched  = Float64(get_val("storage", "checkpoint_schedule_seconds",
+                                get_val("hydrodynamics", "checkpoint_schedule_seconds", 0.0)))
+    cp_dir    = String(get_val("storage", "checkpoint_dir",
+                               get_val("paths", "checkpoint_dir", "")))
+    cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", true))
+    auto_res  = Bool(get_val("hydrodynamics", "auto_restart", true))
+
+    res_scale = Float64(get_val("grid", "resolution_scale", 1.0))
+    v_mode_str = String(get_val("grid", "vertical_stretching_mode", "tanh"))
+    v_mode = Symbol(lowercase(v_mode_str))
+    v_file = String(get_val("grid", "vertical_grid_file",
+                            joinpath("inputs", "scotian_shelf_vertical_grid.csv")))
+    atmo_src = Symbol(lowercase(String(get_val("atmosphere", "source", "era5"))))
+    obc_src = Symbol(lowercase(String(get_val("boundaries", "ocean_boundary_source", "glorys12v1"))))
+    obc_tp = Symbol(lowercase(String(get_val("boundaries", "obc_type", "flather_chapman"))))
+
+    # Voronoi tessellation parameters
+    enable_voronoi = Bool(get_val("tessellation", "enable_voronoi", false))
+    voronoi_n_units = Int(get_val("tessellation", "n_units", 5000))
+    voronoi_p_core = Float64(get_val("tessellation", "prob_core", 0.8))
+    voronoi_p_shallow = Float64(get_val("tessellation", "prob_shallow", 0.1))
+    voronoi_p_deep = Float64(get_val("tessellation", "prob_deep", 0.1))
+    voronoi_min_core = Float64(get_val("tessellation", "min_res_core_km", 1.5))
+    voronoi_min_shallow = Float64(get_val("tessellation", "min_res_shallow_km", 5.0))
+    voronoi_min_deep = Float64(get_val("tessellation", "min_res_deep_km", 10.0))
 
     # Construct HydrodynamicOptions with overrides applied
     return HydrodynamicOptions(;
@@ -634,7 +882,33 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         input_dir = input_dir,
         seed = seed,
         hydro_model_file = hydro_file,
+        enable_checkpoint = enable_cp,
+        checkpoint_prefix = cp_pfx_raw,
+        checkpoint_schedule = cp_sched,
+        checkpoint_dir = cp_dir,
+        checkpoint_cleanup = cp_clean,
+        auto_restart = auto_res,
         run_id = run_id_val,
+        vertical_stretching_mode = v_mode,
+        vertical_grid_file = v_file,
+        resolution_scale = res_scale,
+        atmospheric_source = atmo_src,
+        ocean_boundary_source = obc_src,
+        obc_type = obc_tp,
+        enable_voronoi = enable_voronoi,
+        voronoi_n_units = voronoi_n_units,
+        voronoi_prob_core = voronoi_p_core,
+        voronoi_prob_shallow = voronoi_p_shallow,
+        voronoi_prob_deep = voronoi_p_deep,
+        voronoi_min_res_core_km = voronoi_min_core,
+        voronoi_min_res_shallow_km = voronoi_min_shallow,
+        voronoi_min_res_deep_km = voronoi_min_deep,
+        animate_hydro = anim_hydro,
+        anim_variable = anim_var,
+        anim_fps = anim_fps,
+        anim_format = anim_fmt,
+        anim_depth = anim_depth,
+        anim_overlay_particles = anim_overlay,
         overrides...
     )
 end
@@ -658,7 +932,17 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         "grid" => Dict{String, Any}(
             "nx" => opts.grid_size[1],
             "ny" => opts.grid_size[2],
-            "nz" => opts.grid_size[3]
+            "nz" => opts.grid_size[3],
+            "resolution_scale" => opts.resolution_scale,
+            "vertical_stretching_mode" => string(opts.vertical_stretching_mode),
+            "vertical_grid_file" => opts.vertical_grid_file
+        ),
+        "atmosphere" => Dict{String, Any}(
+            "source" => string(opts.atmospheric_source)
+        ),
+        "boundaries" => Dict{String, Any}(
+            "ocean_boundary_source" => string(opts.ocean_boundary_source),
+            "obc_type" => string(opts.obc_type)
         ),
         "data" => Dict{String, Any}(
             "data_mode" => string(opts.data_mode),
@@ -705,14 +989,35 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         "storage" => Dict{String, Any}(
             "enable_duckdb" => opts.enable_duckdb,
             "duckdb_path" => opts.duckdb_path,
-            "run_id" => opts.run_id
+            "run_id" => opts.run_id,
+            "enable_checkpoint" => opts.enable_checkpoint,
+            "checkpoint_prefix" => opts.checkpoint_prefix,
+            "checkpoint_schedule_seconds" => opts.checkpoint_schedule,
+            "checkpoint_dir" => opts.checkpoint_dir,
+            "checkpoint_cleanup" => opts.checkpoint_cleanup
         ),
         "hardware" => Dict{String, Any}(
             "use_gpu" => opts.use_gpu,
             "fallback_to_cpu" => opts.fallback_to_cpu
         ),
+        "tessellation" => Dict{String, Any}(
+            "enable_voronoi" => opts.enable_voronoi,
+            "n_units" => opts.voronoi_n_units,
+            "prob_core" => opts.voronoi_prob_core,
+            "prob_shallow" => opts.voronoi_prob_shallow,
+            "prob_deep" => opts.voronoi_prob_deep,
+            "min_res_core_km" => opts.voronoi_min_res_core_km,
+            "min_res_shallow_km" => opts.voronoi_min_res_shallow_km,
+            "min_res_deep_km" => opts.voronoi_min_res_deep_km
+        ),
         "visualization" => Dict{String, Any}(
-            "interactive_map" => opts.interactive_map
+            "interactive_map" => opts.interactive_map,
+            "animate_hydro" => opts.animate_hydro,
+            "anim_variable" => string(opts.anim_variable),
+            "anim_fps" => opts.anim_fps,
+            "anim_format" => opts.anim_format,
+            "anim_depth" => opts.anim_depth,
+            "anim_overlay_particles" => opts.anim_overlay_particles
         ),
         "paths" => Dict{String, Any}(
             "output_dir" => opts.output_dir,
@@ -769,6 +1074,24 @@ function SnowCrabRunOptions(; kwargs...)::HydrodynamicOptions
     return configuration_to_options(cfg; kwargs...)
 end
 
+"""
+    SnowCrabTesselatedRunOptions(; kwargs...) -> HydrodynamicOptions
+
+Construct a `HydrodynamicOptions` instance pre-configured with calibrated physical
+and biophysical parameters for snow crab (*Chionoecetes opilio*) and multi-resolution
+depth-stratified Voronoi tessellation analysis.
+
+# Inputs
+- `kwargs...`: Optional keyword overrides for any field of `HydrodynamicOptions`.
+
+# Outputs
+- `HydrodynamicOptions`: Validated runtime options instance with snow crab tessellated defaults.
+"""
+function SnowCrabTesselatedRunOptions(; kwargs...)::HydrodynamicOptions
+    cfg = get_snowcrab_tesselated_configuration()
+    return configuration_to_options(cfg; kwargs...)
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Formally Decoupled Configuration Architecture
 # ─────────────────────────────────────────────────────────────────────────────
@@ -820,6 +1143,12 @@ struct HydrodynamicConfig
     output_dir               :: String
     output_filename          :: String
     output_schedule_seconds  :: Float64
+    enable_checkpoint        :: Bool
+    checkpoint_prefix        :: String
+    checkpoint_schedule      :: Float64
+    checkpoint_dir           :: String
+    checkpoint_cleanup       :: Bool
+    auto_restart             :: Bool
     use_gpu                  :: Bool
     fallback_to_cpu          :: Bool
 end
@@ -889,20 +1218,20 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :domain_lat               => opts.domain_lat,
         :domain_z                 => opts.domain_z,
         :grid_size                => opts.grid_size,
-        :vertical_stretching_mode => :tanh,
-        :vertical_grid_file       => joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
-        :resolution_scale         => 1.0,
+        :vertical_stretching_mode => opts.vertical_stretching_mode,
+        :vertical_grid_file       => opts.vertical_grid_file,
+        :resolution_scale         => opts.resolution_scale,
         :bathymetry_source        => opts.data_mode == :real ? :gebco : :synthetic,
         :bathy_dataset_id         => "etopo180",
         :inshore_depth            => -20.0,
         :shelf_slope              => 500.0,
-        :atmospheric_source       => opts.data_mode == :real ? :era5 : :synthetic,
+        :atmospheric_source       => opts.atmospheric_source,
         :drag_formulation         => :garratt_1977,
         :bulk_heat_flux           => true,
         :climatology              => false,
         :mhw_temp_anomaly         => opts.scenario == :mhw ? 3.5 : 0.0,
-        :ocean_boundary_source    => :glorys12v1,
-        :obc_type                 => :flather_chapman,
+        :ocean_boundary_source    => opts.ocean_boundary_source,
+        :obc_type                 => opts.obc_type,
         :sponge_layer_width       => 0.25,
         :sponge_timescale         => 3600.0,
         :enable_tides             => opts.enable_tides,
@@ -927,6 +1256,12 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
                                      "hydrodynamics_output.jld2" :
                                      basename(opts.hydro_model_file),
         :output_schedule_seconds  => 21600.0,
+        :enable_checkpoint        => opts.enable_checkpoint,
+        :checkpoint_prefix        => opts.checkpoint_prefix,
+        :checkpoint_schedule      => opts.checkpoint_schedule,
+        :checkpoint_dir           => opts.checkpoint_dir,
+        :checkpoint_cleanup       => opts.checkpoint_cleanup,
+        :auto_restart             => opts.auto_restart,
         :use_gpu                  => opts.use_gpu,
         :fallback_to_cpu          => opts.fallback_to_cpu
     )
@@ -954,6 +1289,9 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         Float64(d[:min_dt_seconds]), Float64(d[:coriolis_latitude]),
         Float64(d[:divergence_limit]), String(d[:output_dir]),
         String(d[:output_filename]), Float64(d[:output_schedule_seconds]),
+        Bool(d[:enable_checkpoint]), String(d[:checkpoint_prefix]),
+        Float64(d[:checkpoint_schedule]), String(d[:checkpoint_dir]),
+        Bool(d[:checkpoint_cleanup]), Bool(d[:auto_restart]),
         Bool(d[:use_gpu]), Bool(d[:fallback_to_cpu])
     )
 end

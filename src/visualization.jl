@@ -8,6 +8,7 @@ temperature and salinity tracers, sea surface height, and multi-scenario climate
 """
 
 using CairoMakie
+import CairoMakie: record
 
 """
     plot_particle_trajectories(
@@ -3975,3 +3976,532 @@ function plot_interactive_trajectories_map(
         title = title
     )
 end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hydrodynamic Field Video & GIF Animations (Oceananigans / CairoMakie)
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    resolve_hydrodynamic_frame_data(
+        hydro_frame::NamedTuple,
+        variable::Symbol
+    ) -> Tuple{Matrix{Float64}, Symbol, String}
+
+Extract a 2D scalar spatial matrix, default colormap, and descriptive physical unit label
+for a given hydrodynamic diagnostic variable at the selected discrete depth level.
+
+# Inputs
+- `hydro_frame::NamedTuple`: Hydrodynamic snapshot dataset extracted via
+  `extract_hydrodynamic_dataset`.
+- `variable::Symbol`: Target variable symbol (`:speed`, `:vorticity`, `:temperature`,
+  `:salinity`, `:density`, `:stratification`, `:elevation`, `:w`).
+
+# Outputs
+- `Tuple{Matrix{Float64}, Symbol, String}`: 2D field matrix, CairoMakie colormap, label.
+"""
+function resolve_hydrodynamic_frame_data(
+    hydro_frame::NamedTuple,
+    variable::Symbol
+)::Tuple{Matrix{Float64}, Symbol, String}
+    k = hydro_frame.depth_index
+    if variable in (:salinity, :S)
+        return (Float64.(hydro_frame.salinity[:, :, k]), :haline, "Practical Salinity (PSU)")
+    elseif variable in (:temperature, :T)
+        return (Float64.(hydro_frame.temperature[:, :, k]), :thermal, "Temperature (°C)")
+    elseif variable in (:density, :rho)
+        return (Float64.(hydro_frame.density[:, :, k]), :dense, "Potential Density (kg m⁻³)")
+    elseif variable in (:stratification, :N2)
+        return (Float64.(hydro_frame.stratification[:, :, k] .* 10000.0), :ice, "Stratification N² (10⁻⁴ s⁻²)")
+    elseif variable in (:vorticity, :zeta)
+        return (Float64.(hydro_frame.vorticity[:, :, k] .* 100000.0), :balance, "Relative Vorticity ζ (10⁻⁵ s⁻¹)")
+    elseif variable in (:elevation, :eta, :ssh)
+        return (Float64.(hydro_frame.elevation .* 100.0), :delta, "Sea Surface Elevation η (cm)")
+    elseif variable in (:w, :vertical_velocity)
+        return (Float64.(hydro_frame.w[:, :, k] .* 1000.0), :curl, "Vertical Velocity w (mm s⁻¹)")
+    else
+        return (Float64.(hydro_frame.speed[:, :, k] .* 100.0), :viridis, "Current Speed |u_h| (cm s⁻¹)")
+    end
+end
+
+"""
+    animate_hydrodynamic_field(
+        hydrodynamics::Any;
+        variable::Symbol = :speed,
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = 1,
+        time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
+        time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+        n_frames::Union{Nothing, Int} = nothing,
+        trajectories::Union{Nothing, NamedTuple} = nothing,
+        bathymetry_data::Union{Nothing, NamedTuple} = nothing,
+        title::Union{Nothing, AbstractString} = nothing,
+        output_path::AbstractString = "outputs/hydrodynamic_animation.mp4",
+        framerate::Int = 10,
+        quiver_stride::Int = 3,
+        colormap::Union{Nothing, Symbol} = nothing,
+        show_trajectories::Bool = false,
+        domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
+        domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0)
+    ) -> String
+
+Render and encode an animated video or GIF of time-varying hydrodynamic fields using
+CairoMakie's native rendering engine and Oceananigans field output series.
+
+# Mathematical Formulation
+Horizontal current speed magnitude \$|\\boldsymbol{u}_h|\$:
+```math
+|\\boldsymbol{u}_h(x, y, z_k, t_m)| = \\sqrt{u^2(x, y, z_k, t_m) + v^2(x, y, z_k, t_m)}
+```
+Relative vertical vorticity \$\\zeta\$:
+```math
+\\zeta(x, y, z_k, t_m) = \\frac{\\partial v}{\\partial x} - \\frac{\\partial u}{\\partial y}
+```
+Temporal playback framerate and animation time step \$\\Delta t_{\\text{frame}}\$:
+```math
+t_m = t_0 + m \\cdot \\Delta t_{\\text{frame}}, \\quad
+\\text{playback speed} = \\text{framerate} \\times \\Delta t_{\\text{frame}}
+```
+
+# Inputs
+- `hydrodynamics`: JLD2 file path, DuckDB database connection, Oceananigans Model instance,
+  or NamedTuple.
+- `variable`: Target diagnostic variable to animate. Options:
+  `:speed` / `:advection` (current speed),
+  `:vorticity` / `:zeta` (vertical relative vorticity),
+  `:temperature` / `:T` (seawater potential temperature),
+  `:salinity` / `:S` (practical salinity),
+  `:elevation` / `:eta` / `:ssh` (sea surface height),
+  `:w` (vertical velocity).
+- `depth`: Continuous target depth in meters (e.g. -2.5 for surface, -50.0 for CIL).
+- `depth_level`: Vertical discrete grid index (default: 1).
+- `time_indices`: Optional vector of integer snapshot indices to animate.
+- `time_seconds_range`: Optional time window `(t_start, t_end)` in seconds.
+- `n_frames`: Optional maximum number of frames to render.
+- `trajectories`: Optional Lagrangian particle tracking output from `track_larval_cohort`.
+- `bathymetry_data`: Optional background bathymetry for depth contour overlays.
+- `title`: Custom figure title.
+- `output_path`: Destination file path (`.mp4` or `.gif`).
+- `framerate`: Playback speed in frames per second (default: 10).
+- `quiver_stride`: Spatial subsampling step for vectors (default: 3).
+- `colormap`: Optional custom colormap symbol.
+- `show_trajectories`: Whether to overlay active Lagrangian particles at synchronized time.
+- `domain_lon`: Bounding longitude range (default: (-68.0, -57.0)).
+- `domain_lat`: Bounding latitude range (default: (42.0, 47.0)).
+
+# Outputs
+- `String`: Path to the generated `.mp4` or `.gif` file.
+"""
+function animate_hydrodynamic_field(
+    hydrodynamics::Any;
+    variable::Symbol = :speed,
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = 1,
+    time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
+    time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    n_frames::Union{Nothing, Int} = nothing,
+    trajectories::Union{Nothing, NamedTuple} = nothing,
+    bathymetry_data::Union{Nothing, NamedTuple} = nothing,
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::AbstractString = "outputs/hydrodynamic_animation.mp4",
+    framerate::Int = 10,
+    quiver_stride::Int = 3,
+    colormap::Union{Nothing, Symbol} = nothing,
+    show_trajectories::Bool = false,
+    domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
+    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0)
+)::String
+    mkpath(dirname(output_path))
+
+    # 1. Extract initial reference snapshot to query grid dimensions and time series
+    hydro_init = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        depth = depth,
+        depth_level = depth_level,
+        time_index = 1,
+        domain_lon = domain_lon,
+        domain_lat = domain_lat
+    )
+    lons = hydro_init.lons
+    lats = hydro_init.lats
+    depth_m = hydro_init.depth_m
+    avail_times = hydro_init.times
+
+    # 2. Determine frame schedule
+    is_multi_snapshot = length(avail_times) > 1
+    frame_indices = if is_multi_snapshot
+        raw_idx = isnothing(time_indices) ? (1:length(avail_times)) : time_indices
+        if !isnothing(n_frames) && n_frames < length(raw_idx)
+            round.(Int, range(first(raw_idx), last(raw_idx), length = n_frames))
+        else
+            collect(raw_idx)
+        end
+    else
+        # Single snapshot or synthetic mode: synthesize harmonic time progression
+        n_steps = isnothing(n_frames) ? 24 : max(2, n_frames)
+        t_span = isnothing(time_seconds_range) ? (0.0, 86400.0) : time_seconds_range
+        collect(range(t_span[1], t_span[2], length = n_steps))
+    end
+    total_frames = length(frame_indices)
+
+    # 3. Resolve initial frame data and setup CairoMakie Observables
+    val_mat_init, def_cmap, unit_label = resolve_hydrodynamic_frame_data(hydro_init, variable)
+    chosen_cmap = something(colormap, def_cmap)
+
+    mat_obs = Observable(val_mat_init)
+    t_hr_init = round(hydro_init.time_seconds / 3600.0, digits = 1)
+    default_title = isnothing(title) ?
+        "Hydrodynamic $(unit_label) [Depth: $(depth_m) m | t = $(t_hr_init) h]" :
+        "$(title) [Depth: $(depth_m) m | t = $(t_hr_init) h]"
+    title_obs = Observable(default_title)
+
+    # Particle coordinates Observables
+    do_overlay_particles = show_trajectories && !isnothing(trajectories) &&
+                           hasproperty(trajectories, :lons) && hasproperty(trajectories, :times)
+    p_x_obs = Observable(Float64[])
+    p_y_obs = Observable(Float64[])
+
+    if do_overlay_particles
+        t_idx_p = argmin(abs.(trajectories.times .- hydro_init.time_seconds))
+        alive_mask = hasproperty(trajectories, :alive) ?
+            (trajectories.alive[:, t_idx_p] .== true) :
+            trues(size(trajectories.lons, 1))
+        p_x_obs[] = Float64.(trajectories.lons[alive_mask, t_idx_p])
+        p_y_obs[] = Float64.(trajectories.lats[alive_mask, t_idx_p])
+    end
+
+    # 4. Construct CairoMakie Figure
+    fig = Figure(size = (1080, 780), fontsize = 13)
+    ax = Axis(
+        fig[1, 1],
+        title = title_obs,
+        xlabel = "Longitude (°E)",
+        ylabel = "Latitude (°N)"
+    )
+
+    hm = heatmap!(ax, lons, lats, mat_obs, colormap = chosen_cmap)
+    Colorbar(fig[1, 2], hm, label = unit_label)
+
+    # Optional background bathymetry contours
+    if !isnothing(bathymetry_data) && hasproperty(bathymetry_data, :elevation)
+        try
+            contour!(
+                ax,
+                bathymetry_data.lon,
+                bathymetry_data.lat,
+                bathymetry_data.elevation,
+                levels = [-2000.0, -1000.0, -500.0, -200.0, -100.0, -50.0],
+                color = (:white, 0.45),
+                linewidth = 1.0
+            )
+        catch
+        end
+    end
+
+    # Overlay particles if enabled
+    if do_overlay_particles
+        scatter!(
+            ax, p_x_obs, p_y_obs,
+            color = :gold,
+            markersize = 8,
+            strokecolor = :black,
+            strokewidth = 0.8,
+            label = "Larval Cohort"
+        )
+        axislegend(ax, position = :rt)
+    end
+
+    # 5. Record animation frames
+    println("Recording hydrodynamic $(variable) animation ($(total_frames) frames @ $(framerate) fps)...")
+    try
+        record(fig, output_path, 1:total_frames; framerate = framerate) do frame_step
+            curr_hydro = if is_multi_snapshot
+                extract_hydrodynamic_dataset(
+                    hydrodynamics;
+                    depth = depth,
+                    depth_level = depth_level,
+                    time_index = frame_indices[frame_step],
+                    domain_lon = domain_lon,
+                    domain_lat = domain_lat
+                )
+            else
+                extract_hydrodynamic_dataset(
+                    hydrodynamics;
+                    depth = depth,
+                    depth_level = depth_level,
+                    time_seconds = frame_indices[frame_step],
+                    domain_lon = domain_lon,
+                    domain_lat = domain_lat
+                )
+            end
+
+            new_val_mat, _, _ = resolve_hydrodynamic_frame_data(curr_hydro, variable)
+            mat_obs[] = new_val_mat
+            t_hr = round(curr_hydro.time_seconds / 3600.0, digits = 1)
+            title_obs[] = isnothing(title) ?
+                "Hydrodynamic $(unit_label) [Depth: $(depth_m) m | t = $(t_hr) h]" :
+                "$(title) [Depth: $(depth_m) m | t = $(t_hr) h]"
+
+            if do_overlay_particles
+                t_p = argmin(abs.(trajectories.times .- curr_hydro.time_seconds))
+                a_mask = hasproperty(trajectories, :alive) ?
+                    (trajectories.alive[:, t_p] .== true) :
+                    trues(size(trajectories.lons, 1))
+                p_x_obs[] = Float64.(trajectories.lons[a_mask, t_p])
+                p_y_obs[] = Float64.(trajectories.lats[a_mask, t_p])
+            end
+        end
+        println("Successfully exported hydrodynamic animation to: $(output_path)")
+    catch err
+        @warn "Hydrodynamic animation recording failed: $(err). Trying fallback format..."
+        fallback_path = endswith(output_path, ".mp4") ?
+            replace(output_path, ".mp4" => ".gif") :
+            replace(output_path, ".gif" => ".mp4")
+        try
+            record(fig, fallback_path, 1:min(5, total_frames); framerate = framerate) do s
+            end
+            println("Exported fallback animation to: $(fallback_path)")
+            return fallback_path
+        catch fb_err
+            @error "Fallback animation also failed: $(fb_err)."
+        end
+    end
+
+    return output_path
+end
+
+"""
+    animate_hydrodynamic_dashboard(
+        hydrodynamics::Any;
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = 1,
+        time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
+        time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+        n_frames::Union{Nothing, Int} = nothing,
+        trajectories::Union{Nothing, NamedTuple} = nothing,
+        bathymetry_data::Union{Nothing, NamedTuple} = nothing,
+        section_lat::Real = 44.0,
+        title::Union{Nothing, AbstractString} = nothing,
+        output_path::AbstractString = "outputs/hydrodynamic_dashboard.mp4",
+        framerate::Int = 10,
+        show_trajectories::Bool = false,
+        domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
+        domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0)
+    ) -> String
+
+Render a synchronized 4-panel hydrodynamic simulation dashboard animation:
+1. Panel (1, 1): Surface/depth horizontal current speed \$|\\boldsymbol{u}_h|\$
+   with bathymetric contours and optional active larval particle drift overlay.
+2. Panel (1, 2): Relative vertical vorticity \$\\zeta = \\partial_x v - \\partial_y u\$.
+3. Panel (2, 1): Vertical zonal cross-section \$(x, z)\$ of seawater temperature.
+4. Panel (2, 2): Free sea surface height elevation \$\\eta(x, y)\$ tidal waves.
+
+# Inputs
+- `hydrodynamics`: Model instance, JLD2 file, DuckDB database, or NamedTuple.
+- `depth`: Target depth in meters (default: -2.5 m).
+- `depth_level`: Vertical discrete index (default: 1).
+- `time_indices`: Optional explicit vector of snapshot indices.
+- `time_seconds_range`: Optional time window `(t_start, t_end)` in seconds.
+- `n_frames`: Maximum number of animation frames.
+- `trajectories`: Optional particle trajectory dataset for synchronized overlay.
+- `bathymetry_data`: Optional bathymetric dataset for contours.
+- `section_lat`: Latitude for the vertical cross section (default: 44.0°N).
+- `title`: Optional custom super-title.
+- `output_path`: Destination video path (`.mp4` or `.gif`).
+- `framerate`: Playback speed in fps (default: 10).
+- `show_trajectories`: Whether to render moving larval particles.
+- `domain_lon, domain_lat`: Domain spatial boundaries.
+
+# Outputs
+- `String`: Path to the generated animation file.
+"""
+function animate_hydrodynamic_dashboard(
+    hydrodynamics::Any;
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = 1,
+    time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
+    time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    n_frames::Union{Nothing, Int} = nothing,
+    trajectories::Union{Nothing, NamedTuple} = nothing,
+    bathymetry_data::Union{Nothing, NamedTuple} = nothing,
+    section_lat::Real = 44.0,
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::AbstractString = "outputs/hydrodynamic_dashboard.mp4",
+    framerate::Int = 10,
+    show_trajectories::Bool = false,
+    domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
+    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0)
+)::String
+    mkpath(dirname(output_path))
+
+    # 1. Initial snapshot
+    hydro_init = extract_hydrodynamic_dataset(
+        hydrodynamics;
+        depth = depth,
+        depth_level = depth_level,
+        time_index = 1,
+        domain_lon = domain_lon,
+        domain_lat = domain_lat
+    )
+    lons = hydro_init.lons
+    lats = hydro_init.lats
+    depths = hydro_init.depths
+    k_sel = hydro_init.depth_index
+    depth_m = hydro_init.depth_m
+    avail_times = hydro_init.times
+    nx, ny, nz = length(lons), length(lats), length(depths)
+
+    # 2. Frame schedule
+    is_multi_snapshot = length(avail_times) > 1
+    frame_indices = if is_multi_snapshot
+        raw_idx = isnothing(time_indices) ? (1:length(avail_times)) : time_indices
+        if !isnothing(n_frames) && n_frames < length(raw_idx)
+            round.(Int, range(first(raw_idx), last(raw_idx), length = n_frames))
+        else
+            collect(raw_idx)
+        end
+    else
+        n_steps = isnothing(n_frames) ? 24 : max(2, n_frames)
+        t_span = isnothing(time_seconds_range) ? (0.0, 86400.0) : time_seconds_range
+        collect(range(t_span[1], t_span[2], length = n_steps))
+    end
+    total_frames = length(frame_indices)
+
+    # 3. Observables for 4 panels
+    # Panel 1: Current Speed
+    spd_obs = Observable(Float64.(hydro_init.speed[:, :, k_sel] .* 100.0))
+    # Panel 2: Vorticity
+    vort_obs = Observable(Float64.(hydro_init.vorticity[:, :, k_sel] .* 100000.0))
+    # Panel 3: Temperature Section along section_lat
+    j_sec = argmin(abs.(lats .- Float64(section_lat)))
+    sec_init = zeros(Float64, nx, nz)
+    for i in 1:nx, k in 1:nz
+        sec_init[i, k] = depths[k] < hydro_init.bathymetry[i, j_sec] ? NaN : hydro_init.temperature[i, j_sec, k]
+    end
+    sec_obs = Observable(sec_init)
+    # Panel 4: Elevation SSH
+    elev_obs = Observable(Float64.(hydro_init.elevation .* 100.0))
+
+    # Header title
+    t_hr_init = round(hydro_init.time_seconds / 3600.0, digits = 1)
+    dash_header = isnothing(title) ?
+        "Hydrodynamic Flow & Larval Transport Dashboard | Depth: $(depth_m) m | Time: $(t_hr_init) h" :
+        "$(title) | Depth: $(depth_m) m | Time: $(t_hr_init) h"
+    hdr_obs = Observable(dash_header)
+
+    # Particle overlay
+    do_overlay = show_trajectories && !isnothing(trajectories) &&
+                 hasproperty(trajectories, :lons) && hasproperty(trajectories, :times)
+    p_x_obs = Observable(Float64[])
+    p_y_obs = Observable(Float64[])
+
+    if do_overlay
+        t_p0 = argmin(abs.(trajectories.times .- hydro_init.time_seconds))
+        mask0 = hasproperty(trajectories, :alive) ?
+            (trajectories.alive[:, t_p0] .== true) :
+            trues(size(trajectories.lons, 1))
+        p_x_obs[] = Float64.(trajectories.lons[mask0, t_p0])
+        p_y_obs[] = Float64.(trajectories.lats[mask0, t_p0])
+    end
+
+    # 4. Construct 4-Panel CairoMakie Figure
+    fig = Figure(size = (1520, 960), fontsize = 12)
+    Label(fig[1, 1:4], hdr_obs, fontsize = 17, font = :bold)
+
+    # Panel 1: Current Speed
+    ax1 = Axis(fig[2, 1], title = "Horizontal Current Speed |u_h| (cm s⁻¹)", xlabel = "Lon (°E)", ylabel = "Lat (°N)")
+    hm1 = heatmap!(ax1, lons, lats, spd_obs, colormap = :viridis)
+    Colorbar(fig[2, 2], hm1, label = "Speed (cm s⁻¹)")
+
+    if !isnothing(bathymetry_data) && hasproperty(bathymetry_data, :elevation)
+        try
+            contour!(
+                ax1, bathymetry_data.lon, bathymetry_data.lat, bathymetry_data.elevation,
+                levels = [-2000.0, -1000.0, -500.0, -200.0, -100.0, -50.0],
+                color = (:white, 0.45), linewidth = 0.9
+            )
+        catch
+        end
+    end
+
+    if do_overlay
+        scatter!(ax1, p_x_obs, p_y_obs, color = :gold, markersize = 7, strokecolor = :black, strokewidth = 0.6)
+    end
+
+    # Panel 2: Relative Vorticity
+    ax2 = Axis(fig[2, 3], title = "Vertical Relative Vorticity ζ (10⁻⁵ s⁻¹)", xlabel = "Lon (°E)", ylabel = "Lat (°N)")
+    hm2 = heatmap!(ax2, lons, lats, vort_obs, colormap = :balance)
+    Colorbar(fig[2, 4], hm2, label = "Vorticity ζ (10⁻⁵ s⁻¹)")
+
+    # Panel 3: Temperature Cross-Section along section_lat
+    ax3 = Axis(fig[3, 1], title = "Zonal Temperature Section T(x, z) at $(round(lats[j_sec], digits=2))°N", xlabel = "Lon (°E)", ylabel = "Depth (m)")
+    hm3 = heatmap!(ax3, lons, depths, sec_obs, colormap = :thermal)
+    Colorbar(fig[3, 2], hm3, label = "Temp (°C)")
+
+    # Panel 4: Sea Surface Elevation η
+    ax4 = Axis(fig[3, 3], title = "Sea Surface Elevation η (cm) [Tides & Setup]", xlabel = "Lon (°E)", ylabel = "Lat (°N)")
+    hm4 = heatmap!(ax4, lons, lats, elev_obs, colormap = :delta)
+    Colorbar(fig[3, 4], hm4, label = "Elevation (cm)")
+
+    # 5. Record animation frames
+    println("Recording 4-panel hydrodynamic dashboard ($(total_frames) frames @ $(framerate) fps)...")
+    try
+        record(fig, output_path, 1:total_frames; framerate = framerate) do frame_step
+            curr_hydro = if is_multi_snapshot
+                extract_hydrodynamic_dataset(
+                    hydrodynamics;
+                    depth = depth,
+                    depth_level = depth_level,
+                    time_index = frame_indices[frame_step],
+                    domain_lon = domain_lon,
+                    domain_lat = domain_lat
+                )
+            else
+                extract_hydrodynamic_dataset(
+                    hydrodynamics;
+                    depth = depth,
+                    depth_level = depth_level,
+                    time_seconds = frame_indices[frame_step],
+                    domain_lon = domain_lon,
+                    domain_lat = domain_lat
+                )
+            end
+
+            t_hr = round(curr_hydro.time_seconds / 3600.0, digits = 1)
+            hdr_obs[] = isnothing(title) ?
+                "Hydrodynamic Flow & Larval Transport Dashboard | Depth: $(depth_m) m | Time: $(t_hr) h" :
+                "$(title) | Depth: $(depth_m) m | Time: $(t_hr) h"
+
+            # Update Panel 1
+            spd_obs[] = Float64.(curr_hydro.speed[:, :, k_sel] .* 100.0)
+
+            # Update Panel 2
+            vort_obs[] = Float64.(curr_hydro.vorticity[:, :, k_sel] .* 100000.0)
+
+            # Update Panel 3
+            new_sec = zeros(Float64, nx, nz)
+            for i in 1:nx, k in 1:nz
+                new_sec[i, k] = depths[k] < curr_hydro.bathymetry[i, j_sec] ? NaN : curr_hydro.temperature[i, j_sec, k]
+            end
+            sec_obs[] = new_sec
+
+            # Update Panel 4
+            elev_obs[] = Float64.(curr_hydro.elevation .* 100.0)
+
+            # Update Particles
+            if do_overlay
+                t_p = argmin(abs.(trajectories.times .- curr_hydro.time_seconds))
+                a_mask = hasproperty(trajectories, :alive) ?
+                    (trajectories.alive[:, t_p] .== true) :
+                    trues(size(trajectories.lons, 1))
+                p_x_obs[] = Float64.(trajectories.lons[a_mask, t_p])
+                p_y_obs[] = Float64.(trajectories.lats[a_mask, t_p])
+            end
+        end
+        println("Successfully exported hydrodynamic dashboard to: $(output_path)")
+    catch err
+        @warn "Hydrodynamic dashboard recording failed: $(err)."
+    end
+
+    return output_path
+end
+
