@@ -125,7 +125,6 @@ DuckDB Analytical Storage & Model Averaging:
   --list-runs             Query and display all simulation runs archived in DuckDB.
   --compare-scenarios     Query and display multi-scenario comparison metrics.
   --model-average         Compute ensemble model-averaged connectivity and recruitment.
-  --export-parquet        Export all DuckDB tables to Apache Parquet files.
 
 Centralized Configuration:
   --config=<path>         Path to centralized .config file (default: inputs/ParticleTracking.config).
@@ -2545,18 +2544,6 @@ function main(args = ARGS)
 
     if "--model-average" in args || "--ensemble-average" in args
         run_cli_model_average(opts = opts)
-        return
-    end
-
-    if "--export-parquet" in args
-        if isfile(opts.duckdb_path)
-            db = open_duckdb_storage(opts.duckdb_path; read_only = true)
-            p_paths = export_duckdb_to_parquet(db, joinpath(opts.output_dir, "parquet"))
-            close_duckdb_storage(db)
-            println("Exported $(length(p_paths)) Parquet tables to: $(joinpath(opts.output_dir, "parquet"))")
-        else
-            println("No DuckDB database found at: $(opts.duckdb_path)")
-        end
         return
     end
 

@@ -46,8 +46,7 @@ julia --project=. ParticleTrackingRun.jl [OPTIONS...]
 |                         | `--db-path=<path>`                       | String          | `outputs/particle_tracking.duckdb` | Custom file path for the DuckDB analytical database.                                       |
 |                         | `--list-runs`                            | Flag            | —                                  | Query and print all archived simulation runs.                                              |
 |                         | `--compare-scenarios`                    | Flag            | —                                  | Query and print multi-scenario comparative analytics.                                      |
-|                         | `--model-average`                        | Flag            | —                                  | Compute ensemble model-averaged connectivity ($P_{ij} \pm \sigma$).                        |
-|                         | `--export-parquet`                       | Flag            | —                                  | Export all DuckDB tables to Apache Parquet format.                                         |
+|                         | `--model-average`                        | Flag            | —                                  | Compute Bayesian / ensemble model-averaged connectivity and recruitment.   |
 | **Configuration**       | `--config=<path>`                        | String          | `inputs/ParticleTracking.config`   | Load parameter settings from custom `.config` file.                                        |
 |                         | `--save-config[=<path>]`                 | String          | `inputs/ParticleTracking.config`   | Export active CLI options to `.config` file and exit.                                      |
 | **Species Calibration** | `--snowcrab-settings`                    | Flag            | —                                  | Load calibrated Snow Crab defaults (500 larvae, 60d PLD, ascent, 100x100x20, -3500m to 0m) |
@@ -147,10 +146,7 @@ julia --project=. ParticleTrackingRun.jl --compare-scenarios
 # 7. Compute ensemble model-averaged connectivity matrix (P_ij ± σ)
 julia --project=. ParticleTrackingRun.jl --model-average
 
-# 8. Export all DuckDB tables to Apache Parquet format
-julia --project=. ParticleTrackingRun.jl --export-parquet
-
-# 9. Modify parameters and export new configuration file
+# 8. Modify parameters and export new configuration file
 julia --project=. ParticleTrackingRun.jl --particles=1000 --min-depth=120.0 --save-config=inputs/deep_shelf.config
 ```
 
@@ -255,8 +251,6 @@ julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=outputs/p
 # Bayesian / ensemble model-averaged demographic connectivity (P_ij ± σ)
 julia --project=. ParticleTrackingRun.jl --model-average --db-path=outputs/particle_tracking.duckdb
 
-# Export all DuckDB tables to Apache Parquet for external Python / R / BSTM analysis
-julia --project=. ParticleTrackingRun.jl --export-parquet --db-path=outputs/particle_tracking.duckdb
 ```
 
 ---

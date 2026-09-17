@@ -1414,52 +1414,6 @@ function load_gridded_dispersal(
 end
 
 """
-    export_duckdb_to_parquet(
-        db::DuckDB.DB,
-        output_dir::AbstractString = joinpath("outputs", "parquet")
-    )::Vector{String}
-
-Export all relational tables from DuckDB into high-performance Apache Parquet
-files for seamless interoperability with Python, R, and BSTM modeling frameworks.
-
-# Inputs
-- `db::DuckDB.DB`: Active DuckDB connection.
-- `output_dir::AbstractString`: Destination directory for Parquet files.
-
-# Outputs
-- `Vector{String}`: File paths to the generated Parquet files.
-"""
-function export_duckdb_to_parquet(
-    db::DuckDB.DB,
-    output_dir::AbstractString = joinpath("outputs", "parquet")
-)::Vector{String}
-
-    mkpath(output_dir)
-    tables = [
-        "simulation_runs",
-        "particle_trajectories",
-        "recruitment_metrics",
-        "connectivity_transitions",
-        "gridded_dispersal_summary",
-        "hydrodynamic_fields"
-    ]
-    exported_paths = String[]
-
-    for tbl in tables
-        out_file = joinpath(output_dir, "$(tbl).parquet")
-        # DuckDB native COPY TO parquet
-        try
-            DBInterface.execute(db, "COPY $(tbl) TO '$(replace(out_file, "\\" => "/"))' (FORMAT PARQUET, COMPRESSION ZSTD);")
-            push!(exported_paths, out_file)
-        catch err
-            @warn "Failed to export table $(tbl) to Parquet: $(err)"
-        end
-    end
-
-    return exported_paths
-end
-
-"""
     load_run_configuration(db::DuckDB.DB, run_id::AbstractString)::Dict{String, Any}
 
 Extract and parse the archived TOML configuration dictionary associated with a simulation run.

@@ -104,9 +104,6 @@ julia --project=. ParticleTrackingRun.jl --compare-scenarios
 
 # Bayesian / ensemble model-averaged demographic connectivity (P_ij ± σ)
 julia --project=. ParticleTrackingRun.jl --model-average
-
-# Export DuckDB tables to Apache Parquet format
-julia --project=. ParticleTrackingRun.jl --export-parquet
 ```
 
 ---

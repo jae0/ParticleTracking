@@ -208,7 +208,6 @@ export
     load_connectivity_matrix,
     compare_scenarios,
     compute_ensemble_model_average,
-    export_duckdb_to_parquet,
 
     # Visualization, interactive maps & scenario comparison
     plot_particle_trajectories,

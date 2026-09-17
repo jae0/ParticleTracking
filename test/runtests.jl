@@ -742,14 +742,6 @@ using ParticleTracking
         @test occursin("layer-density", html_str)
         @test occursin("layer-hydro-advection", html_str)
 
-        # 12. Export DuckDB tables to Apache Parquet
-        parquet_dir = "outputs/test_parquet"
-        p_files = export_duckdb_to_parquet(db, parquet_dir)
-        @test length(p_files) >= 5
-        for pf in p_files
-            @test isfile(pf)
-        end
-
         # Clean up database connection
         close_duckdb_storage(db)
     end

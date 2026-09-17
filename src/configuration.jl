@@ -502,7 +502,6 @@ function get_default_configuration()::Dict{String, Any}
         "storage" => Dict{String, Any}(
             "enable_duckdb" => true,
             "duckdb_path" => "outputs/particle_tracking.duckdb",
-            "export_parquet" => false,
             "enable_checkpoint" => true,
             "checkpoint_prefix" => "checkpoint_ParticleTracking",
             "checkpoint_schedule_seconds" => 21600.0,
@@ -642,7 +641,6 @@ function get_snowcrab_configuration()::Dict{String, Any}
         "storage" => Dict{String, Any}(
             "enable_duckdb" => true,
             "duckdb_path" => "outputs/snowcrab_tracking.duckdb",
-            "export_parquet" => false,
             "enable_checkpoint" => true,
             "checkpoint_prefix" => "checkpoint_snowcrab",
             "checkpoint_schedule_seconds" => 21600.0,

@@ -40,7 +40,6 @@ Originally parameterized for the **Scotian Shelf snow crab (*Chionoecetes opilio
   5. Multi-Layer NetCDF / JLD2 / DuckDB Analytical Engine
      - Embedded Columnar DuckDB Database (Outputs/particle_tracking.duckdb)
      - Multi-Scenario Intercomparison & Bayesian / Ensemble Model Averaging
-     - Zero-Copy Apache Parquet Export (BSTM / R / Python Interoperability)
                                 │
                                 ▼
   6. Visualizations & Standalone Interactive Leaflet.js Dashboard
@@ -108,7 +107,7 @@ ParticleTracking/
 | [`src/larval_behavior.jl`](file:///c:/home/jae/projects/ParticleTracking/src/larval_behavior.jl)       | DVM swimming, BBL shear, sinking, drift, tracking             | `initialize_larval_particles`, `larval_ascent_velocity`, `diel_vertical_migration_velocity`, `superpose_tidal_velocity`, `bbl_velocity_factor`, `larval_passive_sinking_velocity`, `update_larval_stage`, `evaluate_settlement_suitability`, `larval_transport_step`, `track_larval_cohort`, `canonicalize_trajectories`                  |
 | [`src/empirical_analysis.jl`](file:///c:/home/jae/projects/ParticleTracking/src/empirical_analysis.jl) | Taylor dispersion, CFA polygons, recruitment connectivity     | `estimate_empirical_movement`, `compute_gridded_recruitment_metrics`, `compute_gridded_thermal_metrics`, `point_in_polygon`, `load_cfa_polygons`, `compute_empirical_connectivity`, `connectivity_transitions`, `export_larval_dispersal_netcdf`, `export_larval_dispersal_jld2`                                     |
 | [`src/voronoi_tessellation.jl`](file:///c:/home/jae/projects/ParticleTracking/src/voronoi_tessellation.jl) | Depth-stratified Voronoi areal units & demographic matrices | `VoronoiUnit`, `VoronoiTessellation`, `generate_depth_stratified_voronoi_units`, `find_voronoi_cell`, `find_voronoi_cells`, `compute_tesselated_connectivity_matrix`                                                                                                                                                      |
-| [`src/storage_duckdb.jl`](file:///c:/home/jae/projects/ParticleTracking/src/storage_duckdb.jl)         | DuckDB analytical backend & ensemble averaging                | `open_duckdb_storage`, `close_duckdb_storage`, `save_simulation_run!`, `load_run_configuration`, `list_simulation_runs`, `load_trajectories_df`, `load_connectivity_matrix`, `compare_scenarios`, `compute_ensemble_model_average`, `export_duckdb_to_parquet`                                                            |
+| [`src/storage_duckdb.jl`](file:///c:/home/jae/projects/ParticleTracking/src/storage_duckdb.jl)         | DuckDB analytical backend & ensemble averaging                | `open_duckdb_storage`, `close_duckdb_storage`, `save_simulation_run!`, `load_run_configuration`, `list_simulation_runs`, `load_trajectories_df`, `load_connectivity_matrix`, `compare_scenarios`, `compute_ensemble_model_average`                                                                                         |
 | [`src/visualization.jl`](file:///c:/home/jae/projects/ParticleTracking/src/visualization.jl)           | CairoMakie figures & interactive Leaflet HTML dashboard       | `plot_particle_trajectories`, `plot_dvm_depth_profiles`, `plot_larval_dispersal_density`, `plot_empirical_movement_field`, `plot_connectivity_matrix`, `plot_thermal_exposure_map`, `plot_recruitment_summary`, `plot_climate_scenario_comparison`, `export_interactive_tracks_html`, `plot_interactive_trajectories_map` |
 
 ---
@@ -404,7 +403,6 @@ settlement_max_temp = 6.0           # Maximum benthic temperature for settlement
 [storage]
 enable_duckdb = true                # Persist all simulation runs into DuckDB
 duckdb_path = "outputs/particle_tracking.duckdb" # DuckDB file path
-export_parquet = false              # Zero-copy export to Apache Parquet
 
 [hardware]
 use_gpu = false                     # NVIDIA CUDA GPU hardware acceleration
@@ -936,9 +934,6 @@ ens = compute_ensemble_model_average(
 println("Ensemble mean connectivity matrix: ", ens.mean_connectivity)
 println("Ensemble connectivity uncertainty (std): ", ens.std_connectivity)
 
-# 6. Export to Apache Parquet
-export_duckdb_to_parquet(db, "outputs/parquet")
-
 close_duckdb_storage(db)
 ```
 
@@ -963,7 +958,7 @@ configuration file at [`inputs/ParticleTracking.config`](file:///c:/home/jae/pro
 - `[dvm]`: Stage-specific Diel Vertical Migration daytime/nighttime target depths and swimming speeds.
 - `[molting_and_settlement]`: Degree-day thresholds ($150, 310, 510\text{ DD}$), thermal mortality
   parameters, and benthic nursery suitability windows ($-250\text{ m} \le z \le -50\text{ m}$, $T \le 6^\circ\text{C}$).
-- `[storage]`: DuckDB analytical database persistence and Parquet export.
+- `[storage]`: DuckDB analytical database persistence and checkpointing.
 - `[hardware]`: NVIDIA CUDA GPU hardware acceleration and automatic CPU fallback.
 - `[visualization]`: Interactive HTML5 Leaflet map export and dashboard options.
 - `[paths]`: File system directories (`inputs`, `outputs`) and pseudorandom seed.
@@ -1040,7 +1035,7 @@ differential equations for discrete individuals):
 │    save_simulation_run!(db, "cohort_spring_benthic", opts; ...)             │
 │    save_simulation_run!(db, "cohort_peak_ascent15", opts; ...)              │
 │    save_simulation_run!(db, "cohort_late_surface", opts; ...)               │
-│    Tagged metadata, SQL cohort filtering, scenario comparison & Parquet     │
+│    Tagged metadata, SQL cohort filtering, scenario comparison & analytics   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1294,9 +1289,6 @@ display(round.(ens.mean_connectivity, digits = 3))
 println("\nEnsemble Uncertainty (Standard Deviation):")
 display(round.(ens.std_connectivity, digits = 3))
 
-# Export database tables to Apache Parquet for downstream analysis
-export_duckdb_to_parquet(db, "outputs/parquet_cohorts")
-
 close_duckdb_storage(db)
 println("\nMulti-cohort batching and analysis complete.")
 ```
@@ -1375,8 +1367,6 @@ julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=outputs/p
 # Compute weighted ensemble model average
 julia --project=. ParticleTrackingRun.jl --model-average --db-path=outputs/particle_tracking.duckdb
 
-# Export all tables to Apache Parquet for external Python / R / BSTM analysis
-julia --project=. ParticleTrackingRun.jl --export-parquet --db-path=outputs/particle_tracking.duckdb
 ```
 
 ---
