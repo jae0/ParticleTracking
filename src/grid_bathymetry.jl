@@ -89,7 +89,8 @@ function build_shelf_grid(;
         longitude = lon_range,
         latitude = lat_range,
         z = z_specification,
-        topology = topology
+        topology = topology,
+        halo = (4, 4, 4)
     )
     return grid
 end

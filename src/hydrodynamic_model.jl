@@ -155,9 +155,12 @@ is the Coriolis parameter, \$b = -g (\\rho - \\rho_0)/\\rho_0\$ is buoyancy,
 - `cd_drag::Real`: Quadratic bottom drag coefficient (default \$10^{-3}\$).
 - `ν::Real`: Kinematic eddy viscosity (\$m^2 s^{-1}\$).
 - `κ::Real`: Tracer eddy diffusivity (\$m^2 s^{-1}\$).
-- `closure`: Optional custom turbulence closure (e.g. `RiBasedVerticalDiffusivity()`).
+- `closure`: Optional custom turbulence closure. Defaults to `SmagorinskyLilly()` if none provided.
 - `tracers::Tuple`: Active tracer fields (default `(:T, :S)`).
 - `free_surface`: Free surface representation (default `ImplicitFreeSurface()`).
+
+Note: Momentum and tracer advection are explicitly configured to use 5th-order `WENO()` 
+schemes to suppress grid-scale numerical noise over complex bathymetry.
 
 # Outputs
 - `HydrostaticFreeSurfaceModel`: Configured Oceananigans model instance.
@@ -254,7 +257,7 @@ function build_hydrodynamic_model(
 
     coriolis = FPlane(latitude = coriolis_latitude)
     buoyancy = SeawaterBuoyancy()
-    active_closure = isnothing(closure) ? ScalarDiffusivity(ν = ν, κ = κ) : closure
+    active_closure = isnothing(closure) ? SmagorinskyLilly() : closure
 
     # Momentum forcing: GPU uses bitstype continuous forcing; CPU supports drag closures
     arch = architecture(grid)
@@ -329,7 +332,9 @@ function build_hydrodynamic_model(
         :boundary_conditions => NamedTuple(boundary_conditions),
         :forcing => momentum_forcing,
         :closure => active_closure,
-        :free_surface => free_surface
+        :free_surface => free_surface,
+        :momentum_advection => WENO(),
+        :tracer_advection => WENO()
     )
 
     model = HydrostaticFreeSurfaceModel(grid; model_kwargs...)

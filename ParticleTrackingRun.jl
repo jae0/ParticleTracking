@@ -325,59 +325,75 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
     wind_file  = joinpath(opts.input_dir, "wind_active.nc")
 
     if opts.data_mode == :real
-        println("Retrieving real bathymetry from NOAA ERDDAP (etopo180)...")
-        try
-            fetch_open_bathymetry(
-                lon_range = opts.domain_lon, 
-                lat_range = opts.domain_lat, 
-                output_path = bathy_file
-            )
-        catch err
-            @warn "Primary NOAA ERDDAP bathymetry download failed: $(err). Trying alternate mirror..."
+        if !isfile(bathy_file)
+            println("Retrieving real bathymetry from NOAA ERDDAP (etopo180)...")
             try
-                # Secondary backup endpoint for topography
-                backup_bathy_url = "https://www.ncei.noaa.gov/erddap/griddap/etopo190.nc?altitude[($(opts.domain_lat[1])):(($(opts.domain_lat[2]))][($(opts.domain_lon[1])):(($(opts.domain_lon[2]))]"
-                Downloads.download(backup_bathy_url, bathy_file)
-            catch backup_err
-                @warn "All live bathymetry sources failed. Falling back to synthetic topography."
-                generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
+                fetch_open_bathymetry(
+                    lon_range = opts.domain_lon, 
+                    lat_range = opts.domain_lat, 
+                    output_path = bathy_file
+                )
+            catch err
+                @warn "Primary NOAA ERDDAP bathymetry download failed: $(err). Trying alternate mirror..."
+                try
+                    # Secondary backup endpoint for topography
+                    backup_bathy_url = "https://www.ncei.noaa.gov/erddap/griddap/etopo190.nc?altitude[($(opts.domain_lat[1])):(($(opts.domain_lat[2]))][($(opts.domain_lon[1])):(($(opts.domain_lon[2]))]"
+                    Downloads.download(backup_bathy_url, bathy_file)
+                catch backup_err
+                    @warn "All live bathymetry sources failed. Falling back to synthetic topography."
+                    generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
+                end
             end
+        else
+            println("Using existing real bathymetry file: $bathy_file")
         end
 
-        println("Retrieving real surface winds from NOAA ERDDAP / NCEP Reanalysis...")
-        try
-            fetch_open_surface_winds(
-                lon_range = opts.domain_lon, 
-                lat_range = opts.domain_lat, 
-                time_iso = "2023-06-01T00:00:00Z", 
-                output_path = wind_file
-            )
-        catch err
-            @warn "NOAA CoastWatch wind server timed out: $(err). Trying NCEP/NCAR reanalysis fallback..."
+        if !isfile(wind_file)
+            println("Retrieving real surface winds from NOAA ERDDAP / NCEP Reanalysis...")
             try
-                # Alternative reanalysis wind endpoint
-                backup_wind_url = "https://psl.noaa.gov/thredds/fileServer/Datasets/ncep.reanalysis/surface/uwnd.10m.gauss.2023.nc"
-                Downloads.download(backup_wind_url, wind_file)
-            catch backup_err
-                @warn "Live wind servers unreachable. Falling back to synthetic wind forcing."
-                generate_synthetic_forcing(wind_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
+                fetch_open_surface_winds(
+                    lon_range = opts.domain_lon, 
+                    lat_range = opts.domain_lat, 
+                    time_iso = "2023-06-01T00:00:00Z", 
+                    output_path = wind_file
+                )
+            catch err
+                @warn "NOAA CoastWatch wind server timed out: $(err). Trying NCEP/NCAR reanalysis fallback..."
+                try
+                    # Alternative reanalysis wind endpoint
+                    backup_wind_url = "https://psl.noaa.gov/thredds/fileServer/Datasets/ncep.reanalysis/surface/uwnd.10m.gauss.2023.nc"
+                    Downloads.download(backup_wind_url, wind_file)
+                catch backup_err
+                    @warn "Live wind servers unreachable. Falling back to synthetic wind forcing."
+                    generate_synthetic_forcing(wind_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
+                end
             end
+        else
+            println("Using existing real surface winds file: $wind_file")
         end
     else
-        println("Generating synthetic Scotian Shelf bathymetry...")
-        generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2], inshore_depth = -100.0, shelf_slope = 600.0 )
-        println("Generating synthetic surface wind forcing...")
-        generate_synthetic_forcing(
-            wind_file,
-            lon_range = opts.domain_lon,
-            lat_range = opts.domain_lat,
-            time_range = (0.0, opts.sim_duration),
-            n_lon = opts.grid_size[1],
-            n_lat = opts.grid_size[2],
-            n_time = 24,
-            tau_x_amplitude = 1e-4,
-            tau_y_amplitude = 2e-5
-        )
+        if !isfile(bathy_file)
+            println("Generating synthetic Scotian Shelf bathymetry...")
+            generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2], inshore_depth = -100.0, shelf_slope = 600.0 )
+        else
+            println("Using existing synthetic bathymetry file: $bathy_file")
+        end
+        if !isfile(wind_file)
+            println("Generating synthetic surface wind forcing...")
+            generate_synthetic_forcing(
+                wind_file,
+                lon_range = opts.domain_lon,
+                lat_range = opts.domain_lat,
+                time_range = (0.0, opts.sim_duration),
+                n_lon = opts.grid_size[1],
+                n_lat = opts.grid_size[2],
+                n_time = 24,
+                tau_x_amplitude = 1e-4,
+                tau_y_amplitude = 2e-5
+            )
+        else
+            println("Using existing synthetic surface wind file: $wind_file")
+        end
     end
 
     bathy_info = inspect_netcdf(bathy_file, verbose = true)
@@ -1790,7 +1806,34 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
         println("\n=================================================================")
         println(" Hydrodynamics-only execution complete in $(t_elapsed) s (--hydro-only specified).")
         println(" Flow solution saved to: $(isnothing(sim_res) ? opts.hydro_model_file : sim_res.jld2_output_path)")
-        println(" Skipping larval particle tracking, metrics, and visualization.")
+        println(" Skipping larval particle tracking and metrics.")
+        
+        viz_res = nothing
+        if opts.animate_hydro
+            println(" Generating requested hydrodynamic animations...")
+            hydro_source = isnothing(sim_res) ? opts.hydro_model_file : sim_res.jld2_output_path
+            target_bathy_path = joinpath(opts.input_dir, "bathymetry_active.nc")
+            bathy_data = isfile(target_bathy_path) ? load_bathymetry_from_netcdf(target_bathy_path) : nothing
+            anim_file_path = joinpath(opts.output_dir, "hydrodynamic_$(opts.anim_variable)_animation.$(opts.anim_format)")
+            
+            try
+                animate_hydrodynamic_dashboard(
+                    hydro_source;
+                    depth = opts.anim_depth,
+                    trajectories = nothing,
+                    bathymetry_data = bathy_data,
+                    output_path = anim_file_path,
+                    framerate = opts.anim_fps,
+                    show_trajectories = false,
+                    domain_lon = opts.domain_lon,
+                    domain_lat = opts.domain_lat
+                )
+                viz_res = (animation = anim_file_path,)
+            catch e
+                @warn "Hydrodynamic animation generation failed: $e"
+            end
+        end
+
         if opts.enable_duckdb
             close_all_duckdb_storage!()
         end
@@ -1803,7 +1846,7 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
             simulation = sim_res,
             tracking = nothing,
             metrics = nothing,
-            visualizations = nothing,
+            visualizations = viz_res,
             elapsed_seconds = t_elapsed
         )
     end

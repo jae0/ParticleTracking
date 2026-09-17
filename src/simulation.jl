@@ -513,7 +513,7 @@ multistage schemes subject to the CFL condition:
 - `adaptive_time_step::Bool`: Whether to dynamically scale `Δt` based on CFL.
 - `target_cfl::Real`: Target CFL number when `adaptive_time_step` is enabled.
 - `max_Δt::Real`: Maximum allowed time step in seconds.
-- `min_Δt::Real`: Minimum allowed time step before raising divergence error.
+- `min_Δt::Real`: Minimum allowed time step in seconds (default `0.1`). If the wizard attempts to scale below this floor to preserve CFL, it implies spatial divergence.
 - `progress_schedule::Union{Real, Int}`: Logging frequency (iterations or seconds).
 - `enable_output::Bool`: Whether to attach a JLD2 timeseries output writer.
 - `output_dir::AbstractString`: Directory where outputs will be saved.
@@ -548,7 +548,7 @@ function setup_hydrodynamic_simulation(
     adaptive_time_step::Bool = false,
     target_cfl::Real = 0.2,
     max_Δt::Real = 5minutes,
-    min_Δt::Real = 10.0,
+    min_Δt::Real = 0.1,
     progress_schedule::Union{Real, Int} = 20,
     enable_output::Bool = true,
     output_dir::AbstractString = "outputs",

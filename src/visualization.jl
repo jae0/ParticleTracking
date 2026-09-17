@@ -1218,12 +1218,31 @@ function extract_hydrodynamic_dataset(
             z = t_depths[k]
             depth_factor = exp(z / 75.0)
 
-            # Alongshore Scotian Current Jet with tidal modulation
+            # Scotian Shelf coast bearing ~45° (SW-NE).  The Nova Scotia
+            # Current flows southwestward, so along-coast unit vector is
+            # (cos 225°, sin 225°) = (-√2/2, -√2/2) in (u_E, v_N).
+            # coast_angle = 45° ⟹ cos_α = sin_α = √2/2 ≈ 0.7071
+            cos_α = 0.7071
+            sin_α = 0.7071
+
             jet_core = exp(-((dist_to_coast - 0.4)^2) / 0.18)
-            u_base = -0.09 * depth_factor * (0.6 + 0.8 * jet_core) + 0.02 * sin(2.0 * π * y_norm) +
-                     0.06 * tide_phase * sin(π * y_norm)
-            v_base = -0.04 * depth_factor * (0.5 + 0.7 * jet_core) + 0.015 * cos(2.0 * π * x_norm) +
-                     0.04 * sin(omega_m2 * t_sec) * cos(π * x_norm)
+
+            # Jet speed along coast and weak cross-shelf return flow
+            V_along = 0.11 * depth_factor * (0.6 + 0.8 * jet_core)
+            V_cross = 0.02 * depth_factor * (0.15 * jet_core)
+
+            # Tidal barotropic oscillation (predominantly cross-shelf on
+            # Scotian Shelf — 90° to coast bearing)
+            u_tide = 0.06 * tide_phase * cos_α +
+                     0.04 * sin(omega_m2 * t_sec) * (-sin_α)
+            v_tide = 0.06 * tide_phase * sin_α +
+                     0.04 * sin(omega_m2 * t_sec) *   cos_α
+
+            # Along-coast = SW ⟹ negative along both x and y
+            u_base = -V_along * cos_α + V_cross * sin_α +
+                     0.015 * sin(2.0 * π * y_norm) + u_tide
+            v_base = -V_along * sin_α - V_cross * cos_α +
+                     0.010 * cos(2.0 * π * x_norm) + v_tide
 
             u_mat[i, j, k] = u_base
             v_mat[i, j, k] = v_base
@@ -4367,10 +4386,10 @@ function animate_hydrodynamic_dashboard(
     total_frames = length(frame_indices)
 
     # 3. Observables for 4 panels
-    # Panel 1: Current Speed
+    # Panel 1: Current Speed (3-D field sliced to selected depth)
     spd_obs = Observable(Float64.(hydro_init.speed[:, :, k_sel] .* 100.0))
-    # Panel 2: Vorticity
-    vort_obs = Observable(Float64.(hydro_init.vorticity[:, :, k_sel] .* 100000.0))
+    # Panel 2: Vorticity (2-D surface field, computed at level 1)
+    vort_obs = Observable(Float64.(hydro_init.vorticity[:, :] .* 100000.0))
     # Panel 3: Temperature Section along section_lat
     j_sec = argmin(abs.(lats .- Float64(section_lat)))
     sec_init = zeros(Float64, nx, nz)
@@ -4396,8 +4415,9 @@ function animate_hydrodynamic_dashboard(
 
     if do_overlay
         t_p0 = argmin(abs.(trajectories.times .- hydro_init.time_seconds))
+        # alive is Vector{Bool} (per-particle), not a matrix
         mask0 = hasproperty(trajectories, :alive) ?
-            (trajectories.alive[:, t_p0] .== true) :
+            (trajectories.alive .== true) :
             trues(size(trajectories.lons, 1))
         p_x_obs[] = Float64.(trajectories.lons[mask0, t_p0])
         p_y_obs[] = Float64.(trajectories.lats[mask0, t_p0])
@@ -4474,8 +4494,8 @@ function animate_hydrodynamic_dashboard(
             # Update Panel 1
             spd_obs[] = Float64.(curr_hydro.speed[:, :, k_sel] .* 100.0)
 
-            # Update Panel 2
-            vort_obs[] = Float64.(curr_hydro.vorticity[:, :, k_sel] .* 100000.0)
+            # Update Panel 2 — vorticity is 2-D (nx, ny), no depth index
+            vort_obs[] = Float64.(curr_hydro.vorticity[:, :] .* 100000.0)
 
             # Update Panel 3
             new_sec = zeros(Float64, nx, nz)
@@ -4487,11 +4507,11 @@ function animate_hydrodynamic_dashboard(
             # Update Panel 4
             elev_obs[] = Float64.(curr_hydro.elevation .* 100.0)
 
-            # Update Particles
+            # Update Particles — alive is Vector{Bool}, not a matrix
             if do_overlay
                 t_p = argmin(abs.(trajectories.times .- curr_hydro.time_seconds))
                 a_mask = hasproperty(trajectories, :alive) ?
-                    (trajectories.alive[:, t_p] .== true) :
+                    (trajectories.alive .== true) :
                     trues(size(trajectories.lons, 1))
                 p_x_obs[] = Float64.(trajectories.lons[a_mask, t_p])
                 p_y_obs[] = Float64.(trajectories.lats[a_mask, t_p])
