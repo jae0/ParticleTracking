@@ -466,7 +466,11 @@ function run_segment_grid(;
     )
 
     println("Constructing immersed boundary with 2D bilinear regridding...")
-    immersed_grid = build_immersed_grid_from_real_data(base_grid, target_bathy)
+    immersed_grid = build_immersed_grid_from_real_data(
+        base_grid,
+        target_bathy,
+        min_water_depth = opts.min_seabed_depth
+    )
 
     println("Grid summary:")
     println("  Longitude: $(opts.domain_lon[1])°E to $(opts.domain_lon[2])°E (Nx=$(opts.grid_size[1]))")
@@ -591,8 +595,10 @@ function run_segment_model(;
             source = opts.ocean_boundary_source,
             scenario = opts.scenario
         )
+        # Initialize T and S from hydrographic reanalysis, but spin up velocities
+        # from rest (u=0, v=0) to respect discrete immersed boundary kinematics
         set!(model, T = ocean_state.temperature, S = ocean_state.salinity,
-             u = ocean_state.u, v = ocean_state.v)
+             u = 0.0, v = 0.0)
     else
         println("Applying baseline thermal stratification (T_surf=15°C, dT/dz=0.01°C/m)...")
         set_initial_stratification!(
@@ -769,6 +775,7 @@ function run_segment_simulation(;
         stop_time = opts.sim_duration,
         adaptive_time_step = opts.adaptive_cfl,
         target_cfl = opts.target_cfl,
+        max_Δt = min(30.0, 3.0 * opts.sim_dt),
         output_dir = out_dir_target,
         output_filename = jld2_filename,
         output_schedule = 50,

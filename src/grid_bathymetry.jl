@@ -1143,6 +1143,7 @@ immersed boundary.
 - `varname::Union{Nothing, String}`: Elevation variable name (auto-detects if nothing).
 - `lon_var::Union{Nothing, String}`: Longitude variable name (auto-detects if nothing).
 - `lat_var::Union{Nothing, String}`: Latitude variable name (auto-detects if nothing).
+- `min_water_depth::Real`: Minimum depth floor in meters for wet coastal water columns (default 10.0m).
 
 # Outputs
 - `ImmersedBoundaryGrid`: Computational grid containing the interpolated real seafloor.
@@ -1158,7 +1159,8 @@ function build_immersed_grid_from_real_data(
     bathymetry_filepath::AbstractString;
     varname::Union{Nothing, AbstractString} = nothing,
     lon_var::Union{Nothing, AbstractString} = nothing,
-    lat_var::Union{Nothing, AbstractString} = nothing
+    lat_var::Union{Nothing, AbstractString} = nothing,
+    min_water_depth::Real = 10.0
 )
     if !isfile(bathymetry_filepath)
         error("Real bathymetry file not found: $(bathymetry_filepath)")
@@ -1232,7 +1234,20 @@ function build_immersed_grid_from_real_data(
     regridded_topo = regrid_2d_field(raw_lon, raw_lat, raw_elevation,
                                      target_lons, target_lats)
 
-    return build_immersed_grid(grid, regridded_topo)
+    # Condition bathymetry: level emerged land to 0.0 and floor shallow wet cells
+    # to prevent barotropic tidal acceleration singularities in ultra-shallow cells
+    h_floor = Float64(min_water_depth)
+    conditioned_topo = map(regridded_topo) do z
+        if z >= 0.0
+            0.0
+        elseif z > -h_floor
+            -h_floor
+        else
+            z
+        end
+    end
+
+    return build_immersed_grid(grid, conditioned_topo)
 end
 
 """

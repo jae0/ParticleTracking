@@ -23,7 +23,8 @@ struct ZeroForcing end
     HorizontalMomentumForcingU{TF}
 
 Bitstype callable struct for zonal momentum forcing on GPU/CPU without field dependencies.
-Combines harmonic tidal body forcing and lateral open boundary sponge relaxation.
+Combines depth-tapered harmonic tidal body forcing, lateral sponge relaxation,
+and Patankar-type quasi-implicit quadratic bottom drag.
 """
 struct HorizontalMomentumForcingU{TF}
     tidal          :: TF
@@ -41,7 +42,13 @@ struct HorizontalMomentumForcingU{TF}
 end
 
 @inline function (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
-    tide_val = m.tidal(x, y, z, t)
+    # Coastal depth tapering: smoothly attenuate uniform body forcing in shallow
+    # coastal margins (z > -50 m) to prevent artificial barotropic surface slope
+    # singularities against vertical immersed boundaries
+    depth_m = max(0.0, -Float64(z))
+    taper = clamp(depth_m / 50.0, 0.0, 1.0)
+    tide_val = taper * m.tidal(x, y, z, t)
+
     sponge_val = 0.0
     if m.has_sponge && x > m.sponge_bound
         gamma = clamp((x - m.sponge_bound) / m.sponge_width, 0.0, 1.0)
@@ -50,6 +57,7 @@ end
                    0.12 * sin(m.omega_M2 * t_eff) + 0.05 * sin(m.omega_S2 * t_eff)
         sponge_val = -gamma * (u - u_target) / m.sponge_tau
     end
+
     speed = sqrt(u^2 + v^2)
     tau_ref = 120.0
     drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
@@ -65,7 +73,8 @@ end
     HorizontalMomentumForcingV{TF}
 
 Bitstype callable struct for meridional momentum forcing on GPU/CPU with field dependencies.
-Combines harmonic tidal body forcing, lateral sponge relaxation, and quadratic bottom drag.
+Combines depth-tapered harmonic tidal body forcing, lateral sponge relaxation,
+and Patankar-type quasi-implicit quadratic bottom drag.
 """
 struct HorizontalMomentumForcingV{TF}
     tidal          :: TF
@@ -83,7 +92,10 @@ struct HorizontalMomentumForcingV{TF}
 end
 
 @inline function (m::HorizontalMomentumForcingV)(x, y, z, t, u, v)
-    tide_val = m.tidal(x, y, z, t)
+    depth_m = max(0.0, -Float64(z))
+    taper = clamp(depth_m / 50.0, 0.0, 1.0)
+    tide_val = taper * m.tidal(x, y, z, t)
+
     sponge_val = 0.0
     if m.has_sponge && y < m.sponge_bound
         gamma = clamp((m.sponge_bound - y) / m.sponge_width, 0.0, 1.0)
@@ -92,6 +104,7 @@ end
                    0.06 * cos(m.omega_M2 * t_eff)
         sponge_val = -gamma * (v - v_target) / m.sponge_tau
     end
+
     speed = sqrt(u^2 + v^2)
     tau_ref = 120.0
     drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
@@ -288,7 +301,10 @@ function build_hydrodynamic_model(
          v = Forcing(fv_gpu, field_dependencies = (:u, :v)))
     else
         total_Fu(x, y, z, t, u, v) = begin
-            tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.u(x, y, z, t)
+            raw_tide = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.u(x, y, z, t)
+            depth_m = max(0.0, -Float64(z))
+            taper = clamp(depth_m / 50.0, 0.0, 1.0)
+            tide_val = taper * raw_tide
             speed = sqrt(u^2 + v^2)
             # Patankar-type quasi-implicit limiter (tau_ref = 120s) prevents numerical
             # sign reversal and runaway during explicit Adams-Bashforth time stepping
@@ -305,7 +321,10 @@ function build_hydrodynamic_model(
         end
 
         total_Fv(x, y, z, t, u, v) = begin
-            tide_val = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.v(x, y, z, t)
+            raw_tide = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.v(x, y, z, t)
+            depth_m = max(0.0, -Float64(z))
+            taper = clamp(depth_m / 50.0, 0.0, 1.0)
+            tide_val = taper * raw_tide
             speed = sqrt(u^2 + v^2)
             tau_ref = 120.0
             drag_coeff = (bottom_drag + cd_drag * speed) /
