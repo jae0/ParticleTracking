@@ -476,7 +476,7 @@ end
         stop_time::Real = 12hours,
         adaptive_time_step::Bool = false,
         target_cfl::Real = 0.2,
-        max_Δt::Real = 5minutes,
+        max_Δt::Real = 12.0,
         min_Δt::Real = 10.0,
         progress_schedule::Union{Real, Int} = 20,
         enable_output::Bool = true,
@@ -512,7 +512,8 @@ multistage schemes subject to the CFL condition:
 - `stop_time::Real`: Simulation duration in seconds (default 12 hours).
 - `adaptive_time_step::Bool`: Whether to dynamically scale `Δt` based on CFL.
 - `target_cfl::Real`: Target CFL number when `adaptive_time_step` is enabled.
-- `max_Δt::Real`: Maximum allowed time step in seconds.
+- `max_Δt::Real`: Maximum allowed time step in seconds (default `12.0` to ensure
+  high-order WENO stability across immersed step bathymetry).
 - `min_Δt::Real`: Minimum allowed time step in seconds (default `0.1`). If the wizard attempts to scale below this floor to preserve CFL, it implies spatial divergence.
 - `progress_schedule::Union{Real, Int}`: Logging frequency (iterations or seconds).
 - `enable_output::Bool`: Whether to attach a JLD2 timeseries output writer.
@@ -547,7 +548,7 @@ function setup_hydrodynamic_simulation(
     stop_time::Real = 12hours,
     adaptive_time_step::Bool = false,
     target_cfl::Real = 0.2,
-    max_Δt::Real = 5minutes,
+    max_Δt::Real = 12.0,
     min_Δt::Real = 0.1,
     progress_schedule::Union{Real, Int} = 20,
     enable_output::Bool = true,
@@ -910,9 +911,6 @@ function create_flow_interpolator_from_jld2(
         end
 
         # Extract grid coordinate vectors from stored metadata or infer from sample
-        sample_u = file["timeseries/u/$(first(sorted_keys))"]
-        nx, ny, nz = size(sample_u)
-
         grid_obj = if haskey(file, "grid")
             file["grid"]
         elseif haskey(file, "serialized/grid")
@@ -921,85 +919,144 @@ function create_flow_interpolator_from_jld2(
             nothing
         end
 
-        extract_coords(obj, n) = try
-            raw = if hasproperty(obj, :parent)
+        ug = if !isnothing(grid_obj)
+            hasproperty(grid_obj, :underlying_grid) ? grid_obj.underlying_grid :
+                (hasproperty(grid_obj, :grid) ? grid_obj.grid : grid_obj)
+        else
+            nothing
+        end
+
+        sample_u = file["timeseries/u/$(first(sorted_keys))"]
+        Nx = (!isnothing(ug) && hasproperty(ug, :Nx)) ? Int(ug.Nx) : size(sample_u, 1)
+        Ny = (!isnothing(ug) && hasproperty(ug, :Ny)) ? Int(ug.Ny) : size(sample_u, 2)
+        Nz = (!isnothing(ug) && hasproperty(ug, :Nz)) ? Int(ug.Nz) : size(sample_u, 3)
+
+        Hx = (!isnothing(ug) && hasproperty(ug, :Hx)) ? Int(ug.Hx) : 0
+        Hy = (!isnothing(ug) && hasproperty(ug, :Hy)) ? Int(ug.Hy) : 0
+        Hz = (!isnothing(ug) && hasproperty(ug, :Hz)) ? Int(ug.Hz) : 0
+
+        i_c = (1 + Hx):(Nx + Hx)
+        j_c = (1 + Hy):(Ny + Hy)
+        k_c = (1 + Hz):(Nz + Hz)
+
+        extract_coords(obj) = try
+            if hasproperty(obj, :parent)
                 collect(Float64, obj.parent)
             else
                 collect(Float64, obj)
-            end
-            if length(raw) >= n
-                raw[1:n]
-            else
-                collect(range(first(raw), last(raw), length = n))
             end
         catch
             nothing
         end
 
-        lons_vec = if !isnothing(grid_obj) && hasproperty(grid_obj, :λᶜᵃᵃ)
-            something(extract_coords(grid_obj.λᶜᵃᵃ, nx), collect(range(-68.0, -57.0, length = nx)))
-        elseif !isnothing(grid_obj) && hasproperty(grid_obj, :xᶜᵃᵃ)
-            something(extract_coords(grid_obj.xᶜᵃᵃ, nx), collect(range(-68.0, -57.0, length = nx)))
+        lon_raw = if !isnothing(ug) && hasproperty(ug, :λᶜᵃᵃ)
+            something(extract_coords(ug.λᶜᵃᵃ), collect(range(-68.0, -57.0, length = Nx)))
+        elseif !isnothing(ug) && hasproperty(ug, :xᶜᵃᵃ)
+            something(extract_coords(ug.xᶜᵃᵃ), collect(range(-68.0, -57.0, length = Nx)))
         else
-            collect(range(-68.0, -57.0, length = nx))
+            collect(range(-68.0, -57.0, length = Nx))
         end
+        lons_vec = length(lon_raw) >= (Nx + 2 * Hx) ? lon_raw[i_c] :
+                   (length(lon_raw) >= Nx ? lon_raw[1:Nx] :
+                    collect(range(first(lon_raw), last(lon_raw), length = Nx)))
 
-        lats_vec = if !isnothing(grid_obj) && hasproperty(grid_obj, :φᵃᶜᵃ)
-            something(extract_coords(grid_obj.φᵃᶜᵃ, ny), collect(range(42.0, 47.0, length = ny)))
-        elseif !isnothing(grid_obj) && hasproperty(grid_obj, :yᵃᶜᵃ)
-            something(extract_coords(grid_obj.yᵃᶜᵃ, ny), collect(range(42.0, 47.0, length = ny)))
+        lat_raw = if !isnothing(ug) && hasproperty(ug, :φᵃᶜᵃ)
+            something(extract_coords(ug.φᵃᶜᵃ), collect(range(42.0, 47.0, length = Ny)))
+        elseif !isnothing(ug) && hasproperty(ug, :yᵃᶜᵃ)
+            something(extract_coords(ug.yᵃᶜᵃ), collect(range(42.0, 47.0, length = Ny)))
         else
-            collect(range(42.0, 47.0, length = ny))
+            collect(range(42.0, 47.0, length = Ny))
         end
+        lats_vec = length(lat_raw) >= (Ny + 2 * Hy) ? lat_raw[j_c] :
+                   (length(lat_raw) >= Ny ? lat_raw[1:Ny] :
+                    collect(range(first(lat_raw), last(lat_raw), length = Ny)))
 
-        deps_vec = if !isnothing(grid_obj) && hasproperty(grid_obj, :zᵃᵃᶜ)
-            something(extract_coords(grid_obj.zᵃᵃᶜ, nz), collect(range(-1000.0, 0.0, length = nz)))
-        elseif !isnothing(grid_obj) && hasproperty(grid_obj, :z) &&
-               hasproperty(grid_obj.z, :cᵃᵃᶜ)
-            something(extract_coords(grid_obj.z.cᵃᵃᶜ, nz), collect(range(-1000.0, 0.0, length = nz)))
+        dep_raw = if !isnothing(ug) && hasproperty(ug, :zᵃᵃᶜ)
+            something(extract_coords(ug.zᵃᵃᶜ), collect(range(-1000.0, 0.0, length = Nz)))
+        elseif !isnothing(ug) && hasproperty(ug, :z) && hasproperty(ug.z, :cᵃᵃᶜ)
+            something(extract_coords(ug.z.cᵃᵃᶜ), collect(range(-1000.0, 0.0, length = Nz)))
         else
-            collect(range(-1000.0, 0.0, length = nz))
+            collect(range(-1000.0, 0.0, length = Nz))
         end
+        deps_vec = length(dep_raw) >= (Nz + 2 * Hz) ? dep_raw[k_c] :
+                   (length(dep_raw) >= Nz ? dep_raw[1:Nz] :
+                    collect(range(first(dep_raw), last(dep_raw), length = Nz)))
 
-        # Load all time snapshots for each variable into 4D arrays (nx, ny, nz, nt)
-        u_arr = Array{Float64}(undef, nx, ny, nz, nt)
-        v_arr = Array{Float64}(undef, nx, ny, nz, nt)
-        w_arr = Array{Float64}(undef, nx, ny, nz, nt)
-        T_arr = Array{Float64}(undef, nx, ny, nz, nt)
+        # Load all time snapshots for each variable into 4D arrays (Nx, Ny, Nz, nt)
+        u_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
+        v_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
+        w_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
+        T_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
 
         has_w   = haskey(file, "timeseries/w")
         has_T   = haskey(file, "timeseries/T")
         has_eta = haskey(file, "timeseries/η")
 
-        η_arr = has_eta ? Array{Float64}(undef, nx, ny, nt) : Array{Float64}(undef, 0, 0, 0)
+        η_arr = has_eta ? Array{Float64}(undef, Nx, Ny, nt) : Array{Float64}(undef, 0, 0, 0)
 
         for (m, key) in enumerate(sorted_keys)
             raw_u = Float64.(file["timeseries/u/$(key)"])
+            u_arr[:, :, :, m] = if size(raw_u) == (Nx, Ny, Nz)
+                raw_u
+            elseif size(raw_u) >= (Nx + 1 + 2 * Hx, Ny + 2 * Hy, Nz + 2 * Hz)
+                u_face = raw_u[(1 + Hx):(Nx + 1 + Hx), j_c, k_c]
+                0.5 .* (u_face[1:Nx, :, :] .+ u_face[2:Nx + 1, :, :])
+            elseif size(raw_u, 1) == Nx + 1
+                0.5 .* (raw_u[1:Nx, 1:Ny, 1:Nz] .+ raw_u[2:Nx + 1, 1:Ny, 1:Nz])
+            else
+                raw_u[1:Nx, 1:Ny, 1:Nz]
+            end
+
             raw_v = Float64.(file["timeseries/v/$(key)"])
-            u_arr[:, :, :, m] = (size(raw_u) == (nx, ny, nz)) ? raw_u : raw_u[1:nx, 1:ny, 1:nz]
-            v_arr[:, :, :, m] = (size(raw_v) == (nx, ny, nz)) ? raw_v : raw_v[1:nx, 1:ny, 1:nz]
+            v_arr[:, :, :, m] = if size(raw_v) == (Nx, Ny, Nz)
+                raw_v
+            elseif size(raw_v) >= (Nx + 2 * Hx, Ny + 1 + 2 * Hy, Nz + 2 * Hz)
+                v_face = raw_v[i_c, (1 + Hy):(Ny + 1 + Hy), k_c]
+                0.5 .* (v_face[:, 1:Ny, :] .+ v_face[:, 2:Ny + 1, :])
+            elseif size(raw_v, 2) == Ny + 1
+                0.5 .* (raw_v[1:Nx, 1:Ny, 1:Nz] .+ raw_v[1:Nx, 2:Ny + 1, 1:Nz])
+            else
+                raw_v[1:Nx, 1:Ny, 1:Nz]
+            end
+
             if has_w
                 raw_w = Float64.(file["timeseries/w/$(key)"])
-                if size(raw_w) == (nx, ny, nz)
-                    w_arr[:, :, :, m] = raw_w
-                elseif size(raw_w, 3) == nz + 1
-                    # Average vertical face values to cell centers
-                    w_arr[:, :, :, m] = 0.5 .* (raw_w[1:nx, 1:ny, 1:nz] .+ raw_w[1:nx, 1:ny, 2:nz+1])
+                w_arr[:, :, :, m] = if size(raw_w) == (Nx, Ny, Nz)
+                    raw_w
+                elseif size(raw_w) >= (Nx + 2 * Hx, Ny + 2 * Hy, Nz + 1 + 2 * Hz)
+                    w_face = raw_w[i_c, j_c, (1 + Hz):(Nz + 1 + Hz)]
+                    0.5 .* (w_face[:, :, 1:Nz] .+ w_face[:, :, 2:Nz + 1])
+                elseif size(raw_w, 3) == Nz + 1
+                    0.5 .* (raw_w[1:Nx, 1:Ny, 1:Nz] .+ raw_w[1:Nx, 1:Ny, 2:Nz + 1])
                 else
-                    w_arr[:, :, :, m] = raw_w[1:nx, 1:ny, 1:nz]
+                    raw_w[1:Nx, 1:Ny, 1:Nz]
                 end
             else
-                w_arr[:, :, :, m] = zeros(nx, ny, nz)
+                w_arr[:, :, :, m] = zeros(Nx, Ny, Nz)
             end
+
             if has_T
                 raw_T = Float64.(file["timeseries/T/$(key)"])
-                T_arr[:, :, :, m] = (size(raw_T) == (nx, ny, nz)) ? raw_T : raw_T[1:nx, 1:ny, 1:nz]
+                T_arr[:, :, :, m] = if size(raw_T) == (Nx, Ny, Nz)
+                    raw_T
+                elseif size(raw_T) >= (Nx + 2 * Hx, Ny + 2 * Hy, Nz + 2 * Hz)
+                    raw_T[i_c, j_c, k_c]
+                else
+                    raw_T[1:Nx, 1:Ny, 1:Nz]
+                end
             else
-                T_arr[:, :, :, m] = fill(4.5, nx, ny, nz)
+                T_arr[:, :, :, m] = fill(4.5, Nx, Ny, Nz)
             end
+
             if has_eta
                 raw_eta = Float64.(file["timeseries/η/$(key)"])
-                η_arr[:, :, m] = (size(raw_eta) == (nx, ny)) ? raw_eta : raw_eta[1:nx, 1:ny]
+                η_arr[:, :, m] = if size(raw_eta) == (Nx, Ny)
+                    raw_eta
+                elseif size(raw_eta) >= (Nx + 2 * Hx, Ny + 2 * Hy)
+                    raw_eta[i_c, j_c]
+                else
+                    raw_eta[1:Nx, 1:Ny]
+                end
             end
         end
     end

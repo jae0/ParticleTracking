@@ -190,6 +190,7 @@ struct HydrodynamicOptions
     anim_format              :: String
     anim_depth               :: Float64
     anim_overlay_particles   :: Bool
+    anim_output_path         :: String
 end
 
 function HydrodynamicOptions(;
@@ -261,7 +262,8 @@ function HydrodynamicOptions(;
     anim_fps                 :: Int = 10,
     anim_format              :: AbstractString = "mp4",
     anim_depth               :: Real = -2.5,
-    anim_overlay_particles   :: Bool = false
+    anim_overlay_particles   :: Bool = false,
+    anim_output_path         :: AbstractString = ""
 )
     resolved_cp_prefix = if !isempty(strip(checkpoint_prefix)) && checkpoint_prefix != "checkpoint"
         String(checkpoint_prefix)
@@ -339,7 +341,8 @@ function HydrodynamicOptions(;
         anim_fps,
         String(anim_format),
         Float64(anim_depth),
-        anim_overlay_particles
+        anim_overlay_particles,
+        String(anim_output_path)
     )
 end
 
@@ -520,6 +523,7 @@ function get_default_configuration()::Dict{String, Any}
             "anim_format" => "mp4",
             "anim_depth" => -2.5,
             "anim_overlay_particles" => false,
+            "anim_output_path" => "",
             "title" => "Regional Marine Lagrangian Particle Tracking & Dispersion"
         ),
         "paths" => Dict{String, Any}(
@@ -798,6 +802,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     anim_fmt     = String(get_val("visualization", "anim_format", "mp4"))
     anim_depth   = Float64(get_val("visualization", "anim_depth", -2.5))
     anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
+    anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
     enable_duckdb = Bool(get_val("storage", "enable_duckdb", true))
     duckdb_path   = String(get_val("storage", "duckdb_path", "outputs/particle_tracking.duckdb"))
@@ -907,6 +912,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         anim_format = anim_fmt,
         anim_depth = anim_depth,
         anim_overlay_particles = anim_overlay,
+        anim_output_path = anim_out_path,
         overrides...
     )
 end
@@ -1015,7 +1021,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "anim_fps" => opts.anim_fps,
             "anim_format" => opts.anim_format,
             "anim_depth" => opts.anim_depth,
-            "anim_overlay_particles" => opts.anim_overlay_particles
+            "anim_overlay_particles" => opts.anim_overlay_particles,
+            "anim_output_path" => opts.anim_output_path
         ),
         "paths" => Dict{String, Any}(
             "output_dir" => opts.output_dir,

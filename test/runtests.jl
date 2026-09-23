@@ -1187,6 +1187,7 @@ using ParticleTracking
         @test opts_default.anim_fps == 10
         @test opts_default.anim_format == "mp4"
         @test opts_default.anim_depth == -2.5
+        @test opts_default.anim_output_path == ""
 
         opts_custom = HydrodynamicOptions(
             animate_hydro = true,
@@ -1194,7 +1195,8 @@ using ParticleTracking
             anim_fps = 15,
             anim_format = "gif",
             anim_depth = -10.0,
-            anim_overlay_particles = true
+            anim_overlay_particles = true,
+            anim_output_path = "outputs/custom_speed.gif"
         )
         @test opts_custom.animate_hydro == true
         @test opts_custom.anim_variable == :speed
@@ -1202,15 +1204,18 @@ using ParticleTracking
         @test opts_custom.anim_format == "gif"
         @test opts_custom.anim_depth == -10.0
         @test opts_custom.anim_overlay_particles == true
+        @test opts_custom.anim_output_path == "outputs/custom_speed.gif"
 
         cfg_dict = options_to_configuration(opts_custom)
         @test cfg_dict["visualization"]["animate_hydro"] == true
         @test cfg_dict["visualization"]["anim_variable"] == "speed"
         @test cfg_dict["visualization"]["anim_fps"] == 15
+        @test cfg_dict["visualization"]["anim_output_path"] == "outputs/custom_speed.gif"
 
         opts_restored = configuration_to_options(cfg_dict)
         @test opts_restored.animate_hydro == true
         @test opts_restored.anim_variable == :speed
+        @test opts_restored.anim_output_path == "outputs/custom_speed.gif"
 
         # 2. Field animation generation (GIF test)
         tmp_anim_gif = joinpath(tempdir(), "test_anim_speed.gif")

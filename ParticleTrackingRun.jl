@@ -159,12 +159,16 @@ Visualization & Hydrodynamic Animation Options:
   --animate-hydro, --anim-hydro
                           Render animated MP4/GIF video of hydrodynamic fields.
   --no-animate-hydro      Disable hydrodynamic animation generation (default).
-  --anim-variable=<name>  Field variable to animate: dashboard, speed, vorticity,
-                          temperature, salinity, elevation, w (default: dashboard).
+  --anim-variable=<name>  Field variable: dashboard, temperature (T), advection (speed),
+                          diffusion (kappa), salinity (S), viscosity (nu),
+                          stratification (N2), density (rho), vorticity (zeta),
+                          elevation (eta), w, richardson (Ri) (default: dashboard).
   --anim-fps=<int>        Animation playback framerate in frames/sec (default: 10).
   --anim-format=<mp4|gif> Video container format: mp4, gif (default: mp4).
-  --anim-depth=<meters>   Depth slice in meters for 2D horizontal fields (default: -2.5).
-  --anim-overlay-particles
+  --anim-depth=<meters>   Depth slice in meters for 2D fields (default: -2.5).
+  --anim-output=<path>, --anim-file=<path>
+                          Designate custom output video path (e.g. outputs/flow.mp4).
+  --anim-overlay-particles, --anim-particles
                           Synchronously overlay Lagrangian larvae drifting with currents.
 
 Spatial Domain & Grid Discretization:
@@ -726,13 +730,19 @@ function run_segment_simulation(;
         end
     end
 
-    # If reuse-hydro requested and file is complete: reuse it
-    if opts.reuse_hydro && file_info.is_complete
+    # If reuse-hydro requested or animate-hydro on existing hydro-model file: reuse it
+    can_reuse = (opts.reuse_hydro || (opts.animate_hydro && !isempty(opts.hydro_model_file))) &&
+                file_info.exists && file_info.n_timesteps > 0
+    if can_reuse
         println("\n=================================================================")
         println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
         println("=================================================================")
-        println("Reusing completed hydrodynamic flow solution from: $(jld2_path)")
-        println("  (simulated $(round(file_info.last_time / 3600.0, digits=2)) / $(round(opts.sim_duration / 3600.0, digits=2)) hours, $(file_info.n_timesteps) snapshots)")
+        if file_info.is_complete
+            println("Reusing completed hydrodynamic flow solution from: $(jld2_path)")
+        else
+            println("Reusing hydrodynamic flow solution from: $(jld2_path)")
+            println("  Notice: $(file_info.n_timesteps) snapshot(s) present (up to $(round(file_info.last_time / 3600.0, digits=2)) h).")
+        end
         return (simulation = nothing, jld2_output_path = jld2_path)
     end
 
@@ -775,7 +785,7 @@ function run_segment_simulation(;
         stop_time = opts.sim_duration,
         adaptive_time_step = opts.adaptive_cfl,
         target_cfl = opts.target_cfl,
-        max_Δt = min(30.0, 3.0 * opts.sim_dt),
+        max_Δt = min(12.0, 1.2 * Float64(opts.sim_dt)),
         output_dir = out_dir_target,
         output_filename = jld2_filename,
         output_schedule = 50,
@@ -1568,9 +1578,16 @@ function run_segment_visualize(;
             isfile(resolved_jld2) ? resolved_jld2 : nothing
         end
 
+        anim_file_path = if !isempty(strip(opts.anim_output_path))
+            opts.anim_output_path
+        elseif opts.anim_variable == :dashboard
+            joinpath(opts.output_dir, "hydrodynamic_dashboard_animation.$(anim_fmt)")
+        else
+            joinpath(opts.output_dir, "hydrodynamic_$(opts.anim_variable)_animation.$(anim_fmt)")
+        end
+
         if opts.anim_variable == :dashboard
-            anim_file_path = joinpath(opts.output_dir, "hydrodynamic_dashboard_animation.$(anim_fmt)")
-            println("Rendering animated hydrodynamic simulation dashboard -> $(anim_file_path)...")
+            println("Rendering animated hydrodynamic dashboard -> $(anim_file_path)...")
             animate_hydrodynamic_dashboard(
                 hydro_source;
                 depth = opts.anim_depth,
@@ -1583,7 +1600,6 @@ function run_segment_visualize(;
                 domain_lat = opts.domain_lat
             )
         else
-            anim_file_path = joinpath(opts.output_dir, "hydrodynamic_$(opts.anim_variable)_animation.$(anim_fmt)")
             println("Rendering animated hydrodynamic $(opts.anim_variable) field -> $(anim_file_path)...")
             animate_hydrodynamic_field(
                 hydro_source;
@@ -1756,6 +1772,78 @@ function run_segment_visualize(;
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Animation Helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    render_hydrodynamic_animation_if_requested(
+        opts::HydrodynamicOptions,
+        hydro_source::AbstractString
+    ) -> Union{Nothing, String}
+
+Render 2D slice or multi-panel dashboard hydrodynamic animation if requested
+by command-line options (`opts.animate_hydro = true`).
+
+# Inputs
+- `opts::HydrodynamicOptions`: Workflow options containing animation settings.
+- `hydro_source::AbstractString`: Path to hydrodynamic JLD2 solution file.
+
+# Outputs
+- `Union{Nothing, String}`: Path to generated animation file, or `nothing` if not requested.
+"""
+function render_hydrodynamic_animation_if_requested(
+    opts::HydrodynamicOptions,
+    hydro_source::AbstractString
+)
+    if !opts.animate_hydro
+        return nothing
+    end
+    target_bathy_path = joinpath(opts.input_dir, "bathymetry_active.nc")
+    bathy_data = isfile(target_bathy_path) ?
+        load_bathymetry_from_netcdf(target_bathy_path) : nothing
+    anim_fmt = lowercase(opts.anim_format) == "gif" ? "gif" : "mp4"
+    anim_file_path = if !isempty(strip(opts.anim_output_path))
+        opts.anim_output_path
+    elseif opts.anim_variable == :dashboard
+        joinpath(opts.output_dir, "hydrodynamic_dashboard_animation.$(anim_fmt)")
+    else
+        joinpath(opts.output_dir, "hydrodynamic_$(opts.anim_variable)_animation.$(anim_fmt)")
+    end
+
+    mkpath(dirname(anim_file_path))
+    if opts.anim_variable == :dashboard
+        println("Rendering hydrodynamic dashboard -> $(anim_file_path)...")
+        animate_hydrodynamic_dashboard(
+            hydro_source;
+            depth = opts.anim_depth,
+            trajectories = nothing,
+            bathymetry_data = bathy_data,
+            output_path = anim_file_path,
+            framerate = opts.anim_fps,
+            show_trajectories = false,
+            domain_lon = opts.domain_lon,
+            domain_lat = opts.domain_lat
+        )
+    else
+        println("Rendering hydrodynamic $(opts.anim_variable) field -> $(anim_file_path)...")
+        animate_hydrodynamic_field(
+            hydro_source;
+            variable = opts.anim_variable,
+            depth = opts.anim_depth,
+            trajectories = nothing,
+            bathymetry_data = bathy_data,
+            output_path = anim_file_path,
+            framerate = opts.anim_fps,
+            show_trajectories = false,
+            domain_lon = opts.domain_lon,
+            domain_lat = opts.domain_lat
+        )
+    end
+    println("Hydrodynamic animation saved to: $(anim_file_path)")
+    return anim_file_path
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Full End-to-End Production Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1818,26 +1906,8 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
         if opts.animate_hydro
             println(" Generating requested hydrodynamic animations...")
             hydro_source = isnothing(sim_res) ? opts.hydro_model_file : sim_res.jld2_output_path
-            target_bathy_path = joinpath(opts.input_dir, "bathymetry_active.nc")
-            bathy_data = isfile(target_bathy_path) ? load_bathymetry_from_netcdf(target_bathy_path) : nothing
-            anim_file_path = joinpath(opts.output_dir, "hydrodynamic_$(opts.anim_variable)_animation.$(opts.anim_format)")
-            
-            try
-                animate_hydrodynamic_dashboard(
-                    hydro_source;
-                    depth = opts.anim_depth,
-                    trajectories = nothing,
-                    bathymetry_data = bathy_data,
-                    output_path = anim_file_path,
-                    framerate = opts.anim_fps,
-                    show_trajectories = false,
-                    domain_lon = opts.domain_lon,
-                    domain_lat = opts.domain_lat
-                )
-                viz_res = (animation = anim_file_path,)
-            catch e
-                @warn "Hydrodynamic animation generation failed: $e"
-            end
+            anim_file = render_hydrodynamic_animation_if_requested(opts, hydro_source)
+            viz_res = (animation = anim_file,)
         end
 
         if opts.enable_duckdb
@@ -2148,6 +2218,7 @@ function main(args = ARGS)
     anim_fmt = String(lowercase(get(vis_cfg, "anim_format", "mp4")))
     anim_depth = Float64(get(vis_cfg, "anim_depth", -2.5))
     anim_overlay_parts = Bool(get(vis_cfg, "anim_overlay_particles", false))
+    anim_out_path = String(get(vis_cfg, "anim_output_path", ""))
 
     # 3. Parse modifier flags that override config defaults
     is_quick = "--quick" in args || "-q" in args
@@ -2406,6 +2477,8 @@ function main(args = ARGS)
             anim_fmt = String(lowercase(split(a, "=")[2]))
         elseif startswith(a, "--anim-depth=")
             anim_depth = parse(Float64, split(a, "=")[2])
+        elseif startswith(a, "--anim-output=") || startswith(a, "--anim-file=")
+            anim_out_path = String(split(a, "=")[2])
         end
     end
 
@@ -2492,7 +2565,8 @@ function main(args = ARGS)
         anim_fps = anim_fps,
         anim_format = anim_fmt,
         anim_depth = anim_depth,
-        anim_overlay_particles = anim_overlay_parts
+        anim_overlay_particles = anim_overlay_parts,
+        anim_output_path = anim_out_path
     )
 
     # Executive Hardware & Workflow Summary Banner
@@ -2565,14 +2639,34 @@ function main(args = ARGS)
             println(" Target Model File: $(opts.hydro_model_file)")
         end
         println("=================================================================")
-        d_res = run_segment_data(opts = opts)
-        g_res = run_segment_grid(opts = opts, bathy_file = d_res.bathy_file)
-        m_res = run_segment_model(opts = opts, immersed_grid = g_res.immersed_grid,
-                                  tau_x = d_res.tau_x, tau_y = d_res.tau_y)
-        run_segment_climate(opts = opts, model = m_res.model)
-        s_res = run_segment_simulation(opts = opts, model = m_res.model)
-        println("\nHydrodynamic simulation completed successfully.")
-        println("Output flow field saved to: $(s_res.jld2_output_path)")
+
+        default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
+        jld2_path, _ = resolve_hydro_model_path(opts, default_jld2)
+        f_info = inspect_hydrodynamic_file(jld2_path, expected_stop_time = opts.sim_duration)
+
+        s_res = if (opts.reuse_hydro || opts.animate_hydro) && f_info.exists && f_info.n_timesteps > 0
+            if f_info.is_complete
+                println("Reusing completed hydrodynamic flow solution from: $(jld2_path)")
+            else
+                println("Reusing hydrodynamic flow solution from: $(jld2_path)")
+                println("  Notice: $(f_info.n_timesteps) snapshot(s) present (up to $(round(f_info.last_time / 3600.0, digits=2)) h).")
+            end
+            (simulation = nothing, jld2_output_path = jld2_path)
+        else
+            d_res = run_segment_data(opts = opts)
+            g_res = run_segment_grid(opts = opts, bathy_file = d_res.bathy_file)
+            m_res = run_segment_model(opts = opts, immersed_grid = g_res.immersed_grid,
+                                      tau_x = d_res.tau_x, tau_y = d_res.tau_y)
+            run_segment_climate(opts = opts, model = m_res.model)
+            run_segment_simulation(opts = opts, model = m_res.model)
+        end
+
+        println("\nHydrodynamic solution ready: $(s_res.jld2_output_path)")
+
+        if opts.animate_hydro
+            render_hydrodynamic_animation_if_requested(opts, s_res.jld2_output_path)
+        end
+
         if opts.enable_duckdb
             close_all_duckdb_storage!()
         end
@@ -2625,7 +2719,10 @@ function main(args = ARGS)
     end
 
     if "--sim" in args || "--simulation" in args || "--segment=sim" in args
-        run_segment_simulation(opts = opts)
+        s_res = run_segment_simulation(opts = opts)
+        if opts.animate_hydro
+            render_hydrodynamic_animation_if_requested(opts, s_res.jld2_output_path)
+        end
         has_run = true
     end
 
@@ -2645,8 +2742,12 @@ function main(args = ARGS)
     end
 
     if !has_run
-        println("No recognized execution flag provided.")
-        display_help()
+        if opts.animate_hydro && !isempty(opts.hydro_model_file) && isfile(opts.hydro_model_file)
+            render_hydrodynamic_animation_if_requested(opts, opts.hydro_model_file)
+        else
+            println("No recognized execution flag provided.")
+            display_help()
+        end
     end
 end
 

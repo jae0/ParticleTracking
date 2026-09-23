@@ -43,13 +43,22 @@ function resolve_architecture(
 
     if cuda_functional
         try
+            backend = CUDA.CUDABackend()
             if isdefined(Oceananigans, :GPU)
-                return Oceananigans.GPU()
+                return Oceananigans.GPU(backend)
             elseif isdefined(Oceananigans.Architectures, :GPU)
-                return Oceananigans.Architectures.GPU()
+                return Oceananigans.Architectures.GPU(backend)
             end
         catch err
-            @warn "Failed to construct Oceananigans.GPU device: $(err)"
+            try
+                if isdefined(Oceananigans, :GPU)
+                    return Oceananigans.GPU()
+                elseif isdefined(Oceananigans.Architectures, :GPU)
+                    return Oceananigans.Architectures.GPU()
+                end
+            catch err2
+                @warn "Failed to construct Oceananigans.GPU device: $(err); fallback error: $(err2)"
+            end
         end
     end
 

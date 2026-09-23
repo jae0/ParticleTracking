@@ -935,35 +935,201 @@ function extract_hydrodynamic_dataset(
         local lons_j, lats_j, deps_j, times_j, u_j, v_j, w_j, T_j, S_j, elev_j
         jldopen(hydro_input, "r") do file
             u_group = file["timeseries/u"]
-            raw_keys = collect(keys(u_group))
-            sorted_keys = sort(raw_keys, by = k -> something(tryparse(Float64, k), 0.0))
-            times_j = haskey(file, "timeseries/t") ?
-                collect(Float64, file["timeseries/t"]) :
-                [something(tryparse(Float64, k), Float64(idx)) for (idx, k) in enumerate(sorted_keys)]
+            num_keys = [k for k in keys(u_group) if tryparse(Float64, k) !== nothing]
+            if isempty(num_keys)
+                error("No numerical snapshot keys found in timeseries/u of $(hydro_input)")
+            end
+            sorted_keys = sort(num_keys, by = k -> parse(Float64, k))
+            times_j = if haskey(file, "timeseries/t")
+                t_node = file["timeseries/t"]
+                if t_node isa JLD2.Group
+                    [haskey(t_node, k) ? Float64(t_node[k]) : parse(Float64, k) for k in sorted_keys]
+                else
+                    collect(Float64, t_node)
+                end
+            else
+                [parse(Float64, k) for k in sorted_keys]
+            end
+            if isempty(times_j)
+                times_j = [0.0]
+            end
 
             t_idx = resolve_time_index(times_j, time_seconds, time_index)
             key_sel = sorted_keys[t_idx]
 
-            sample_u = file["timeseries/u/$(key_sel)"]
-            nx_f, ny_f, nz_f = size(sample_u)
-
-            if haskey(file, "grid")
-                g = file["grid"]
-                lons_j = haskey(g, "λᶜᵃᵃ") ? collect(Float64, g["λᶜᵃᵃ"][1:nx_f]) : collect(range(domain_lon[1], domain_lon[2], length=nx_f))
-                lats_j = haskey(g, "φᵃᶜᵃ") ? collect(Float64, g["φᵃᶜᵃ"][1:ny_f]) : collect(range(domain_lat[1], domain_lat[2], length=ny_f))
-                deps_j = haskey(g, "zᵃᵃᶜ") ? collect(Float64, g["zᵃᵃᶜ"][1:nz_f]) : t_depths
+            grid_obj = if haskey(file, "grid")
+                file["grid"]
+            elseif haskey(file, "serialized/grid")
+                file["serialized/grid"]
             else
-                lons_j = collect(range(domain_lon[1], domain_lon[2], length=nx_f))
-                lats_j = collect(range(domain_lat[1], domain_lat[2], length=ny_f))
-                deps_j = t_depths
+                nothing
             end
 
-            u_j = Float64.(file["timeseries/u/$(key_sel)"])
-            v_j = Float64.(file["timeseries/v/$(key_sel)"])
-            w_j = haskey(file, "timeseries/w") ? Float64.(file["timeseries/w/$(key_sel)"]) : zeros(nx_f, ny_f, nz_f)
-            T_j = haskey(file, "timeseries/T") ? Float64.(file["timeseries/T/$(key_sel)"]) : fill(4.5, nx_f, ny_f, nz_f)
-            S_j = haskey(file, "timeseries/S") ? Float64.(file["timeseries/S/$(key_sel)"]) : fill(33.0, nx_f, ny_f, nz_f)
-            elev_j = haskey(file, "timeseries/η") ? Float64.(file["timeseries/η/$(key_sel)"]) : zeros(nx_f, ny_f)
+            ug = if !isnothing(grid_obj)
+                hasproperty(grid_obj, :underlying_grid) ? grid_obj.underlying_grid :
+                    (hasproperty(grid_obj, :grid) ? grid_obj.grid : grid_obj)
+            else
+                nothing
+            end
+
+            sample_u = file["timeseries/u/$(key_sel)"]
+            has_T = haskey(file, "timeseries/T")
+            sample_T = has_T ? file["timeseries/T/$(key_sel)"] : sample_u
+
+            Nx = if !isnothing(ug) && hasproperty(ug, :Nx)
+                Int(ug.Nx)
+            else
+                has_T ? size(sample_T, 1) : size(sample_u, 1)
+            end
+            Ny = if !isnothing(ug) && hasproperty(ug, :Ny)
+                Int(ug.Ny)
+            else
+                has_T ? size(sample_T, 2) : size(sample_u, 2)
+            end
+            Nz = if !isnothing(ug) && hasproperty(ug, :Nz)
+                Int(ug.Nz)
+            else
+                has_T ? size(sample_T, 3) : size(sample_u, 3)
+            end
+
+            Hx = (!isnothing(ug) && hasproperty(ug, :Hx)) ? Int(ug.Hx) : 0
+            Hy = (!isnothing(ug) && hasproperty(ug, :Hy)) ? Int(ug.Hy) : 0
+            Hz = (!isnothing(ug) && hasproperty(ug, :Hz)) ? Int(ug.Hz) : 0
+
+            # Interior index ranges for cell centers
+            i_c = (1 + Hx):(Nx + Hx)
+            j_c = (1 + Hy):(Ny + Hy)
+            k_c = (1 + Hz):(Nz + Hz)
+
+            # Spatial coordinate vectors
+            lon_raw = if !isnothing(ug) && hasproperty(ug, :λᶜᵃᵃ)
+                hasproperty(ug.λᶜᵃᵃ, :parent) ? collect(Float64, ug.λᶜᵃᵃ.parent) :
+                    collect(Float64, ug.λᶜᵃᵃ)
+            elseif !isnothing(ug) && hasproperty(ug, :xᶜᵃᵃ)
+                hasproperty(ug.xᶜᵃᵃ, :parent) ? collect(Float64, ug.xᶜᵃᵃ.parent) :
+                    collect(Float64, ug.xᶜᵃᵃ)
+            else
+                collect(range(domain_lon[1], domain_lon[2], length = Nx))
+            end
+            lons_j = if length(lon_raw) >= (Nx + 2 * Hx)
+                lon_raw[i_c]
+            elseif length(lon_raw) >= Nx
+                lon_raw[1:Nx]
+            else
+                collect(range(domain_lon[1], domain_lon[2], length = Nx))
+            end
+
+            lat_raw = if !isnothing(ug) && hasproperty(ug, :φᵃᶜᵃ)
+                hasproperty(ug.φᵃᶜᵃ, :parent) ? collect(Float64, ug.φᵃᶜᵃ.parent) :
+                    collect(Float64, ug.φᵃᶜᵃ)
+            elseif !isnothing(ug) && hasproperty(ug, :yᵃᶜᵃ)
+                hasproperty(ug.yᵃᶜᵃ, :parent) ? collect(Float64, ug.yᵃᶜᵃ.parent) :
+                    collect(Float64, ug.yᵃᶜᵃ)
+            else
+                collect(range(domain_lat[1], domain_lat[2], length = Ny))
+            end
+            lats_j = if length(lat_raw) >= (Ny + 2 * Hy)
+                lat_raw[j_c]
+            elseif length(lat_raw) >= Ny
+                lat_raw[1:Ny]
+            else
+                collect(range(domain_lat[1], domain_lat[2], length = Ny))
+            end
+
+            dep_raw = if !isnothing(ug) && hasproperty(ug, :z) && hasproperty(ug.z, :cᵃᵃᶜ)
+                zc = ug.z.cᵃᵃᶜ
+                hasproperty(zc, :parent) ? collect(Float64, zc.parent) :
+                    collect(Float64, zc)
+            elseif !isnothing(ug) && hasproperty(ug, :zᵃᵃᶜ)
+                zc = ug.zᵃᵃᶜ
+                hasproperty(zc, :parent) ? collect(Float64, zc.parent) :
+                    collect(Float64, zc)
+            else
+                collect(range(-600.0, 0.0, length = Nz))
+            end
+            deps_j = if length(dep_raw) >= (Nz + 2 * Hz)
+                dep_raw[k_c]
+            elseif length(dep_raw) >= Nz
+                dep_raw[1:Nz]
+            else
+                collect(range(-600.0, 0.0, length = Nz))
+            end
+
+            # Extract tracers and de-halo if necessary
+            raw_T = has_T ? Float64.(file["timeseries/T/$(key_sel)"]) : fill(4.5, Nx, Ny, Nz)
+            T_j = if size(raw_T) == (Nx, Ny, Nz)
+                raw_T
+            elseif size(raw_T) >= (Nx + 2 * Hx, Ny + 2 * Hy, Nz + 2 * Hz)
+                raw_T[i_c, j_c, k_c]
+            else
+                raw_T[1:Nx, 1:Ny, 1:Nz]
+            end
+
+            has_S = haskey(file, "timeseries/S")
+            raw_S = has_S ? Float64.(file["timeseries/S/$(key_sel)"]) : fill(33.0, Nx, Ny, Nz)
+            S_j = if size(raw_S) == (Nx, Ny, Nz)
+                raw_S
+            elseif size(raw_S) >= (Nx + 2 * Hx, Ny + 2 * Hy, Nz + 2 * Hz)
+                raw_S[i_c, j_c, k_c]
+            else
+                raw_S[1:Nx, 1:Ny, 1:Nz]
+            end
+
+            # De-stagger velocities to cell centers
+            raw_u = Float64.(file["timeseries/u/$(key_sel)"])
+            u_j = if size(raw_u) == (Nx, Ny, Nz)
+                raw_u
+            elseif size(raw_u) >= (Nx + 1 + 2 * Hx, Ny + 2 * Hy, Nz + 2 * Hz)
+                u_face = raw_u[(1 + Hx):(Nx + 1 + Hx), j_c, k_c]
+                0.5 .* (u_face[1:Nx, :, :] .+ u_face[2:Nx + 1, :, :])
+            elseif size(raw_u, 1) == Nx + 1
+                0.5 .* (raw_u[1:Nx, 1:Ny, 1:Nz] .+ raw_u[2:Nx + 1, 1:Ny, 1:Nz])
+            else
+                raw_u[1:Nx, 1:Ny, 1:Nz]
+            end
+
+            raw_v = Float64.(file["timeseries/v/$(key_sel)"])
+            v_j = if size(raw_v) == (Nx, Ny, Nz)
+                raw_v
+            elseif size(raw_v) >= (Nx + 2 * Hx, Ny + 1 + 2 * Hy, Nz + 2 * Hz)
+                v_face = raw_v[i_c, (1 + Hy):(Ny + 1 + Hy), k_c]
+                0.5 .* (v_face[:, 1:Ny, :] .+ v_face[:, 2:Ny + 1, :])
+            elseif size(raw_v, 2) == Ny + 1
+                0.5 .* (raw_v[1:Nx, 1:Ny, 1:Nz] .+ raw_v[1:Nx, 2:Ny + 1, 1:Nz])
+            else
+                raw_v[1:Nx, 1:Ny, 1:Nz]
+            end
+
+            has_w = haskey(file, "timeseries/w")
+            w_j = if !has_w
+                zeros(Nx, Ny, Nz)
+            else
+                raw_w = Float64.(file["timeseries/w/$(key_sel)"])
+                if size(raw_w) == (Nx, Ny, Nz)
+                    raw_w
+                elseif size(raw_w) >= (Nx + 2 * Hx, Ny + 2 * Hy, Nz + 1 + 2 * Hz)
+                    w_face = raw_w[i_c, j_c, (1 + Hz):(Nz + 1 + Hz)]
+                    0.5 .* (w_face[:, :, 1:Nz] .+ w_face[:, :, 2:Nz + 1])
+                elseif size(raw_w, 3) == Nz + 1
+                    0.5 .* (raw_w[1:Nx, 1:Ny, 1:Nz] .+ raw_w[1:Nx, 1:Ny, 2:Nz + 1])
+                else
+                    raw_w[1:Nx, 1:Ny, 1:Nz]
+                end
+            end
+
+            has_eta = haskey(file, "timeseries/η")
+            elev_j = if !has_eta
+                zeros(Nx, Ny)
+            else
+                raw_eta = Float64.(file["timeseries/η/$(key_sel)"])
+                if size(raw_eta) == (Nx, Ny)
+                    raw_eta
+                elseif size(raw_eta) >= (Nx + 2 * Hx, Ny + 2 * Hy)
+                    raw_eta[i_c, j_c]
+                else
+                    raw_eta[1:Nx, 1:Ny]
+                end
+            end
         end
 
         diag = compute_hydrodynamic_diagnostics(lons_j, lats_j, deps_j, u_j, v_j, w_j, T_j, S_j)
@@ -4023,16 +4189,27 @@ function resolve_hydrodynamic_frame_data(
     variable::Symbol
 )::Tuple{Matrix{Float64}, Symbol, String}
     k = hydro_frame.depth_index
-    if variable in (:salinity, :S)
+    if variable in (:salinity, :S, :sal)
         return (Float64.(hydro_frame.salinity[:, :, k]), :haline, "Practical Salinity (PSU)")
-    elseif variable in (:temperature, :T)
+    elseif variable in (:temperature, :T, :temp, :theta)
         return (Float64.(hydro_frame.temperature[:, :, k]), :thermal, "Temperature (°C)")
+    elseif variable in (:advection, :speed, :current, :velocity, :u_h)
+        return (Float64.(hydro_frame.speed[:, :, k] .* 100.0), :viridis, "Current Speed |u_h| (cm s⁻¹)")
+    elseif variable in (:diffusion, :diffusivity, :kappa, :eddy_diffusion)
+        return (Float64.(hydro_frame.diffusion[:, :, k] .* 10000.0), :turbid, "Eddy Diffusivity κ (10⁻⁴ m² s⁻¹)")
+    elseif variable in (:viscosity, :nu, :eddy_viscosity)
+        return (Float64.(hydro_frame.viscosity[:, :, k] .* 10000.0), :deep, "Eddy Viscosity ν (10⁻⁴ m² s⁻¹)")
     elseif variable in (:density, :rho)
         return (Float64.(hydro_frame.density[:, :, k]), :dense, "Potential Density (kg m⁻³)")
     elseif variable in (:stratification, :N2)
         return (Float64.(hydro_frame.stratification[:, :, k] .* 10000.0), :ice, "Stratification N² (10⁻⁴ s⁻²)")
+    elseif variable in (:richardson, :Ri)
+        return (Float64.(hydro_frame.richardson_number[:, :, k]), :spectral, "Richardson Number Ri")
     elseif variable in (:vorticity, :zeta)
-        return (Float64.(hydro_frame.vorticity[:, :, k] .* 100000.0), :balance, "Relative Vorticity ζ (10⁻⁵ s⁻¹)")
+        vort_mat = ndims(hydro_frame.vorticity) == 2 ?
+            Float64.(hydro_frame.vorticity[:, :]) :
+            Float64.(hydro_frame.vorticity[:, :, k])
+        return (vort_mat .* 100000.0, :balance, "Relative Vorticity ζ (10⁻⁵ s⁻¹)")
     elseif variable in (:elevation, :eta, :ssh)
         return (Float64.(hydro_frame.elevation .* 100.0), :delta, "Sea Surface Elevation η (cm)")
     elseif variable in (:w, :vertical_velocity)
@@ -4085,11 +4262,15 @@ t_m = t_0 + m \\cdot \\Delta t_{\\text{frame}}, \\quad
 - `hydrodynamics`: JLD2 file path, DuckDB database connection, Oceananigans Model instance,
   or NamedTuple.
 - `variable`: Target diagnostic variable to animate. Options:
-  `:speed` / `:advection` (current speed),
-  `:vorticity` / `:zeta` (vertical relative vorticity),
+  `:speed` / `:advection` (horizontal current speed |u_h|),
   `:temperature` / `:T` (seawater potential temperature),
   `:salinity` / `:S` (practical salinity),
-  `:elevation` / `:eta` / `:ssh` (sea surface height),
+  `:diffusion` / `:diffusivity` / `:kappa` (turbulent eddy diffusivity κ_v),
+  `:viscosity` / `:nu` (turbulent eddy viscosity ν_v),
+  `:stratification` / `:N2` (buoyancy frequency squared N²),
+  `:density` / `:rho` (seawater potential density),
+  `:vorticity` / `:zeta` (vertical relative vorticity ζ),
+  `:elevation` / `:eta` / `:ssh` (sea surface height η),
   `:w` (vertical velocity).
 - `depth`: Continuous target depth in meters (e.g. -2.5 for surface, -50.0 for CIL).
 - `depth_level`: Vertical discrete grid index (default: 1).

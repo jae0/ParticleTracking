@@ -69,11 +69,12 @@ julia --project=. ParticleTrackingRun.jl [OPTIONS...]
 |                         | `--no-interactive`                       | Flag            | —                                  | Disable interactive HTML map generation.                                                   |
 |                         | `--animate-hydro`, `--anim-hydro`        | Flag            | —                                  | Render animated MP4/GIF video of hydrodynamic fields.                                      |
 |                         | `--no-animate-hydro`                     | Flag            | `true`                             | Disable hydrodynamic animation rendering.                                                  |
-|                         | `--anim-variable=<name>`                 | String          | `dashboard`                        | Target field: `dashboard`, `speed`, `vorticity`, `temperature`, `salinity`, `elevation`, `w`.|
+|                         | `--anim-variable=<name>`                 | String          | `dashboard`                        | Diagnostic field: `dashboard`, `temperature` (`T`), `advection` (`speed`), `diffusion` (`kappa`), `salinity` (`S`), `viscosity` (`nu`), `stratification` (`N2`), `density` (`rho`), `vorticity` (`zeta`), `elevation` (`eta`), `w`, `richardson` (`Ri`). |
 |                         | `--anim-fps=<int>`                       | Int             | `10`                               | Playback framerate in frames/second.                                                       |
 |                         | `--anim-format=<mp4\|gif>`               | String          | `mp4`                              | Video output format container (`mp4` or `gif`).                                            |
-|                         | `--anim-depth=<meters>`                  | Float (m)       | `-2.5`                             | Target depth level for 2D horizontal slice animations.                                     |
-|                         | `--anim-overlay-particles`               | Flag            | —                                  | Synchronously overlay Lagrangian larvae drifting with currents.                             |
+|                         | `--anim-depth=<meters>`                  | Float (m)       | `-2.5`                             | Target depth in meters (e.g. `0.0`, `-2.5` surface, `-50.0` CIL, `-150.0` deep shelf).       |
+|                         | `--anim-output=<path>`, `--anim-file=<path>` | String      | `""`                               | Designate custom destination path (e.g. `outputs/flow.mp4`). If empty, auto-names.         |
+|                         | `--anim-overlay-particles`               | Flag            | —                                  | Synchronously overlay active Lagrangian larvae drifting with currents.                     |
 | **Spatial Domain**      | `--lon=<min,max>`                        | Real,Real       | `-68.0,-57.0`                      | Longitude bounding range in degrees East.                                                  |
 |                         | `--lat=<min,max>`                        | Real,Real       | `42.0,47.0`                        | Latitude bounding range in degrees North.                                                  |
 |                         | `--depth-range=<min,max>`                | Real,Real       | `-1000.0,0.0`                      | Vertical depth range in meters ($z_{\text{bottom}}, z_{\text{surface}}$).                  |
@@ -250,8 +251,80 @@ julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=outputs/p
 
 # Bayesian / ensemble model-averaged demographic connectivity (P_ij ± σ)
 julia --project=. ParticleTrackingRun.jl --model-average --db-path=outputs/particle_tracking.duckdb
-
 ```
+
+### 6. Spatiotemporal Hydrodynamic Field & Dashboard Video Animation
+
+Hydrodynamic animations can be generated either alongside a complete simulation or decoupled in `--hydro-only` mode:
+
+```bash
+# 1. 4-Panel Synchronized Dashboard with Larval Drift Overlays
+julia --project=. ParticleTrackingRun.jl \
+    --hydro-only \
+    --animate-hydro \
+    --anim-variable=dashboard \
+    --anim-depth=-2.5 \
+    --anim-fps=12 \
+    --anim-format=mp4 \
+    --anim-output=outputs/scotian_shelf_dashboard.mp4
+
+# 2. Potential Temperature Evolution at Cold Intermediate Layer (depth = -50 m)
+julia --project=. ParticleTrackingRun.jl \
+    --hydro-only \
+    --animate-hydro \
+    --anim-variable=temperature \
+    --anim-depth=-50.0 \
+    --anim-output=outputs/cil_temperature_evolution.mp4
+
+# 3. Turbulent Vertical Eddy Diffusivity (κ_v) at Mid-Depth (-50 m)
+julia --project=. ParticleTrackingRun.jl \
+    --hydro-only \
+    --animate-hydro \
+    --anim-variable=diffusion \
+    --anim-depth=-50.0 \
+    --anim-format=mp4 \
+    --anim-output=outputs/vertical_eddy_diffusivity_50m.mp4
+
+# 4. Surface Advection Current Speed (|u_h|) with Animated Particles
+julia --project=. ParticleTrackingRun.jl \
+    --animate-hydro \
+    --anim-variable=advection \
+    --anim-depth=0.0 \
+    --anim-particles \
+    --anim-format=mp4 \
+    --anim-output=outputs/surface_advection_cohort.mp4
+```
+
+#### Diagnostic Field Variables
+
+| Variable Key | Aliases | Physical Metric | Colormap |
+| :--- | :--- | :--- | :--- |
+| `temperature` | `T`, `temp`, `theta` | Seawater potential temperature ($^\circ\text{C}$) | `:thermal` |
+| `advection` | `speed`, `velocity`, `u_h` | Horizontal current speed $\sqrt{u^2 + v^2}$ ($\text{cm s}^{-1}$) | `:viridis` |
+| `diffusion` | `diffusivity`, `kappa` | Turbulent vertical eddy diffusivity $\kappa_v$ ($10^{-4}\text{ m}^2\text{ s}^{-1}$) | `:turbid` |
+| `salinity` | `S`, `sal` | Practical salinity ($\text{PSU}$) | `:haline` |
+| `viscosity` | `nu`, `eddy_viscosity` | Turbulent vertical eddy viscosity $\nu_v$ ($10^{-4}\text{ m}^2\text{ s}^{-1}$) | `:deep` |
+| `stratification` | `N2` | Buoyancy frequency squared $N^2$ ($10^{-4}\text{ s}^{-2}$) | `:ice` |
+| `density` | `rho` | Potential density $\rho$ ($\text{kg m}^{-3}$) | `:dense` |
+| `vorticity` | `zeta` | Relative vertical vorticity $\zeta$ ($10^{-5}\text{ s}^{-1}$) | `:balance` |
+| `elevation` | `eta`, `ssh` | Free sea surface height $\eta$ ($\text{cm}$) | `:delta` |
+| `w` | `vertical_velocity` | Vertical velocity $w$ ($\text{mm s}^{-1}$) | `:curl` |
+| `richardson` | `Ri` | Gradient Richardson number $Ri$ (dimensionless) | `:spectral` |
+| `dashboard` | — | Synchronized 4-panel multi-diagnostic dashboard | Multiple |
+
+#### Continuous Depth Targeting
+
+Depth selection is continuous via nearest vertical coordinate matching ($k = \arg\min_k |z_k - z_{\text{target}}|$):
+- Surface mixed layer: `--anim-depth=0.0` or `--anim-depth=-2.5`.
+- Cold Intermediate Layer (CIL): `--anim-depth=-50.0`.
+- Deep shelf / continental slope: `--anim-depth=-150.0` or `-300.0`.
+
+#### Custom Output File Designation
+
+Designate custom output paths via `--anim-output=<path>` or `--anim-file=<path>`:
+- The parent directory is created automatically if absent.
+- Both `.mp4` and `.gif` formats are supported via `--anim-format=<mp4|gif>`.
+- If omitted, files default to `<output-dir>/hydrodynamic_<variable>_animation.<format>`.
 
 ---
 
@@ -337,6 +410,11 @@ julia --project=. ParticleTrackingRun.jl --snowcrab --all --quick
 | `--ascent-target=<val>`| Float (m) | `-10.0` | Target depth in meters for ascent completion. |
 | `--db-path=<path>` | String | `outputs/snowcrab_tracking.duckdb` | Custom DuckDB analytical database path. |
 | `--output-dir=<dir>` | String | `outputs` | Target directory for outputs and figures. |
+| `--animate-hydro` | Flag | — | Render spatiotemporal hydrodynamic animation video (MP4/GIF). |
+| `--anim-variable=<name>` | String | `dashboard` | Diagnostic field (`dashboard`, `temperature`, `advection`, `diffusion`, `salinity`, etc.). |
+| `--anim-depth=<meters>` | Float (m) | `-2.5` | Continuous target depth in meters (e.g. `0.0`, `-2.5`, `-50.0`, `-150.0`). |
+| `--anim-output=<path>` | String | `""` | Designate custom output video path (e.g. `outputs/flow.mp4`). |
+| `--anim-overlay-particles` | Flag | — | Synchronously overlay Lagrangian larvae drifting with currents. |
 | `--gpu`, `--cuda` | Flag | — | Enable GPU acceleration. |
 | `--fallback-cpu` | Flag | `true` | Fallback to CPU if CUDA GPU is not detected. |
 
