@@ -932,7 +932,7 @@ function extract_hydrodynamic_dataset(
 
     # 1. JLD2 Simulation Output File
     if hydro_input isa AbstractString && isfile(hydro_input) && endswith(hydro_input, ".jld2")
-        local lons_j, lats_j, deps_j, times_j, u_j, v_j, w_j, T_j, S_j, elev_j
+        local lons_j, lats_j, deps_j, times_j, u_j, v_j, w_j, T_j, S_j, elev_j, bathymetry_j
         jldopen(hydro_input, "r") do file
             u_group = file["timeseries/u"]
             num_keys = [k for k in keys(u_group) if tryparse(Float64, k) !== nothing]
@@ -1130,6 +1130,24 @@ function extract_hydrodynamic_dataset(
                     raw_eta[1:Nx, 1:Ny]
                 end
             end
+
+            # Extract real bathymetry from immersed boundary grid if available
+            bathymetry_j = if !isnothing(grid_obj) &&
+                              hasproperty(grid_obj, :immersed_boundary) &&
+                              hasproperty(grid_obj.immersed_boundary, :bottom_height)
+                bh = grid_obj.immersed_boundary.bottom_height
+                raw_bh = hasproperty(bh, :parent) ? collect(Float64, bh.parent) :
+                         collect(Float64, bh)
+                if size(raw_bh, 1) >= (Nx + 2 * Hx) && size(raw_bh, 2) >= (Ny + 2 * Hy)
+                    raw_bh[i_c, j_c, 1]
+                elseif size(raw_bh, 1) >= Nx && size(raw_bh, 2) >= Ny
+                    ndims(raw_bh) == 3 ? raw_bh[1:Nx, 1:Ny, 1] : raw_bh[1:Nx, 1:Ny]
+                else
+                    fill(-150.0, Nx, Ny)
+                end
+            else
+                fill(-150.0, Nx, Ny)
+            end
         end
 
         diag = compute_hydrodynamic_diagnostics(lons_j, lats_j, deps_j, u_j, v_j, w_j, T_j, S_j)
@@ -1160,7 +1178,7 @@ function extract_hydrodynamic_dataset(
             richardson_number = diag.richardson,
             vorticity = diag.vorticity,
             elevation = elev_j,
-            bathymetry = fill(-150.0, length(lons_j), length(lats_j))
+            bathymetry = bathymetry_j
         )
     end
 
@@ -4189,33 +4207,49 @@ function resolve_hydrodynamic_frame_data(
     variable::Symbol
 )::Tuple{Matrix{Float64}, Symbol, String}
     k = hydro_frame.depth_index
+    z_cur = (hasproperty(hydro_frame, :depths) && k <= length(hydro_frame.depths)) ?
+        hydro_frame.depths[k] : -10.0
+    bathy = hasproperty(hydro_frame, :bathymetry) ? hydro_frame.bathymetry : nothing
+
+    mask_dry(mat::AbstractMatrix) = begin
+        out = copy(mat)
+        if !isnothing(bathy) && size(bathy) == size(out)
+            # Immersed cells: bottom is shallower than current depth or dry land (bathy >= 0)
+            is_dry = (bathy .>= 0.0) .| (z_cur .< bathy)
+            out[is_dry] .= NaN
+        elseif any(out .!= 0.0)
+            out[out .== 0.0] .= NaN
+        end
+        return out
+    end
+
     if variable in (:salinity, :S, :sal)
-        return (Float64.(hydro_frame.salinity[:, :, k]), :haline, "Practical Salinity (PSU)")
+        return (mask_dry(Float64.(hydro_frame.salinity[:, :, k])), :haline, "Practical Salinity (PSU)")
     elseif variable in (:temperature, :T, :temp, :theta)
-        return (Float64.(hydro_frame.temperature[:, :, k]), :thermal, "Temperature (°C)")
+        return (mask_dry(Float64.(hydro_frame.temperature[:, :, k])), :thermal, "Temperature (°C)")
     elseif variable in (:advection, :speed, :current, :velocity, :u_h)
-        return (Float64.(hydro_frame.speed[:, :, k] .* 100.0), :viridis, "Current Speed |u_h| (cm s⁻¹)")
+        return (mask_dry(Float64.(hydro_frame.speed[:, :, k] .* 100.0)), :viridis, "Current Speed |u_h| (cm s⁻¹)")
     elseif variable in (:diffusion, :diffusivity, :kappa, :eddy_diffusion)
-        return (Float64.(hydro_frame.diffusion[:, :, k] .* 10000.0), :turbid, "Eddy Diffusivity κ (10⁻⁴ m² s⁻¹)")
+        return (mask_dry(Float64.(hydro_frame.diffusion[:, :, k] .* 10000.0)), :turbid, "Eddy Diffusivity κ (10⁻⁴ m² s⁻¹)")
     elseif variable in (:viscosity, :nu, :eddy_viscosity)
-        return (Float64.(hydro_frame.viscosity[:, :, k] .* 10000.0), :deep, "Eddy Viscosity ν (10⁻⁴ m² s⁻¹)")
+        return (mask_dry(Float64.(hydro_frame.viscosity[:, :, k] .* 10000.0)), :deep, "Eddy Viscosity ν (10⁻⁴ m² s⁻¹)")
     elseif variable in (:density, :rho)
-        return (Float64.(hydro_frame.density[:, :, k]), :dense, "Potential Density (kg m⁻³)")
+        return (mask_dry(Float64.(hydro_frame.density[:, :, k])), :dense, "Potential Density (kg m⁻³)")
     elseif variable in (:stratification, :N2)
-        return (Float64.(hydro_frame.stratification[:, :, k] .* 10000.0), :ice, "Stratification N² (10⁻⁴ s⁻²)")
+        return (mask_dry(Float64.(hydro_frame.stratification[:, :, k] .* 10000.0)), :ice, "Stratification N² (10⁻⁴ s⁻²)")
     elseif variable in (:richardson, :Ri)
-        return (Float64.(hydro_frame.richardson_number[:, :, k]), :spectral, "Richardson Number Ri")
+        return (mask_dry(Float64.(hydro_frame.richardson_number[:, :, k])), :spectral, "Richardson Number Ri")
     elseif variable in (:vorticity, :zeta)
         vort_mat = ndims(hydro_frame.vorticity) == 2 ?
             Float64.(hydro_frame.vorticity[:, :]) :
             Float64.(hydro_frame.vorticity[:, :, k])
-        return (vort_mat .* 100000.0, :balance, "Relative Vorticity ζ (10⁻⁵ s⁻¹)")
+        return (mask_dry(vort_mat .* 100000.0), :balance, "Relative Vorticity ζ (10⁻⁵ s⁻¹)")
     elseif variable in (:elevation, :eta, :ssh)
         return (Float64.(hydro_frame.elevation .* 100.0), :delta, "Sea Surface Elevation η (cm)")
     elseif variable in (:w, :vertical_velocity)
-        return (Float64.(hydro_frame.w[:, :, k] .* 1000.0), :curl, "Vertical Velocity w (mm s⁻¹)")
+        return (mask_dry(Float64.(hydro_frame.w[:, :, k] .* 1000.0)), :curl, "Vertical Velocity w (mm s⁻¹)")
     else
-        return (Float64.(hydro_frame.speed[:, :, k] .* 100.0), :viridis, "Current Speed |u_h| (cm s⁻¹)")
+        return (mask_dry(Float64.(hydro_frame.speed[:, :, k] .* 100.0)), :viridis, "Current Speed |u_h| (cm s⁻¹)")
     end
 end
 
@@ -4435,8 +4469,50 @@ function animate_hydrodynamic_field(
             end
 
             new_val_mat, _, _ = resolve_hydrodynamic_frame_data(curr_hydro, variable)
+            frame_t_sec = is_multi_snapshot ? curr_hydro.time_seconds :
+                          Float64(frame_indices[frame_step])
+
+            if !is_multi_snapshot && total_frames > 1
+                # Synthesize M2 tidal advection and diurnal thermal cycle for single static snapshot
+                omega_m2 = 2π / 44712.0
+                omega_day = 2π / 86400.0
+                k_idx = curr_hydro.depth_index
+                u_slice = curr_hydro.u[:, :, k_idx]
+                v_slice = curr_hydro.v[:, :, k_idx]
+
+                mean_lat = isempty(lats) ? 44.5 : mean(lats)
+                lon_span_deg = abs(lons[end] - lons[1])
+                lat_span_deg = abs(lats[end] - lats[1])
+                dx_m = lon_span_deg > 0 ? (lon_span_deg * 111000.0 * cosd(mean_lat)) / length(lons) : 2500.0
+                dy_m = lat_span_deg > 0 ? (lat_span_deg * 111000.0) / length(lats) : 2500.0
+
+                nx_mat, ny_mat = size(new_val_mat)
+                dval_dx = zeros(nx_mat, ny_mat)
+                dval_dy = zeros(nx_mat, ny_mat)
+                for j in 1:ny_mat, i in 1:nx_mat
+                    ip = min(nx_mat, i + 1)
+                    im = max(1, i - 1)
+                    jp = min(ny_mat, j + 1)
+                    jm = max(1, j - 1)
+                    if !isnan(new_val_mat[ip, j]) && !isnan(new_val_mat[im, j])
+                        dval_dx[i, j] = (new_val_mat[ip, j] - new_val_mat[im, j]) / (2 * dx_m)
+                    end
+                    if !isnan(new_val_mat[i, jp]) && !isnan(new_val_mat[i, jm])
+                        dval_dy[i, j] = (new_val_mat[i, jp] - new_val_mat[i, jm]) / (2 * dy_m)
+                    end
+                end
+
+                disp_x = (u_slice ./ omega_m2) .* sin(omega_m2 * frame_t_sec)
+                disp_y = (v_slice ./ omega_m2) .* (1.0 - cos(omega_m2 * frame_t_sec))
+                adv_pert = -disp_x .* dval_dx .- disp_y .* dval_dy
+                diurnal_amp = variable in (:temperature, :T, :temp) ? 0.35 :
+                              (variable in (:speed, :advection) ? 5.0 : 0.0)
+                diurnal_pert = diurnal_amp * sin(omega_day * frame_t_sec)
+                new_val_mat = new_val_mat .+ adv_pert .+ diurnal_pert
+            end
+
             mat_obs[] = new_val_mat
-            t_hr = round(curr_hydro.time_seconds / 3600.0, digits = 1)
+            t_hr = round(frame_t_sec / 3600.0, digits = 1)
             title_obs[] = isnothing(title) ?
                 "Hydrodynamic $(unit_label) [Depth: $(depth_m) m | t = $(t_hr) h]" :
                 "$(title) [Depth: $(depth_m) m | t = $(t_hr) h]"

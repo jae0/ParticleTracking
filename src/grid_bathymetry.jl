@@ -90,7 +90,7 @@ function build_shelf_grid(;
         latitude = lat_range,
         z = z_specification,
         topology = topology,
-        halo = (4, 4, 4)
+        halo = (7, 7, 5)
     )
     return grid
 end
@@ -1120,6 +1120,107 @@ function build_immersed_grid(
 end
 
 """
+    smooth_bathymetry(
+        topo::AbstractMatrix{<:Real};
+        passes::Integer = 3,
+        alpha::Real = 0.5,
+        h_min::Real = 20.0
+    ) -> Matrix{Float64}
+
+Apply conservative 2D discrete Laplacian smoothing to bathymetric elevation data on wet
+cells, attenuating subgrid \$2\\Delta x\$ pinnacles and single-cell topographic cliffs
+arising from bilinear interpolation of high-resolution digital elevation models (ETOPO/GEBCO).
+Preserves emerged land points (\$z = 0.0\\text{ m}\$) and enforces the minimum water column
+depth floor \$h_{\\min}\$.
+
+# Mathematical Formulation
+For each smoothing iteration \$m = 1, \\dots, M\$ and every interior wet cell \$(i, j)\$ with
+seabed elevation \$Z_{i,j}^{(m)} \\le -h_{\\min}\$:
+```math
+Z_{i,j}^{(m+1)} = (1 - \\alpha) Z_{i,j}^{(m)} + \\frac{\\alpha}{N_{\\text{wet}}}
+                  \\sum_{(p,q) \\in \\mathcal{N}_{\\text{wet}}(i,j)} Z_{p,q}^{(m)}
+```
+where \$\\mathcal{N}_{\\text{wet}}(i,j) = \\{(i \\pm 1, j), (i, j \\pm 1) \\mid Z_{p,q}^{(m)} \\le -h_{\\min}\\}\$
+denotes the 4-connected wet neighborhood, and \$N_{\\text{wet}} = |\\mathcal{N}_{\\text{wet}}(i,j)| \\ge 2\$.
+If \$Z_{i,j}^{(m+1)} > -h_{\\min}\$, the depth floor \$Z_{i,j}^{(m+1)} = -h_{\\min}\$ is enforced.
+
+# Inputs
+- `topo::AbstractMatrix{<:Real}`: 2D array of seabed elevations in meters.
+- `passes::Integer`: Number of smoothing iterations (default 3).
+- `alpha::Real`: Smoothing weight in \$[0, 1]\$ (default 0.5).
+- `h_min::Real`: Minimum physical water depth floor in meters (default 20.0m).
+
+# Outputs
+- `Matrix{Float64}`: Smoothed elevation matrix matching the input horizontal dimensions.
+
+# References
+- Shapiro, R. (1970). Smoothing, filtering, and boundary effects.
+  *Reviews of Geophysics*, 8(2), 359-387.
+- Haidvogel, D. B., & Beckmann, A. (1999). *Numerical Ocean Circulation Modeling*.
+  Imperial College Press.
+"""
+function smooth_bathymetry(
+    topo::AbstractMatrix{<:Real};
+    passes::Integer = 3,
+    alpha::Real = 0.5,
+    h_min::Real = 20.0
+)::Matrix{Float64}
+    if passes < 0
+        error("smooth_bathymetry: passes must be non-negative, got passes = $(passes)")
+    end
+    if !(0.0 <= alpha <= 1.0)
+        error("smooth_bathymetry: alpha must be in [0, 1], got alpha = $(alpha)")
+    end
+    if h_min <= 0.0
+        error("smooth_bathymetry: h_min must be positive, got h_min = $(h_min)")
+    end
+
+    nx, ny = size(topo)
+    h_floor = Float64(h_min)
+    alpha_f = Float64(alpha)
+
+    # Initialize conditioned array: land >= 0 is 0.0, shallow wet is floored
+    h = Matrix{Float64}(undef, nx, ny)
+    for j in 1:ny, i in 1:nx
+        z = Float64(topo[i, j])
+        if z >= 0.0
+            h[i, j] = 0.0
+        elseif z > -h_floor
+            h[i, j] = -h_floor
+        else
+            h[i, j] = z
+        end
+    end
+
+    # Apply 2D discrete Laplacian smoothing iterations on wet cells
+    for _ in 1:passes
+        h_next = copy(h)
+        for j in 2:(ny - 1), i in 2:(nx - 1)
+            if h[i, j] <= -h_floor
+                sum_nb = 0.0
+                n_wet = 0
+                for (di, dj) in ((-1, 0), (1, 0), (0, -1), (0, 1))
+                    nb = h[i + di, j + dj]
+                    if nb <= -h_floor
+                        sum_nb += nb
+                        n_wet += 1
+                    end
+                end
+                if n_wet >= 2
+                    avg_nb = sum_nb / n_wet
+                    z_smoothed = (1.0 - alpha_f) * h[i, j] + alpha_f * avg_nb
+                    h_next[i, j] = z_smoothed > -h_floor ? -h_floor : z_smoothed
+                end
+            end
+        end
+        h = h_next
+    end
+
+    return h
+end
+
+
+"""
     build_immersed_grid_from_real_data(
         grid::LatitudeLongitudeGrid,
         bathymetry_filepath::AbstractString;
@@ -1234,18 +1335,16 @@ function build_immersed_grid_from_real_data(
     regridded_topo = regrid_2d_field(raw_lon, raw_lat, raw_elevation,
                                      target_lons, target_lats)
 
-    # Condition bathymetry: level emerged land to 0.0 and floor shallow wet cells
-    # to prevent barotropic tidal acceleration singularities in ultra-shallow cells
+    # Condition bathymetry: level emerged land to 0.0, floor shallow wet cells,
+    # and apply conservative Laplacian smoothing on wet cells to eliminate subgrid 2Δx
+    # pinnacles and single-cell shelf-edge cliffs while preserving land masks
     h_floor = Float64(min_water_depth)
-    conditioned_topo = map(regridded_topo) do z
-        if z >= 0.0
-            0.0
-        elseif z > -h_floor
-            -h_floor
-        else
-            z
-        end
-    end
+    conditioned_topo = smooth_bathymetry(
+        regridded_topo,
+        passes = 4,
+        alpha = 0.5,
+        h_min = h_floor
+    )
 
     return build_immersed_grid(grid, conditioned_topo)
 end

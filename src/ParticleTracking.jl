@@ -96,9 +96,12 @@ export
 
     # Open real-world data and regridding
     fetch_open_bathymetry,
+    fetch_etopo2022_bathymetry,
+    fetch_era5_atmospheric_forcing,
     fetch_open_surface_winds,
     fetch_open_meteo_surface_winds,
     fetch_open_woa_climatology,
+    fetch_woa23_hydrography,
     fetch_copernicus_surface_winds,
     wind_speed_to_kinematic_stress,
     regrid_2d_field,
@@ -126,12 +129,16 @@ export
     get_strata_buffered_envelope,
     build_immersed_grid,
     build_immersed_grid_from_real_data,
+    smooth_bathymetry,
     extract_grid_coordinates,
 
     # Hydrodynamic model
     build_hydrodynamic_model,
+    WENOVectorInvariant,
     set_initial_stratification!,
     set_initial_conditions!,
+    LateralBoundaryRelaxation,
+    seawater_freezing_temperature,
 
     # Tidal forcing & harmonic synthesis
     get_tidal_frequency,

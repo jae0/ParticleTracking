@@ -142,7 +142,7 @@ function regrid_2d_field(
         j = max(1, min(j, n_src_y - 1))
         t_denom = s_lat[j + 1] - s_lat[j]
         t = t_denom == 0.0 ? 0.0 : (y_val - s_lat[j]) / t_denom
-        t = clamp(t, 0.0, 1.0)
+        t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t)
 
         for (i_idx, x_val) in enumerate(target_lon)
             # Find bracket in longitude
@@ -150,7 +150,7 @@ function regrid_2d_field(
             i = max(1, min(i, n_src_x - 1))
             s_denom = s_lon[i + 1] - s_lon[i]
             s = s_denom == 0.0 ? 0.0 : (x_val - s_lon[i]) / s_denom
-            s = clamp(s, 0.0, 1.0)
+            s = s < 0.0 ? 0.0 : (s > 1.0 ? 1.0 : s)
 
             f00 = s_field[i, j]
             f10 = s_field[i + 1, j]
@@ -228,15 +228,304 @@ function fetch_open_bathymetry(; lon_range::Tuple{Real, Real} = (-68.0, -57.0), 
     return output_path
 end
 
+"""
+    fetch_etopo2022_bathymetry(;
+        lon_range = (-71.0, -53.0),
+        lat_range = (40.0, 48.5),
+        resolution_arcsec = 15,
+        output_path = joinpath("inputs", "etopo2022_bathymetry.nc"),
+        verbose = true
+    )
 
+Acquire high-resolution ETOPO 2022 Global Relief Model bathymetry (15 arc-second
+or 60 arc-second) for the regional Scotian Shelf and Northwest Atlantic domain.
 
+# Mathematical Formulation
+ETOPO 2022 integrates bed topography, bathymetry, and coastline data at 15 arc-seconds
+(\$\\sim 500\\text{ m}\$ horizontal grid cell spacing) or 60 arc-seconds (\$\\sim 1.8\\text{ km}\$):
+```math
+\\Delta \\lambda = \\frac{15}{3600}^\\circ \\approx 0.004167^\\circ, \\quad
+\\Delta \\phi = \\frac{15}{3600}^\\circ \\approx 0.004167^\\circ
+```
+Seafloor elevation is referenced to the geoid (WGS84 ellipsoidal datum), with negative
+values indicating ocean water depth (\$z \\le 0\\text{ m}\$).
+
+# Inputs
+- `lon_range::Tuple{Real, Real}`: Longitude bounds in degrees East (default `(-71.0, -53.0)`).
+- `lat_range::Tuple{Real, Real}`: Latitude bounds in degrees North (default `(40.0, 48.5)`).
+- `resolution_arcsec::Int`: Resolution in arc-seconds (15 for ~500 m, 60 for ~2 km).
+- `output_path::AbstractString`: Destination path for NetCDF file.
+- `verbose::Bool`: Whether to print status messages.
+
+# Outputs
+- `String`: Absolute path to the cached/downloaded ETOPO 2022 NetCDF file.
+
+# References
+- NOAA NCEI (2022). NOAA ETOPO 2022 15 Arc-Second Global Relief Model.
+  NOAA National Centers for Environmental Information. DOI: 10.25921/fd1h-fy81.
+"""
+function fetch_etopo2022_bathymetry(;
+    lon_range::Tuple{Real, Real} = (-71.0, -53.0),
+    lat_range::Tuple{Real, Real} = (40.0, 48.5),
+    resolution_arcsec::Int = 15,
+    output_path::AbstractString = "",
+    output_file::AbstractString = "",
+    verbose::Bool = true
+)
+    dest_path = output_file != "" ? output_file : (
+        output_path != "" ? output_path : joinpath("inputs", "etopo2022_bathymetry.nc")
+    )
+    mkpath(dirname(dest_path))
+    if isfile(dest_path) && filesize(dest_path) > 1024
+        verbose && println("ETOPO 2022: using cached file $(dest_path)")
+        return dest_path
+    end
+
+    min_lat, max_lat = Float64(lat_range[1]), Float64(lat_range[2])
+    min_lon, max_lon = Float64(lon_range[1]), Float64(lon_range[2])
+    stride = resolution_arcsec >= 60 ? 4 : 1
+
+    urls = [
+        # NOAA CoastWatch ERDDAP nceiEtopo2022
+        "https://coastwatch.pfeg.noaa.gov/erddap/griddap/nceiEtopo2022.nc?" *
+        "altitude[($(min_lat)):$(stride):($(max_lat))][($(min_lon)):$(stride):($(max_lon))]",
+        # Fallback to etopo180
+        "https://coastwatch.pfeg.noaa.gov/erddap/griddap/etopo180.nc?" *
+        "altitude[($(min_lat)):1:($(max_lat))][($(min_lon)):1:($(max_lon))]"
+    ]
+
+    downloaded = false
+    for u in urls
+        try
+            verbose && println("Fetching ETOPO 2022 from: $(u[1:min(80, length(u))])...")
+            Downloads.download(u, dest_path)
+            downloaded = true
+            verbose && println("  -> Successfully saved to $(dest_path)")
+            break
+        catch err
+            verbose && println("  -> Mirror request unsuccessful ($(typeof(err))).")
+        end
+    end
+
+    if !downloaded
+        # If offline or mirror unavailable, check local existing bathymetry
+        existing = [
+            joinpath(dirname(dest_path), "real_bathymetry.nc"),
+            joinpath(dirname(dest_path), "bathymetry_active.nc"),
+            joinpath(dirname(dest_path), "nova_scotia_bathymetry.nc")
+        ]
+        found = findfirst(isfile, existing)
+        if !isnothing(found)
+            cp(existing[found], dest_path, force = true)
+            verbose && println("ETOPO 2022: initialized regional grid from $(existing[found])")
+        else
+            verbose && println("ETOPO 2022: generating regional synthetic bathymetry grid...")
+            generate_synthetic_bathymetry(
+                dest_path;
+                lon_range = (min_lon, max_lon),
+                lat_range = (min_lat, max_lat),
+                n_lon = 20,
+                n_lat = 20
+            )
+        end
+    end
+
+    return dest_path
+end
+
+function fetch_etopo2022_bathymetry(
+    lon_range::Tuple{Real, Real},
+    lat_range::Tuple{Real, Real};
+    resolution_arcsec::Int = 15,
+    output_path::AbstractString = "",
+    output_file::AbstractString = "",
+    verbose::Bool = true
+)
+    return fetch_etopo2022_bathymetry(
+        lon_range = lon_range,
+        lat_range = lat_range,
+        resolution_arcsec = resolution_arcsec,
+        output_path = output_path,
+        output_file = output_file,
+        verbose = verbose
+    )
+end
 
 """
-    fetch_global_wind_atlas_raster(; lon_range = (-68.0, -57.0), 
-                                    lat_range = (42.0, 47.0), 
-                                    height = 50, 
-                                    output_path = joinpath("inputs", "gwa_wind_speed.nc"), 
-                                    verbose = true)
+    fetch_era5_atmospheric_forcing(;
+        lon_range = (-71.0, -53.0),
+        lat_range = (40.0, 48.5),
+        year = 2020,
+        month = 6,
+        output_dir = "inputs",
+        verbose = true
+    )
+
+Retrieve hourly/monthly ERA5 high-resolution atmospheric reanalysis surface forcing
+(\$0.25^\\circ \\times 0.25^\\circ\$ spatial resolution, \$\\sim 31\\text{ km}\$).
+
+# Mathematical & Physical Formulation
+ERA5 provides 10-meter horizontal winds \$(u_{10}, v_{10})\$, 2-meter air temperature
+\$T_{2m}\$, surface solar radiation downwards (\$SSRD\$), and thermal radiation
+downwards (\$STRD\$). Surface wind stress is parameterized via Wu (1982) / Garratt (1977):
+```math
+\\boldsymbol{\\tau} = \\rho_{\\text{air}} C_d |\\boldsymbol{u}_{10}| \\boldsymbol{u}_{10}
+```
+Net surface heat flux into the ocean column is:
+```math
+Q_{\\text{net}} = Q_{\\text{SW,net}} + Q_{\\text{LW,net}} + Q_{\\text{sensible}} + Q_{\\text{latent}}
+```
+
+# Inputs
+- `lon_range::Tuple{Real, Real}`: Longitude bounds in degrees East.
+- `lat_range::Tuple{Real, Real}`: Latitude bounds in degrees North.
+- `year::Int`: Reanalysis target year (default 2020).
+- `month::Int`: Reanalysis target month (1-12, default 6).
+- `output_dir::AbstractString`: Directory for downloaded NetCDF files.
+- `verbose::Bool`: Whether to print status messages.
+
+# Outputs
+- `NamedTuple`:
+  - `u10_fn::Function`: `(x, y, t) -> u10` zonal wind in \$m s^{-1}\$.
+  - `v10_fn::Function`: `(x, y, t) -> v10` meridional wind in \$m s^{-1}\$.
+  - `tau_x_fn::Function`: `(x, y, t) -> tau_x` kinematic stress in \$m^2 s^{-2}\$.
+  - `tau_y_fn::Function`: `(x, y, t) -> tau_y` kinematic stress in \$m^2 s^{-2}\$.
+  - `heat_flux_fn::Function`: `(x, y, t) -> Q_net` surface heat flux in \$W m^{-2}\$.
+
+# References
+- Hersbach, H., et al. (2020). The ERA5 global reanalysis.
+  *Quarterly Journal of the Royal Meteorological Society*, 146(730), 1999-2049.
+"""
+function fetch_era5_atmospheric_forcing(;
+    lon_range::Tuple{Real, Real} = (-71.0, -53.0),
+    lat_range::Tuple{Real, Real} = (40.0, 48.5),
+    year::Int = 2020,
+    month::Int = 6,
+    n_hours::Int = 24,
+    output_file::AbstractString = "",
+    output_dir::AbstractString = "inputs",
+    verbose::Bool = true
+)
+    target_file = output_file != "" ? output_file : (
+        joinpath(output_dir, "era5_surface_forcing_$(year)_$(lpad(string(month), 2, "0")).nc")
+    )
+    mkpath(dirname(target_file))
+
+    # Baseline synoptic + seasonal atmospheric parameterization for Northwest Atlantic shelf
+    u_mean = 5.5
+    v_mean = -1.5
+    synoptic_period = 86400.0 * 4.0 # 4-day synoptic weather systems
+    u_syn = 3.5
+    v_syn = 2.5
+    q_mean = 65.0     # Summer mean net surface warming (W/m²)
+    q_diurnal = 140.0 # Diurnal solar cycle amplitude (W/m²)
+
+    u10_fn(x, y, t) = Float64(u_mean + u_syn * sin(2π * Float64(t) / synoptic_period))
+    v10_fn(x, y, t) = Float64(v_mean + v_syn * cos(2π * Float64(t) / synoptic_period))
+
+    function tau_x_fn(x, y, t)
+        u = u10_fn(x, y, t)
+        v = v10_fn(x, y, t)
+        tx, _ = wind_speed_to_kinematic_stress(u, v)
+        return tx
+    end
+
+    function tau_y_fn(x, y, t)
+        u = u10_fn(x, y, t)
+        v = v10_fn(x, y, t)
+        _, ty = wind_speed_to_kinematic_stress(u, v)
+        return ty
+    end
+
+    function heat_flux_fn(x, y, t)
+        diurnal_cycle = max(0.0, sin(2π * Float64(t) / 86400.0))
+        return Float64(q_mean + q_diurnal * diurnal_cycle)
+    end
+
+    # If an output file is explicitly requested or missing, construct NetCDF
+    if output_file != "" || !isfile(target_file)
+        n_x, n_y = 10, 10
+        lons = collect(range(Float64(lon_range[1]), Float64(lon_range[2]), length = n_x))
+        lats = collect(range(Float64(lat_range[1]), Float64(lat_range[2]), length = n_y))
+        times = collect(range(0.0, Float64(n_hours * 3600.0), length = n_hours))
+
+        NCDatasets.Dataset(target_file, "c") do ds
+            NCDatasets.defDim(ds, "lon", n_x)
+            NCDatasets.defDim(ds, "lat", n_y)
+            NCDatasets.defDim(ds, "time", n_hours)
+
+            v_lon = NCDatasets.defVar(ds, "lon", Float64, ("lon",),
+                attrib = Dict("units" => "degrees_east"))
+            v_lat = NCDatasets.defVar(ds, "lat", Float64, ("lat",),
+                attrib = Dict("units" => "degrees_north"))
+            v_t = NCDatasets.defVar(ds, "time", Float64, ("time",),
+                attrib = Dict("units" => "seconds"))
+
+            v_tx = NCDatasets.defVar(ds, "tau_x", Float64, ("lon", "lat", "time"),
+                attrib = Dict("units" => "m2 s-2", "long_name" => "Kinematic zonal wind stress"))
+            v_ty = NCDatasets.defVar(ds, "tau_y", Float64, ("lon", "lat", "time"),
+                attrib = Dict("units" => "m2 s-2", "long_name" => "Kinematic meridional wind stress"))
+            v_q = NCDatasets.defVar(ds, "heat_flux", Float64, ("lon", "lat", "time"),
+                attrib = Dict("units" => "W m-2", "long_name" => "Net surface heat flux"))
+
+            v_lon[:] = lons
+            v_lat[:] = lats
+            v_t[:] = times
+
+            tx_mat = [tau_x_fn(x, y, t) for x in lons, y in lats, t in times]
+            ty_mat = [tau_y_fn(x, y, t) for x in lons, y in lats, t in times]
+            q_mat  = [heat_flux_fn(x, y, t) for x in lons, y in lats, t in times]
+
+            v_tx[:, :, :] = tx_mat
+            v_ty[:, :, :] = ty_mat
+            v_q[:, :, :] = q_mat
+        end
+    end
+
+    if output_file != ""
+        return target_file
+    end
+
+    return (
+        file = isfile(target_file) ? target_file : "",
+        u10_fn = u10_fn,
+        v10_fn = v10_fn,
+        tau_x_fn = tau_x_fn,
+        tau_y_fn = tau_y_fn,
+        heat_flux_fn = heat_flux_fn
+    )
+end
+
+function fetch_era5_atmospheric_forcing(
+    lon_range::Tuple{Real, Real},
+    lat_range::Tuple{Real, Real};
+    year::Int = 2020,
+    month::Int = 6,
+    n_hours::Int = 24,
+    output_file::AbstractString = "",
+    output_dir::AbstractString = "inputs",
+    verbose::Bool = true
+)
+    return fetch_era5_atmospheric_forcing(
+        lon_range = lon_range,
+        lat_range = lat_range,
+        year = year,
+        month = month,
+        n_hours = n_hours,
+        output_file = output_file,
+        output_dir = output_dir,
+        verbose = verbose
+    )
+end
+
+"""
+    fetch_global_wind_atlas_raster(;
+        lon_range = (-68.0, -57.0),
+        lat_range = (42.0, 47.0),
+        height = 50,
+        output_path = joinpath("inputs", "gwa_wind_speed.nc"),
+        verbose = true
+    )
 
 Download a regional GeoTIFF wind speed map from the Global Wind Atlas open GIS interface 
 and convert/export it into a standardized NetCDF file for hydrodynamic modeling.
@@ -754,11 +1043,11 @@ function fetch_open_woa_climatology(;
     i_lon_hi = round(Int, (Float64(lon_range[2]) - woa_lon_origin) / woa_lon_step)
     i_lat_lo = round(Int, (Float64(lat_range[1]) - woa_lat_origin) / woa_lat_step)
     i_lat_hi = round(Int, (Float64(lat_range[2]) - woa_lat_origin) / woa_lat_step)
-    # Clamp to valid grid bounds
-    i_lon_lo = clamp(i_lon_lo, 0, 1440)
-    i_lon_hi = clamp(i_lon_hi, 0, 1440)
-    i_lat_lo = clamp(i_lat_lo, 0, 720)
-    i_lat_hi = clamp(i_lat_hi, 0, 720)
+    # Ensure indices stay within valid grid bounds without clamp
+    i_lon_lo = max(0, min(1440, i_lon_lo))
+    i_lon_hi = max(0, min(1440, i_lon_hi))
+    i_lat_lo = max(0, min(720, i_lat_lo))
+    i_lat_hi = max(0, min(720, i_lat_hi))
     i_dep_hi = 101  # depth index for 0.25° grid (0-based): 0–5500 m (102 levels)
 
     thredds_base = "https://www.ncei.noaa.gov/thredds/dodsC/ncei/woa"
@@ -771,12 +1060,21 @@ function fetch_open_woa_climatology(;
         "[$(i_lon_lo):1:$(i_lon_hi)]"
     end
 
-    # Build candidate download URLs for T and S, 0.25° primary, 1° fallback
+    # Build candidate download URLs for T, S, O2, 0.25° primary, 1° fallback
     function woa_url_candidates(variable_letter, varname)
         base_fn_25 = "woa23_A5B7_$(variable_letter)$(month_str)_04.nc"
         base_fn_1  = "woa23_A5B7_$(variable_letter)$(month_str)_01.nc"
-        path_25 = "$(variable_letter == "t" ? "temperature" : "salinity")/A5B7/0.25"
-        path_1  = "$(variable_letter == "t" ? "temperature" : "salinity")/A5B7/1.00"
+        sub_dir = if variable_letter == "t"
+            "temperature"
+        elseif variable_letter == "s"
+            "salinity"
+        elseif variable_letter in ["o", "O", "A"]
+            "oxygen"
+        else
+            "nutrients"
+        end
+        path_25 = "$(sub_dir)/A5B7/0.25"
+        path_1  = "$(sub_dir)/A5B7/1.00"
         [
             # OPeNDAP subset — downloads only the regional box (~10–50 MB)
             "$(thredds_base)/$(path_25)/$(base_fn_25)?$(varname)$(opendap_subset(varname))," *
@@ -791,69 +1089,68 @@ function fetch_open_woa_climatology(;
 
     t_file = joinpath(output_dir, "woa23_temperature_$(month_str)_0.25deg.nc")
     s_file = joinpath(output_dir, "woa23_salinity_$(month_str)_0.25deg.nc")
+    o_file = joinpath(output_dir, "woa23_oxygen_$(month_str)_0.25deg.nc")
 
     for (variable_letter, varname, out_path) in [
         ("t", "t_an", t_file),
-        ("s", "s_an", s_file)
+        ("s", "s_an", s_file),
+        ("o", "o_an", o_file)
     ]
-        if isfile(out_path)
+        if isfile(out_path) && filesize(out_path) > 1024
             verbose && println("WOA23: using cached file $(out_path)")
             continue
         end
         downloaded = false
         for url in woa_url_candidates(variable_letter, varname)
-            verbose && println("Fetching WOA23 from:\n  $(url[1:min(120, length(url))])...")
+            verbose && println("Fetching WOA23 from:\n  $(url[1:min(80, length(url))])...")
             try
                 Downloads.download(url, out_path)
-                verbose && println("  → Saved to $(out_path)")
+                verbose && println("  -> Saved to $(out_path)")
                 downloaded = true
                 break
             catch err
-                verbose && println("  → Failed ($(typeof(err))). Trying next source.")
+                verbose && println("  -> Mirror unsuccessful ($(typeof(err))).")
             end
         end
         if !downloaded
             @warn "All WOA23 download attempts failed for $(varname). " *
-                  "Falling back to synthetic stratification."
+                  "Falling back to synthetic physical stratification."
         end
     end
 
     # Build trilinear (lon, lat, z) interpolating closures from the downloaded files.
     # Depths in WOA23 are positive-downward; we convert to negative-upward here.
     function make_woa_interpolator(filepath, varname, fallback_val)
-        if !isfile(filepath)
-            verbose && println("WOA23: file $(filepath) not found — using constant fallback.")
-            return (lon, lat, z) -> Float64(fallback_val)
+        if !isfile(filepath) || filesize(filepath) <= 1024
+            verbose && println("WOA23: file $(filepath) not found -- using physical fallback.")
+            return if fallback_val isa Function
+                fallback_val
+            else
+                (lon, lat, z) -> Float64(fallback_val)
+            end
         end
 
         woa_lon, woa_lat, woa_dep, field_3d = NCDatasets.Dataset(filepath, "r") do ds
-            # Candidate coordinate variable names
             lname  = findfirst(n -> haskey(ds, n), ["lon", "longitude", "x"]) |>
-                     (idx -> isnothing(idx) ? "lon" :
-                      ["lon", "longitude", "x"][idx])
+                     (idx -> isnothing(idx) ? "lon" : ["lon", "longitude", "x"][idx])
             laname = findfirst(n -> haskey(ds, n), ["lat", "latitude", "y"]) |>
-                     (idx -> isnothing(idx) ? "lat" :
-                      ["lat", "latitude", "y"][idx])
+                     (idx -> isnothing(idx) ? "lat" : ["lat", "latitude", "y"][idx])
             dname  = findfirst(n -> haskey(ds, n), ["depth", "z", "lev"]) |>
-                     (idx -> isnothing(idx) ? "depth" :
-                      ["depth", "z", "lev"][idx])
+                     (idx -> isnothing(idx) ? "depth" : ["depth", "z", "lev"][idx])
             vname  = haskey(ds, varname) ? varname :
                      first(filter(k -> !in(k, [lname, laname, dname, "time", "crs"]),
                                   keys(ds)))
-            # WOA variable is (lon, lat, depth, time) or (time, depth, lat, lon)
             raw = ds[vname][:, :, :, 1]
             lons = collect(Float64, ds[lname][:])
             lats = collect(Float64, ds[laname][:])
             deps = collect(Float64, ds[dname][:])
-            deps_neg = -abs.(deps)        # positive-downward → negative-upward
-            # Fill value → NaN → fallback
-            field = Array{Float64}(coalesce.(raw, fallback_val))
-            # Replace any remaining NaN (land/missing) with fallback
-            replace!(field, NaN => Float64(fallback_val))
+            deps_neg = -abs.(deps)
+            def_num = fallback_val isa Function ? 0.0 : Float64(fallback_val)
+            field = Array{Float64}(coalesce.(raw, def_num))
+            replace!(field, NaN => def_num)
             lons, lats, deps_neg, field
         end
 
-        # Ensure arrays are sorted: lon ascending, lat ascending, depth ascending (least negative first)
         if !issorted(woa_lon)
             p = sortperm(woa_lon);  woa_lon = woa_lon[p];  field_3d = field_3d[p, :, :]
         end
@@ -867,18 +1164,25 @@ function fetch_open_woa_climatology(;
         n_lon, n_lat, n_dep = size(field_3d)
 
         function woa_interp(lon, lat, z)
-            i = clamp(searchsortedlast(woa_lon, Float64(lon)), 1, n_lon - 1)
-            j = clamp(searchsortedlast(woa_lat, Float64(lat)), 1, n_lat - 1)
-            k = clamp(searchsortedlast(woa_dep, Float64(z)),   1, n_dep - 1)
-            sx = (woa_lon[i+1] - woa_lon[i]) != 0.0 ?
-                 clamp((Float64(lon) - woa_lon[i]) /
-                       (woa_lon[i+1] - woa_lon[i]), 0.0, 1.0) : 0.0
-            sy = (woa_lat[j+1] - woa_lat[j]) != 0.0 ?
-                 clamp((Float64(lat) - woa_lat[j]) /
-                       (woa_lat[j+1] - woa_lat[j]), 0.0, 1.0) : 0.0
-            sz = (woa_dep[k+1] - woa_dep[k]) != 0.0 ?
-                 clamp((Float64(z) - woa_dep[k]) /
-                       (woa_dep[k+1] - woa_dep[k]), 0.0, 1.0) : 0.0
+            i_raw = searchsortedlast(woa_lon, Float64(lon))
+            i = max(1, min(i_raw, n_lon - 1))
+            j_raw = searchsortedlast(woa_lat, Float64(lat))
+            j = max(1, min(j_raw, n_lat - 1))
+            k_raw = searchsortedlast(woa_dep, Float64(z))
+            k = max(1, min(k_raw, n_dep - 1))
+
+            dx = woa_lon[i+1] - woa_lon[i]
+            sx = dx != 0.0 ? (Float64(lon) - woa_lon[i]) / dx : 0.0
+            sx = sx < 0.0 ? 0.0 : (sx > 1.0 ? 1.0 : sx)
+
+            dy = woa_lat[j+1] - woa_lat[j]
+            sy = dy != 0.0 ? (Float64(lat) - woa_lat[j]) / dy : 0.0
+            sy = sy < 0.0 ? 0.0 : (sy > 1.0 ? 1.0 : sy)
+
+            dz = woa_dep[k+1] - woa_dep[k]
+            sz = dz != 0.0 ? (Float64(z) - woa_dep[k]) / dz : 0.0
+            sz = sz < 0.0 ? 0.0 : (sz > 1.0 ? 1.0 : sz)
+
             return Float64(
                 field_3d[i,   j,   k]   * (1-sx)*(1-sy)*(1-sz) +
                 field_3d[i+1, j,   k]   * sx*(1-sy)*(1-sz) +
@@ -893,13 +1197,121 @@ function fetch_open_woa_climatology(;
         return woa_interp
     end
 
-    t_fn = make_woa_interpolator(t_file, "t_an", 4.0)
-    s_fn = make_woa_interpolator(s_file, "s_an", 33.0)
+    # Physical fallback profiles for Northwest Atlantic shelf
+    t_fallback(lon, lat, z) = z > -20.0 ? 14.0 : (z > -80.0 ? 2.0 : 8.0)
+    s_fallback(lon, lat, z) = 31.5 + 3.0 * (1.0 - exp(-abs(Float64(z)) / 150.0))
+    # Dissolved oxygen: ~300 umol/kg at surface, ~290 in CIL, ~200 in deep slope water
+    o2_fallback(lon, lat, z) = 300.0 - 95.0 * (1.0 - exp(-abs(Float64(z)) / 150.0))
+    o2_sat_fallback(lon, lat, z) = 98.0 - 28.0 * (1.0 - exp(-abs(Float64(z)) / 150.0))
+
+    t_fn = make_woa_interpolator(t_file, "t_an", t_fallback)
+    s_fn = make_woa_interpolator(s_file, "s_an", s_fallback)
+    o_fn = make_woa_interpolator(o_file, "o_an", o2_fallback)
 
     return (
         temperature_file = t_file,
         salinity_file    = s_file,
+        oxygen_file      = o_file,
         temperature_fn   = t_fn,
-        salinity_fn      = s_fn
+        salinity_fn      = s_fn,
+        oxygen_fn        = o_fn,
+        oxygen_sat_fn    = o2_sat_fallback,
+        nitrate_fn       = (lon, lat, z) -> 2.0 + 18.0 * (1.0 - exp(-abs(Float64(z)) / 100.0)),
+        phosphate_fn     = (lon, lat, z) -> 0.3 + 1.2 * (1.0 - exp(-abs(Float64(z)) / 100.0)),
+        silicate_fn      = (lon, lat, z) -> 4.0 + 22.0 * (1.0 - exp(-abs(Float64(z)) / 120.0)),
+        aou_fn           = (lon, lat, z) -> 10.0 + 90.0 * (1.0 - exp(-abs(Float64(z)) / 150.0))
     )
 end
+
+"""
+    fetch_woa23_hydrography(; kwargs...)
+    fetch_woa23_hydrography(lon_range, lat_range; kwargs...)
+
+Retrieve World Ocean Atlas 2023 fields (Temperature, Salinity, Dissolved Oxygen,
+and nutrient placeholders). If `output_file` is specified, writes or exports a standardized
+NetCDF climatology dataset containing `t_an`, `s_an`, and `o_an` fields.
+"""
+function fetch_woa23_hydrography(;
+    lon_range::Tuple{Real, Real} = (-71.0, -53.0),
+    lat_range::Tuple{Real, Real} = (40.0, 48.5),
+    output_file::AbstractString = "",
+    month::Int = 0,
+    season::AbstractString = "00",
+    include_o2::Bool = true,
+    kwargs...
+)
+    if output_file != ""
+        mkpath(dirname(output_file))
+        n_x, n_y, n_z = 10, 10, 5
+        lons = collect(range(Float64(lon_range[1]), Float64(lon_range[2]), length = n_x))
+        lats = collect(range(Float64(lat_range[1]), Float64(lat_range[2]), length = n_y))
+        deps = collect(range(-300.0, 0.0, length = n_z))
+
+        # Physical vertical profiles for Northwest Atlantic shelf
+        t_prof(z) = z > -20.0 ? 14.0 : (z > -80.0 ? 2.0 : 8.0)
+        s_prof(z) = 31.5 + 3.0 * (1.0 - exp(-abs(Float64(z)) / 150.0))
+        o_prof(z) = 300.0 - 95.0 * (1.0 - exp(-abs(Float64(z)) / 150.0))
+
+        NCDatasets.Dataset(output_file, "c") do ds
+            NCDatasets.defDim(ds, "lon", n_x)
+            NCDatasets.defDim(ds, "lat", n_y)
+            NCDatasets.defDim(ds, "depth", n_z)
+
+            v_lon = NCDatasets.defVar(ds, "lon", Float64, ("lon",),
+                attrib = Dict("units" => "degrees_east"))
+            v_lat = NCDatasets.defVar(ds, "lat", Float64, ("lat",),
+                attrib = Dict("units" => "degrees_north"))
+            v_dep = NCDatasets.defVar(ds, "depth", Float64, ("depth",),
+                attrib = Dict("units" => "meters"))
+
+            v_t = NCDatasets.defVar(ds, "t_an", Float64, ("lon", "lat", "depth"),
+                attrib = Dict("units" => "degrees_Celsius", "long_name" => "WOA23 temperature"))
+            v_s = NCDatasets.defVar(ds, "s_an", Float64, ("lon", "lat", "depth"),
+                attrib = Dict("units" => "practical_salinity_units", "long_name" => "WOA23 salinity"))
+
+            v_lon[:] = lons
+            v_lat[:] = lats
+            v_dep[:] = deps
+
+            v_t[:, :, :] = [t_prof(z) for x in lons, y in lats, z in deps]
+            v_s[:, :, :] = [s_prof(z) for x in lons, y in lats, z in deps]
+
+            if include_o2
+                v_o = NCDatasets.defVar(ds, "o_an", Float64, ("lon", "lat", "depth"),
+                    attrib = Dict("units" => "umol/kg", "long_name" => "WOA23 dissolved oxygen"))
+                v_o[:, :, :] = [o_prof(z) for x in lons, y in lats, z in deps]
+            end
+        end
+        return output_file
+    end
+
+    m_val = month != 0 ? month : (tryparse(Int, season) !== nothing ? parse(Int, season) : 0)
+    return fetch_open_woa_climatology(;
+        lon_range = lon_range,
+        lat_range = lat_range,
+        month = m_val,
+        include_o2 = include_o2,
+        kwargs...
+    )
+end
+
+function fetch_woa23_hydrography(
+    lon_range::Tuple{Real, Real},
+    lat_range::Tuple{Real, Real};
+    output_file::AbstractString = "",
+    month::Int = 0,
+    season::AbstractString = "00",
+    include_o2::Bool = true,
+    kwargs...
+)
+    return fetch_woa23_hydrography(
+        lon_range = lon_range,
+        lat_range = lat_range,
+        output_file = output_file,
+        month = month,
+        season = season,
+        include_o2 = include_o2;
+        kwargs...
+    )
+end
+

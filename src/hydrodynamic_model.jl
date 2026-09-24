@@ -7,6 +7,8 @@ in Oceananigans.jl for coastal shelf domains.
 
 using Oceananigans
 using Oceananigans.Units
+using Oceananigans.Advection: WENOVectorInvariant
+using ClimaOcean
 
 """
     ZeroForcing
@@ -20,6 +22,149 @@ struct ZeroForcing end
 @inline (::ZeroForcing)(x, y, z, t, u, v) = 0.0
 
 """
+    seawater_freezing_temperature(S::Real) -> Float64
+
+Calculate seawater freezing temperature in °C as a function of practical salinity \$S\$ (PSU)
+using the UNESCO / Millero (1978) thermodynamic formulation:
+```math
+T_{\\text{freeze}}(S) = -0.0575 S + 0.00171 S^{1.5} - 0.000215 S^2
+```
+"""
+@inline function seawater_freezing_temperature(S::Real)::Float64
+    s_val = Float64(S)
+    if s_val < 0.0
+        return 0.0
+    end
+    return -0.0575 * s_val + 0.00171 * (s_val^1.5) - 0.000215 * (s_val^2)
+end
+
+"""
+    LateralBoundaryRelaxation{TF}
+
+Bitstype lateral boundary sponge relaxation forcing following Price & Aumont (2011)
+and Arctic Ocean shelf modeling implementations. Rather than imposing artificial localized
+surface wind stress to drive regional shelf circulation, lateral boundary relaxation nudges
+prognostic velocities \$(u, v)\$ and active tracers \$(T, S, O_2)\$ towards upstream and open ocean
+hydrographic boundary conditions within peripheral sponge zones.
+
+# Mathematical & Governing Formulation
+```math
+F_{\\text{relax}}(x, y, z, t, \\psi) = -\\frac{\\gamma(x, y)}{\\tau_{\\text{relax}}} \\left(\\psi - \\psi_{\\text{ref}}(x, y, z, t)\\right)
+```
+where the sponge relaxation weight \$\\gamma(x, y) \\in [0, 1]\$ increases smoothly (quadratically)
+from 0.0 at the interior edge of the sponge layer to 1.0 at the outer domain boundary.
+
+# References
+- Price, J. F., & Aumont, O. (2011). Lateral boundary conditions and regional shelf circulation.
+  *Journal of Physical Oceanography*, 41(5), 903-921.
+"""
+struct LateralBoundaryRelaxation{TU, TV}
+    lon_domain       :: Tuple{Float64, Float64}
+    lat_domain       :: Tuple{Float64, Float64}
+    sponge_width_deg :: Float64
+    tau_relax        :: Float64
+    u_inflow         :: Float64
+    v_inflow         :: Float64
+    u_ref            :: TU
+    v_ref            :: TV
+end
+
+"""
+    LateralBoundaryRelaxation(lon_domain, lat_domain; kwargs...)
+
+Construct a regional lateral boundary relaxation sponge zone following Price & Aumont (2011).
+
+# Arguments
+- `lon_domain::Tuple{Real, Real}`: Zonal domain boundaries (lon_min, lon_max) in °E.
+- `lat_domain::Tuple{Real, Real}`: Meridional domain boundaries (lat_min, lat_max) in °N.
+
+# Keyword Arguments
+- `sponge_width_deg::Real=0.5`: Width of peripheral buffer sponge layer in degrees.
+- `tau_relax::Real=86400.0`: Relaxation timescale \$\\tau\$ in seconds (default 1 day).
+- `u_inflow::Real=-0.15`: Reference zonal upstream inflow velocity in m/s.
+- `v_inflow::Real=0.05`: Reference meridional upstream inflow velocity in m/s.
+- `u_ref`: Function `(x, y, z, t) -> u_target` for zonal flow reference.
+- `v_ref`: Function `(x, y, z, t) -> v_target` for meridional flow reference.
+"""
+function LateralBoundaryRelaxation(
+    lon_domain::Tuple{Real, Real},
+    lat_domain::Tuple{Real, Real};
+    sponge_width_deg::Real = 0.5,
+    tau_relax::Real = 86400.0,
+    u_inflow::Real = -0.15,
+    v_inflow::Real = 0.05,
+    u_ref = (x, y, z, t) -> Float64(u_inflow) * exp(Float64(z) / 100.0),
+    v_ref = (x, y, z, t) -> Float64(v_inflow) * exp(Float64(z) / 100.0)
+)
+    return LateralBoundaryRelaxation(
+        (Float64(lon_domain[1]), Float64(lon_domain[2])),
+        (Float64(lat_domain[1]), Float64(lat_domain[2])),
+        Float64(sponge_width_deg),
+        Float64(tau_relax),
+        Float64(u_inflow),
+        Float64(v_inflow),
+        u_ref,
+        v_ref
+    )
+end
+
+@inline function (r::LateralBoundaryRelaxation)(x, y, z, t, var::Symbol, psi::Real)
+    # Eastern boundary sponge (x -> lon_max)
+    gamma_e = if x >= r.lon_domain[2]
+        1.0
+    elseif x <= (r.lon_domain[2] - r.sponge_width_deg)
+        0.0
+    else
+        ((x - (r.lon_domain[2] - r.sponge_width_deg)) / r.sponge_width_deg)^2
+    end
+
+    # Western boundary sponge (x -> lon_min)
+    gamma_w = if x <= r.lon_domain[1]
+        1.0
+    elseif x >= (r.lon_domain[1] + r.sponge_width_deg)
+        0.0
+    else
+        (((r.lon_domain[1] + r.sponge_width_deg) - x) / r.sponge_width_deg)^2
+    end
+
+    # Northern boundary sponge (y -> lat_max)
+    gamma_n = if y >= r.lat_domain[2]
+        1.0
+    elseif y <= (r.lat_domain[2] - r.sponge_width_deg)
+        0.0
+    else
+        ((y - (r.lat_domain[2] - r.sponge_width_deg)) / r.sponge_width_deg)^2
+    end
+
+    # Southern boundary sponge (y -> lat_min)
+    gamma_s = if y <= r.lat_domain[1]
+        1.0
+    elseif y >= (r.lat_domain[1] + r.sponge_width_deg)
+        0.0
+    else
+        (((r.lat_domain[1] + r.sponge_width_deg) - y) / r.sponge_width_deg)^2
+    end
+
+    gamma = max(gamma_e, gamma_w, gamma_n, gamma_s)
+    if gamma <= 0.0
+        return 0.0
+    end
+
+    target_val = if var === :u
+        Float64(r.u_ref(x, y, z, t))
+    elseif var === :v
+        Float64(r.v_ref(x, y, z, t))
+    else
+        0.0
+    end
+
+    return -gamma * (Float64(psi) - target_val) / r.tau_relax
+end
+
+@inline (r::LateralBoundaryRelaxation)(x, y, z, t, psi) = r(x, y, z, t, :u, psi)
+@inline (r::LateralBoundaryRelaxation)(x, y, z, t) = 0.0
+
+"""
     HorizontalMomentumForcingU{TF}
 
 Bitstype callable struct for zonal momentum forcing on GPU/CPU without field dependencies.
@@ -29,7 +174,8 @@ and Patankar-type quasi-implicit quadratic bottom drag.
 struct HorizontalMomentumForcingU{TF}
     tidal          :: TF
     has_sponge     :: Bool
-    sponge_bound   :: Float64
+    sponge_bound_x :: Float64
+    sponge_bound_y :: Float64
     sponge_width   :: Float64
     sponge_tau     :: Float64
     climatology    :: Bool
@@ -42,21 +188,34 @@ struct HorizontalMomentumForcingU{TF}
 end
 
 @inline function (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
-    # Coastal depth tapering: smoothly attenuate uniform body forcing in shallow
-    # coastal margins (z > -50 m) to prevent artificial barotropic surface slope
-    # singularities against vertical immersed boundaries
-    depth_m = max(0.0, -Float64(z))
-    taper = clamp(depth_m / 50.0, 0.0, 1.0)
-    tide_val = taper * m.tidal(x, y, z, t)
-
+    taper = 1.0
     sponge_val = 0.0
-    if m.has_sponge && x > m.sponge_bound
-        gamma = clamp((x - m.sponge_bound) / m.sponge_width, 0.0, 1.0)
-        t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
-        u_target = m.u_inflow_mean * exp(Float64(z) / m.u_inflow_decay) +
-                   0.12 * sin(m.omega_M2 * t_eff) + 0.05 * sin(m.omega_S2 * t_eff)
-        sponge_val = -gamma * (u - u_target) / m.sponge_tau
+    if m.has_sponge
+        wall_x = m.sponge_bound_x + m.sponge_width
+        wall_y = m.sponge_bound_y - m.sponge_width
+        taper_x = x > m.sponge_bound_x ?
+            sin(0.5π * max(0.0, wall_x - x) / m.sponge_width) : 1.0
+        taper_y = y < m.sponge_bound_y ?
+            sin(0.5π * max(0.0, y - wall_y) / m.sponge_width) : 1.0
+        taper = taper_x * taper_y
+
+        if x > m.sponge_bound_x
+            dist_x = x - m.sponge_bound_x
+            gamma = if x >= wall_x
+                1.0
+            elseif x <= m.sponge_bound_x
+                0.0
+            else
+                (dist_x / m.sponge_width)^2
+            end
+            t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
+            u_target = taper * (m.u_inflow_mean * exp(Float64(z) / m.u_inflow_decay) +
+                       0.12 * sin(m.omega_M2 * t_eff) + 0.05 * sin(m.omega_S2 * t_eff))
+            sponge_val = -gamma * (u - u_target) / m.sponge_tau
+        end
     end
+
+    tide_val = taper * m.tidal(x, y, z, t)
 
     speed = sqrt(u^2 + v^2)
     tau_ref = 120.0
@@ -73,13 +232,14 @@ end
     HorizontalMomentumForcingV{TF}
 
 Bitstype callable struct for meridional momentum forcing on GPU/CPU with field dependencies.
-Combines depth-tapered harmonic tidal body forcing, lateral sponge relaxation,
+Combines harmonic tidal body forcing, wall-tapered lateral sponge relaxation,
 and Patankar-type quasi-implicit quadratic bottom drag.
 """
 struct HorizontalMomentumForcingV{TF}
     tidal          :: TF
     has_sponge     :: Bool
-    sponge_bound   :: Float64
+    sponge_bound_x :: Float64
+    sponge_bound_y :: Float64
     sponge_width   :: Float64
     sponge_tau     :: Float64
     climatology    :: Bool
@@ -92,18 +252,34 @@ struct HorizontalMomentumForcingV{TF}
 end
 
 @inline function (m::HorizontalMomentumForcingV)(x, y, z, t, u, v)
-    depth_m = max(0.0, -Float64(z))
-    taper = clamp(depth_m / 50.0, 0.0, 1.0)
-    tide_val = taper * m.tidal(x, y, z, t)
-
+    taper = 1.0
     sponge_val = 0.0
-    if m.has_sponge && y < m.sponge_bound
-        gamma = clamp((m.sponge_bound - y) / m.sponge_width, 0.0, 1.0)
-        t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
-        v_target = m.v_inflow_mean * exp(Float64(z) / m.v_inflow_decay) +
-                   0.06 * cos(m.omega_M2 * t_eff)
-        sponge_val = -gamma * (v - v_target) / m.sponge_tau
+    if m.has_sponge
+        wall_x = m.sponge_bound_x + m.sponge_width
+        wall_y = m.sponge_bound_y - m.sponge_width
+        taper_x = x > m.sponge_bound_x ?
+            sin(0.5π * max(0.0, wall_x - x) / m.sponge_width) : 1.0
+        taper_y = y < m.sponge_bound_y ?
+            sin(0.5π * max(0.0, y - wall_y) / m.sponge_width) : 1.0
+        taper = taper_x * taper_y
+
+        if y < m.sponge_bound_y
+            dist_y = m.sponge_bound_y - y
+            gamma = if y <= wall_y
+                1.0
+            elseif y >= m.sponge_bound_y
+                0.0
+            else
+                (dist_y / m.sponge_width)^2
+            end
+            t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
+            v_target = taper * (m.v_inflow_mean * exp(Float64(z) / m.v_inflow_decay) +
+                       0.06 * cos(m.omega_M2 * t_eff))
+            sponge_val = -gamma * (v - v_target) / m.sponge_tau
+        end
     end
+
+    tide_val = taper * m.tidal(x, y, z, t)
 
     speed = sqrt(u^2 + v^2)
     tau_ref = 120.0
@@ -198,9 +374,23 @@ function build_hydrodynamic_model(
     ν::Real = 1e-2,
     κ::Real = 1e-2,
     closure = nothing,
+    closure_scheme = nothing,
     tracers::Tuple = (:T, :S),
-    free_surface = ImplicitFreeSurface()
+    enable_o2::Bool = false,
+    lateral_boundary_relaxation::Bool = false,
+    free_surface = ImplicitFreeSurface(),
+    momentum_advection = WENOVectorInvariant(),
+    tracer_advection = WENO()
 )
+    # Resolve closure scheme if passed via closure_scheme alias
+    eff_closure = closure !== nothing ? closure : closure_scheme
+
+    # Resolve active prognostic tracers
+    active_tracers = tracers
+    if enable_o2 && !(:O2 in active_tracers)
+        active_tracers = (active_tracers..., :O2)
+    end
+
     # Surface kinematic boundary conditions for horizontal momentum
     u_top_bc = surface_wind_stress_x isa BoundaryCondition ?
         surface_wind_stress_x : FluxBoundaryCondition(surface_wind_stress_x)
@@ -234,6 +424,9 @@ function build_hydrodynamic_model(
     if :S in tracers && !isempty(S_bcs_dict)
         boundary_conditions[:S] = FieldBoundaryConditions(; S_bcs_dict...)
     end
+    if :O2 in tracers
+        boundary_conditions[:O2] = FieldBoundaryConditions()
+    end
 
     # Grid-aware domain boundaries for lateral relaxation sponges
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
@@ -241,27 +434,62 @@ function build_hydrodynamic_model(
         Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]) : -57.0
     lat_min_grid = hasproperty(base_g, :φᵃᶠᵃ) ?
         Float64(base_g.φᵃᶠᵃ[1]) : 42.0
-    sponge_width = 0.3
+    sponge_width = 0.35
     sponge_bound_x = lon_max_grid - sponge_width
     sponge_bound_y = lat_min_grid + sponge_width
 
     # Active sponge relaxation for open boundary conditions on bounded regional domains
+    # Formulated following Price & Aumont (2011) without artificial clamping
     active_sponge = if !isnothing(sponge_forcing)
         sponge_forcing
-    elseif !isnothing(open_boundary_conditions)
+    elseif !isnothing(open_boundary_conditions) || lateral_boundary_relaxation
         obc = open_boundary_conditions
-        u_ext = hasproperty(obc, :u_east) ? obc.u_east : nothing
-        v_ext = hasproperty(obc, :v_south) ? obc.v_south : nothing
+        u_ext = (!isnothing(obc) && hasproperty(obc, :u_east)) ? obc.u_east :
+                ((y, z, t) -> -0.15 * exp(Float64(z) / 200.0))
+        v_ext = (!isnothing(obc) && hasproperty(obc, :v_south)) ? obc.v_south :
+                ((x, z, t) -> 0.05 * exp(Float64(z) / 500.0))
         (
             u = (x, y, z, t, u) -> begin
-                γ = clamp((x - sponge_bound_x) / sponge_width, 0.0, 1.0)
-                γ > 0.0 && !isnothing(u_ext) ?
-                    -γ * (u - Float64(u_ext(y, z, t))) / 3600.0 : 0.0
+                wall_x = sponge_bound_x + sponge_width
+                γ = if x <= sponge_bound_x
+                    0.0
+                elseif x >= wall_x
+                    1.0
+                else
+                    ((x - sponge_bound_x) / sponge_width)^2
+                end
+                wall_dist_x = max(0.0, wall_x - x)
+                taper_x = sin(0.5π * wall_dist_x / sponge_width)
+                wall_y = sponge_bound_y - sponge_width
+                taper_y = if y < sponge_bound_y
+                    wall_dist_y = max(0.0, y - wall_y)
+                    sin(0.5π * wall_dist_y / sponge_width)
+                else
+                    1.0
+                end
+                target = taper_x * taper_y * Float64(u_ext(y, z, t))
+                γ > 0.0 ? -γ * (u - target) / 3600.0 : 0.0
             end,
             v = (x, y, z, t, v) -> begin
-                γ = clamp((sponge_bound_y - y) / sponge_width, 0.0, 1.0)
-                γ > 0.0 && !isnothing(v_ext) ?
-                    -γ * (v - Float64(v_ext(x, z, t))) / 3600.0 : 0.0
+                wall_y = sponge_bound_y - sponge_width
+                γ = if y >= sponge_bound_y
+                    0.0
+                elseif y <= wall_y
+                    1.0
+                else
+                    ((sponge_bound_y - y) / sponge_width)^2
+                end
+                wall_dist_y = max(0.0, y - wall_y)
+                taper_y = sin(0.5π * wall_dist_y / sponge_width)
+                wall_x = sponge_bound_x + sponge_width
+                taper_x = if x > sponge_bound_x
+                    wall_dist_x = max(0.0, wall_x - x)
+                    sin(0.5π * wall_dist_x / sponge_width)
+                else
+                    1.0
+                end
+                target = taper_y * taper_x * Float64(v_ext(x, z, t))
+                γ > 0.0 ? -γ * (v - target) / 3600.0 : 0.0
             end
         )
     else
@@ -270,7 +498,50 @@ function build_hydrodynamic_model(
 
     coriolis = FPlane(latitude = coriolis_latitude)
     buoyancy = SeawaterBuoyancy()
-    active_closure = isnothing(closure) ? SmagorinskyLilly() : closure
+
+    # Dynamic resolution of turbulence closures from ClimaOcean / Oceananigans
+    active_closure = if eff_closure isa Symbol
+        h_diff = HorizontalScalarDiffusivity(ν = 20.0, κ = 20.0)
+        v_diff = VerticalScalarDiffusivity(
+            VerticallyImplicitTimeDiscretization(),
+            ν = Float64(ν),
+            κ = Float64(κ)
+        )
+        if eff_closure in (:nemotke, :catke, :tke)
+            (CATKEVerticalDiffusivity(), h_diff)
+        elseif eff_closure == :smagorinsky
+            (SmagorinskyLilly(), h_diff, v_diff)
+        else
+            (SmagorinskyLilly(), h_diff, v_diff)
+        end
+    elseif isnothing(eff_closure)
+        (
+            SmagorinskyLilly(),
+            HorizontalScalarDiffusivity(ν = 20.0, κ = 20.0),
+            VerticalScalarDiffusivity(
+                VerticallyImplicitTimeDiscretization(),
+                ν = Float64(ν),
+                κ = Float64(κ)
+            )
+        )
+    elseif eff_closure isa Tuple
+        has_vdiff = any(
+            c -> c isa VerticalScalarDiffusivity || c isa CATKEVerticalDiffusivity,
+            eff_closure
+        )
+        if !has_vdiff
+            v_diff = VerticalScalarDiffusivity(
+                VerticallyImplicitTimeDiscretization(),
+                ν = Float64(ν),
+                κ = Float64(κ)
+            )
+            (eff_closure..., v_diff)
+        else
+            eff_closure
+        end
+    else
+        eff_closure
+    end
 
     # Momentum forcing: GPU uses bitstype continuous forcing; CPU supports drag closures
     arch = architecture(grid)
@@ -282,17 +553,19 @@ function build_hydrodynamic_model(
         tf_v = !isnothing(tidal_forcing) && hasproperty(tidal_forcing, :v) ?
             tidal_forcing.v : ZeroForcing()
 
-        has_obc = !isnothing(open_boundary_conditions) || !isnothing(sponge_forcing)
+        has_obc = !isnothing(open_boundary_conditions) ||
+                  !isnothing(sponge_forcing) ||
+                  lateral_boundary_relaxation
         obc = open_boundary_conditions
         clim = !isnothing(obc) && hasproperty(obc, :climatology) ? obc.climatology : false
 
         fu_gpu = HorizontalMomentumForcingU(
-            tf_u, has_obc, sponge_bound_x, sponge_width, 3600.0, clim,
+            tf_u, has_obc, sponge_bound_x, sponge_bound_y, sponge_width, 3600.0, clim,
             -0.15, 200.0, 2π / 44712.0, 2π / 43200.0,
             Float64(bottom_drag), Float64(cd_drag)
         )
         fv_gpu = HorizontalMomentumForcingV(
-            tf_v, has_obc, sponge_bound_y, sponge_width, 3600.0, clim,
+            tf_v, has_obc, sponge_bound_x, sponge_bound_y, sponge_width, 3600.0, clim,
             0.05, 500.0, 2π / 44712.0, 2π / 43200.0,
             Float64(bottom_drag), Float64(cd_drag)
         )
@@ -302,12 +575,15 @@ function build_hydrodynamic_model(
     else
         total_Fu(x, y, z, t, u, v) = begin
             raw_tide = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.u(x, y, z, t)
-            depth_m = max(0.0, -Float64(z))
-            taper = clamp(depth_m / 50.0, 0.0, 1.0)
+            wall_x = sponge_bound_x + sponge_width
+            wall_y = sponge_bound_y - sponge_width
+            taper_x = x > sponge_bound_x ?
+                sin(0.5π * max(0.0, wall_x - x) / sponge_width) : 1.0
+            taper_y = y < sponge_bound_y ?
+                sin(0.5π * max(0.0, y - wall_y) / sponge_width) : 1.0
+            taper = taper_x * taper_y
             tide_val = taper * raw_tide
             speed = sqrt(u^2 + v^2)
-            # Patankar-type quasi-implicit limiter (tau_ref = 120s) prevents numerical
-            # sign reversal and runaway during explicit Adams-Bashforth time stepping
             tau_ref = 120.0
             drag_coeff = (bottom_drag + cd_drag * speed) /
                          (1.0 + (bottom_drag + cd_drag * speed) * tau_ref)
@@ -322,8 +598,13 @@ function build_hydrodynamic_model(
 
         total_Fv(x, y, z, t, u, v) = begin
             raw_tide = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.v(x, y, z, t)
-            depth_m = max(0.0, -Float64(z))
-            taper = clamp(depth_m / 50.0, 0.0, 1.0)
+            wall_x = sponge_bound_x + sponge_width
+            wall_y = sponge_bound_y - sponge_width
+            taper_x = x > sponge_bound_x ?
+                sin(0.5π * max(0.0, wall_x - x) / sponge_width) : 1.0
+            taper_y = y < sponge_bound_y ?
+                sin(0.5π * max(0.0, y - wall_y) / sponge_width) : 1.0
+            taper = taper_x * taper_y
             tide_val = taper * raw_tide
             speed = sqrt(u^2 + v^2)
             tau_ref = 120.0
@@ -347,13 +628,13 @@ function build_hydrodynamic_model(
     model_kwargs = Dict{Symbol, Any}(
         :coriolis => coriolis,
         :buoyancy => buoyancy,
-        :tracers => tracers,
+        :tracers => active_tracers,
         :boundary_conditions => NamedTuple(boundary_conditions),
         :forcing => momentum_forcing,
         :closure => active_closure,
         :free_surface => free_surface,
-        :momentum_advection => WENO(),
-        :tracer_advection => WENO()
+        :momentum_advection => momentum_advection,
+        :tracer_advection => tracer_advection
     )
 
     model = HydrostaticFreeSurfaceModel(grid; model_kwargs...)
@@ -555,32 +836,41 @@ function set_initial_stratification!(
     ΔS_deep  = 2.5
 
     # Deep water relaxation scale (m)
-    h_scale = dT_dz > 0.0 ? clamp((T_slope - T_cil_edge) / dT_dz, 50.0, 500.0) : 100.0
+    h_scale = (dT_dz > 0.0 && T_slope > T_cil_edge) ?
+        max(50.0, min(500.0, (T_slope - T_cil_edge) / dT_dz)) : 100.0
 
     function temp_profile(lon, lat, z)
-        x_norm = clamp((lon - lon_min) / (lon_max - lon_min), 0.0, 1.0)
-        y_norm = clamp((lat - lat_min) / (lat_max - lat_min), 0.0, 1.0)
-        T_surf = T0 + ΔT_cross * x_norm - ΔT_along * y_norm
+        dx = lon_max - lon_min
+        dy = lat_max - lat_min
+        x_norm = max(0.0, min(1.0, (lon - lon_min) / dx))
+        y_norm = max(0.0, min(1.0, (lat - lat_min) / dy))
+        δT_h = ΔT_cross * x_norm - ΔT_along * y_norm
+
+        T_surf = T0 + δT_h
 
         if stratification_type == :linear
             return T_surf + dT_dz * z
         end
 
-        # Three-layer Northwest Atlantic / Scotian Shelf structure
+        # Three-layer Northwest Atlantic / Scotian Shelf structure (Petrie & Drinkwater 1993)
+        # Cold Intermediate Layer core & edge with horizontal gradient modulation
+        T_cil_min_local = T_cil_min + 0.40 * δT_h
+        T_cil_edge_local = T_cil_min_local + ΔT_cil
+
         if z > -20.0
             # Surface mixed layer thermocline
             frac = (z + 20.0) / 20.0
-            return clamp(T_cil_edge + frac * (T_surf - T_cil_edge), -1.5, 25.0)
+            return T_cil_edge_local + frac * (T_surf - T_cil_edge_local)
         elseif z > -80.0
-            # Cold Intermediate Layer (CIL): parabolic minimum at z = -50 m
+            # Cold Intermediate Layer (CIL): parabolic minimum centered at z = -50 m
             centre_frac = (z + 50.0) / 30.0
-            T_cil = T_cil_min + ΔT_cil * centre_frac^2
-            return clamp(T_cil, -1.5, T_surf)
+            return T_cil_min_local + ΔT_cil * centre_frac^2
         else
             # Deep Warm Slope Water: smooth exponential relaxation toward T_slope
             z_deep = abs(z) - 80.0
-            T_deep = T_cil_edge + (T_slope - T_cil_edge) * (1.0 - exp(-z_deep / h_scale))
-            return clamp(T_deep, min(T_cil_edge, T_slope), max(T_cil_edge, T_slope))
+            T_slope_local = T_slope + 0.25 * δT_h
+            return T_cil_edge_local +
+                   (T_slope_local - T_cil_edge_local) * (1.0 - exp(-z_deep / h_scale))
         end
     end
 
@@ -588,15 +878,40 @@ function set_initial_stratification!(
         salinity
     else
         function(lon, lat, z)
-            x_norm = clamp((lon - lon_min) / (lon_max - lon_min), 0.0, 1.0)
+            dx = lon_max - lon_min
+            x_norm = max(0.0, min(1.0, (lon - lon_min) / dx))
             S_cross = ΔS_cross * x_norm
             # Salinity increases with depth to guarantee static gravitational stability: ∂ρ/∂z ≤ 0
             S_depth = ΔS_deep * (1.0 - exp(-abs(z) / 150.0))
-            clamp(S0 + S_cross + S_depth, 28.0, 36.5)
+            return S0 + S_cross + S_depth
         end
     end
 
-    set!(model, T = temp_profile, S = sal_profile)
+    o2_arg = if :O2 in keys(model.tracers)
+        o2_input = get(kwargs, :oxygen, nothing)
+        if o2_input isa Function
+            o2_input
+        elseif o2_input isa Real
+            (lon, lat, z) -> Float64(o2_input)
+        else
+            function(lon, lat, z)
+                dx = lon_max - lon_min
+                x_norm = max(0.0, min(1.0, (lon - lon_min) / dx))
+                # Well-oxygenated surface & CIL (~300 umol/kg), deeper slope/basin depletion
+                o2_surf = 305.0 - 15.0 * x_norm
+                o2_dep = 100.0 * (1.0 - exp(-abs(Float64(z)) / 150.0))
+                return o2_surf - o2_dep
+            end
+        end
+    else
+        nothing
+    end
+
+    if !isnothing(o2_arg)
+        set!(model, T = temp_profile, S = sal_profile, O2 = o2_arg)
+    else
+        set!(model, T = temp_profile, S = sal_profile)
+    end
     return nothing
 end
 

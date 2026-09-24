@@ -50,7 +50,7 @@ For numerical stability, \$U_{10}\$ is bounded within \$\\{1.0, 40.0\\}\\text{ m
   *Monthly Weather Review*, 105(7), 915-929.
 """
 @inline function drag_coefficient(U10::Real)::Float64
-    U = clamp(Float64(U10), 1.0, 40.0)
+    U = max(1.0, min(40.0, Float64(U10)))
     return (0.75 + 0.067 * U) * 1e-3
 end
 
@@ -475,7 +475,8 @@ Returns 0 outside the sponge layer and ramp up linearly toward the boundary.
     if dist >= w
         return 0.0
     end
-    return clamp((w - dist) / w, 0.0, 1.0)
+    ratio = (w - dist) / w
+    return ratio < 0.0 ? 0.0 : (ratio > 1.0 ? 1.0 : ratio)
 end
 
 """
@@ -509,6 +510,7 @@ function regrid_bathymetry(
 
     # Check candidate bathymetry files on disk
     candidates = isnothing(filepath) ? [
+        joinpath("inputs", "etopo2022_bathymetry.nc"),
         joinpath("inputs", "bathymetry_active.nc"),
         joinpath("inputs", "real_bathymetry.nc"),
         joinpath("inputs", "nova_scotia_bathymetry.nc")
@@ -620,6 +622,7 @@ function load_regional_bathymetry(;
     input_dir::AbstractString = "inputs"
 )::NamedTuple{(:elevation, :lon, :lat), Tuple{Matrix{Float64}, Vector{Float64}, Vector{Float64}}}
     candidates = isnothing(filepath) ? [
+        joinpath(input_dir, "etopo2022_bathymetry.nc"),
         joinpath(input_dir, "bathymetry_active.nc"),
         joinpath(input_dir, "real_bathymetry.nc"),
         joinpath(input_dir, "nova_scotia_bathymetry.nc")
@@ -936,50 +939,54 @@ function interpolate_ocean_state(
     lon_min, lon_max = extrema(lons)
     lat_min, lat_max = extrema(lats)
 
-    # Initial 3D temperature profile function (smooth Scotian Shelf structure)
-    temp_initial(x, y, z) = begin
-        x_norm = clamp((Float64(x) - lon_min) / max(1e-3, lon_max - lon_min), 0.0, 1.0)
-        y_norm = clamp((Float64(y) - lat_min) / max(1e-3, lat_max - lat_min), 0.0, 1.0)
+    dlon = max(1e-3, lon_max - lon_min)
+    dlat = max(1e-3, lat_max - lat_min)
 
-        # Baseline temperatures (e.g. January spinup conditions)
+    # Initial 3D temperature profile (gravitationally stable Scotian Shelf structure)
+    temp_initial(x, y, z) = begin
+        x_norm = (Float64(x) - lon_min) / dlon
+        y_norm = (Float64(y) - lat_min) / dlat
+        if x_norm < -0.05 || x_norm > 1.05 || y_norm < -0.05 || y_norm > 1.05
+            error("Coordinate ($x, $y) out of domain [$lon_min, $lon_max] x [$lat_min, $lat_max]")
+        end
+
+        # Baseline temperatures (January spinup conditions: warm offshore, cold shelf)
         T_surf = 4.5 + 4.0 * x_norm - 3.5 * y_norm
-        T_cil_min = 1.5
-        T_slope = 8.5
+        T_deep = 3.0
 
         if scenario == :mhw
             T_surf += 3.5
-            T_cil_min += 2.0
-            T_slope += 2.5
+            T_deep += 1.0
         end
 
-        T_val = if z > -20.0
-            frac = (z + 20.0) / 20.0
-            T_cil_min + frac * (T_surf - T_cil_min)
-        elseif z > -80.0
-            centre_frac = (z + 50.0) / 30.0
-            T_cil_min + 2.0 * centre_frac^2
-        else
-            z_deep = abs(z) - 80.0
-            T_cil_min + (T_slope - T_cil_min) * (1.0 - exp(-z_deep / 120.0))
-        end
-        return T_val
+        # Smooth, continuous thermocline with no non-physical vertical inversions
+        return T_deep + (T_surf - T_deep) * exp(Float64(z) / 150.0)
     end
 
     sal_initial(x, y, z) = begin
-        x_norm = clamp((Float64(x) - lon_min) / max(1e-3, lon_max - lon_min), 0.0, 1.0)
-        # Static gravitational stability: salinity increases with depth
-        32.0 + 1.2 * x_norm + 2.2 * (1.0 - exp(-abs(Float64(z)) / 200.0))
+        x_norm = (Float64(x) - lon_min) / dlon
+        if x_norm < -0.05 || x_norm > 1.05
+            error("Longitude $x out of domain bounds [$lon_min, $lon_max]")
+        end
+        # Static gravitational stability: salinity increases monotonically with depth
+        return 32.0 + 1.0 * x_norm + 2.8 * (1.0 - exp(Float64(z) / 150.0))
     end
 
     # Geostrophic-balanced baroclinic velocity estimate
     u_initial(x, y, z) = begin
-        y_norm = clamp((Float64(y) - lat_min) / max(1e-3, lat_max - lat_min), 0.0, 1.0)
+        y_norm = (Float64(y) - lat_min) / dlat
+        if y_norm < -0.05 || y_norm > 1.05
+            error("Latitude $y out of domain bounds [$lat_min, $lat_max]")
+        end
         # Southwestward coastal Nova Scotia Current
         -0.08 * (1.0 - y_norm) * exp(Float64(z) / 100.0)
     end
 
     v_initial(x, y, z) = begin
-        x_norm = clamp((Float64(x) - lon_min) / max(1e-3, lon_max - lon_min), 0.0, 1.0)
+        x_norm = (Float64(x) - lon_min) / dlon
+        if x_norm < -0.05 || x_norm > 1.05
+            error("Longitude $x out of domain bounds [$lon_min, $lon_max]")
+        end
         -0.05 * (1.0 - x_norm) * exp(Float64(z) / 100.0)
     end
 

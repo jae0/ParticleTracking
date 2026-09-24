@@ -473,7 +473,7 @@ function run_segment_grid(;
     immersed_grid = build_immersed_grid_from_real_data(
         base_grid,
         target_bathy,
-        min_water_depth = opts.min_seabed_depth
+        min_water_depth = 27.0
     )
 
     println("Grid summary:")
@@ -577,6 +577,9 @@ function run_segment_model(;
     wind_y = isnothing(atmo_craft) ? tau_y : atmo_craft.stress_y
 
     println("Building HydrostaticFreeSurfaceModel (Coriolis at $(coriolis_lat)°N, summer surface heat flux)...")
+    free_surf = ImplicitFreeSurface(maxiter = 2000, reltol = 1e-6)
+    closure_choice = hasproperty(opts, :turbulence_closure) ?
+        Symbol(lowercase(string(opts.turbulence_closure))) : :smagorinsky
     model = build_hydrodynamic_model(
         target_grid,
         coriolis_latitude = coriolis_lat,
@@ -585,6 +588,8 @@ function run_segment_model(;
         surface_heat_flux = opts.surface_heat_flux,
         tidal_forcing = tidal_forcing,
         open_boundary_conditions = obc_craft,
+        free_surface = free_surf,
+        closure = closure_choice,
         ν = 1e-2,
         κ = 1e-2,
         tracers = (:T, :S)
@@ -781,11 +786,11 @@ function run_segment_simulation(;
     println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt=$(opts.sim_dt)s)...")
     sim = setup_hydrodynamic_simulation(
         target_model,
-        Δt = opts.sim_dt,
+        Δt = min(4.0, Float64(opts.sim_dt)),
         stop_time = opts.sim_duration,
         adaptive_time_step = opts.adaptive_cfl,
         target_cfl = opts.target_cfl,
-        max_Δt = min(12.0, 1.2 * Float64(opts.sim_dt)),
+        max_Δt = min(6.0, Float64(opts.sim_dt)),
         output_dir = out_dir_target,
         output_filename = jld2_filename,
         output_schedule = 50,

@@ -440,11 +440,32 @@ function get_default_configuration()::Dict{String, Any}
         ),
         "data" => Dict{String, Any}(
             "data_mode" => "synthetic",
-            "bathy_dataset_id" => "etopo180",
+            "bathy_dataset_id" => "nceiEtopo2022",
             "wind_dataset_id" => "erdBSwinds1day",
+            "hydrography_source" => "woa23",
             "wind_time_iso" => "2023-06-01T00:00:00Z",
             "inshore_depth" => -100.0,
             "shelf_slope" => 500.0
+        ),
+        "bathymetry" => Dict{String, Any}(
+            "source" => "numerical_earth",
+            "provider" => "etopo2022",
+            "resolution_arcsec" => 15,
+            "fallback_dataset_id" => "etopo180"
+        ),
+        "boundaries" => Dict{String, Any}(
+            "method" => "relaxation",
+            "ocean_boundary_source" => "glorys12v1",
+            "obc_type" => "flather_chapman",
+            "sponge_layer_width" => 0.35,
+            "sponge_timescale" => 3600.0,
+            "u_inflow" => -0.15,
+            "v_inflow" => 0.05
+        ),
+        "atmosphere" => Dict{String, Any}(
+            "source" => "era5",
+            "drag_formulation" => "garratt_1977",
+            "bulk_heat_flux" => true
         ),
         "tides" => Dict{String, Any}(
             "enable_tides" => true,
@@ -466,7 +487,11 @@ function get_default_configuration()::Dict{String, Any}
             "adaptive_cfl" => true,
             "target_cfl" => 0.2,
             "divergence_velocity_limit" => 20.0,
-            "coriolis_latitude" => 44.5
+            "coriolis_latitude" => 44.5,
+            "surface_heat_flux" => 50.0,
+            "turbulence_closure" => "nemotke",
+            "enable_sea_ice" => true,
+            "enable_oxygen" => true
         ),
         "biology" => Dict{String, Any}(
             "n_particles" => 100,
@@ -813,6 +838,9 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
 
     hydro_file = String(get_val("hydrodynamics", "hydro_model_file",
                                 get_val("storage", "output_filename", "")))
+    hydro_only = Bool(get_val("hydrodynamics", "hydro_only", false))
+    track_only = Bool(get_val("hydrodynamics", "track_only", false))
+    reuse_hydro = Bool(get_val("hydrodynamics", "reuse_hydro", false))
     run_id_val = String(get_val("storage", "run_id", ""))
 
     enable_cp = Bool(get_val("storage", "enable_checkpoint",
@@ -885,6 +913,9 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         input_dir = input_dir,
         seed = seed,
         hydro_model_file = hydro_file,
+        hydro_only = hydro_only,
+        track_only = track_only,
+        reuse_hydro = reuse_hydro,
         enable_checkpoint = enable_cp,
         checkpoint_prefix = cp_pfx_raw,
         checkpoint_schedule = cp_sched,
@@ -968,7 +999,10 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "adaptive_cfl" => opts.adaptive_cfl,
             "target_cfl" => opts.target_cfl,
             "surface_heat_flux" => opts.surface_heat_flux,
-            "hydro_model_file" => opts.hydro_model_file
+            "hydro_model_file" => opts.hydro_model_file,
+            "hydro_only" => opts.hydro_only,
+            "track_only" => opts.track_only,
+            "reuse_hydro" => opts.reuse_hydro
         ),
         "biology" => Dict{String, Any}(
             "n_particles" => opts.n_particles,

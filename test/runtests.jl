@@ -1243,4 +1243,106 @@ using ParticleTracking
         rm(res_dash, force = true)
     end
 
+    @testset "10. ClimaOcean, ETOPO 2022, WOA23 & Lateral Boundary Relaxation" begin
+        # 1. Seawater freezing temperature (UNESCO / Millero 1978)
+        t_freeze_fresh = seawater_freezing_temperature(0.0)
+        @test isapprox(t_freeze_fresh, 0.0, atol = 1e-6)
+
+        t_freeze_ocean = seawater_freezing_temperature(35.0)
+        # S = 35 PSU should yield ~ -1.91 to -1.93 deg C
+        @test -2.0 < t_freeze_ocean < -1.8
+
+        # 2. Lateral Boundary Relaxation
+        lon_domain = (-65.0, -60.0)
+        lat_domain = (42.0, 46.0)
+        sponge = LateralBoundaryRelaxation(
+            lon_domain,
+            lat_domain;
+            sponge_width_deg = 0.5,
+            tau_relax = 86400.0,
+            u_inflow = -0.12,
+            v_inflow = 0.04
+        )
+        @test sponge.tau_relax == 86400.0
+        @test sponge.u_inflow == -0.12
+
+        # Core domain should have zero sponge relaxation factor
+        core_lon = -62.5
+        core_lat = 44.0
+        @test sponge(core_lon, core_lat, -50.0, 0.0, :u, 0.0) == 0.0
+        @test sponge(core_lon, core_lat, -50.0, 0.0, :v, 0.0) == 0.0
+
+        # Boundary region (lon near -60.0) should relax toward target velocity
+        east_lon = -60.05
+        east_lat = 44.0
+        f_u_sponge = sponge(east_lon, east_lat, 0.0, 0.0, :u, 0.0)
+        # When current u = 0, F_relax = -gamma/tau * (0 - u_ref) = gamma/tau * u_ref
+        @test f_u_sponge < 0.0
+
+        # 3. ETOPO 2022 Bathymetry Fetching & Synthetic Fallback
+        tmp_etopo = joinpath(tempdir(), "test_etopo2022.nc")
+        etopo_path = fetch_etopo2022_bathymetry(
+            (-64.0, -62.0),
+            (43.0, 45.0);
+            output_file = tmp_etopo,
+            resolution_arcsec = 15
+        )
+        @test isfile(etopo_path)
+        @test filesize(etopo_path) > 0
+        info_etopo = inspect_netcdf(etopo_path, verbose = false)
+        @test any(v -> v in info_etopo[:variables], ["altitude", "elevation", "z", "topo"])
+        rm(etopo_path, force = true)
+
+        # 4. ERA5 Atmospheric Forcing Ingestion
+        tmp_era5 = joinpath(tempdir(), "test_era5.nc")
+        era5_path = fetch_era5_atmospheric_forcing(
+            (-64.0, -62.0),
+            (43.0, 45.0);
+            output_file = tmp_era5,
+            n_hours = 24
+        )
+        @test isfile(era5_path)
+        @test filesize(era5_path) > 0
+        info_era5 = inspect_netcdf(era5_path, verbose = false)
+        @test "tau_x" in info_era5[:variables]
+        @test "tau_y" in info_era5[:variables]
+        @test "heat_flux" in info_era5[:variables]
+        rm(era5_path, force = true)
+
+        # 5. WOA23 Climatology Ingestion
+        tmp_woa = joinpath(tempdir(), "test_woa23.nc")
+        woa_path = fetch_woa23_hydrography(
+            (-64.0, -62.0),
+            (43.0, 45.0);
+            output_file = tmp_woa,
+            season = "00",
+            include_o2 = true
+        )
+        @test isfile(woa_path)
+        @test filesize(woa_path) > 0
+        info_woa = inspect_netcdf(woa_path, verbose = false)
+        @test "t_an" in info_woa[:variables]
+        @test "s_an" in info_woa[:variables]
+        @test "o_an" in info_woa[:variables]
+        rm(woa_path, force = true)
+
+        # 6. Hydrodynamic Model with Oxygen and ClimaOcean / NEMO-TKE closure
+        test_grid = build_shelf_grid(
+            lon_range = (-63.0, -62.0),
+            lat_range = (43.0, 44.0),
+            z_range = (-200.0, 0.0),
+            grid_size = (6, 6, 4)
+        )
+        test_model = build_hydrodynamic_model(
+            test_grid;
+            coriolis_latitude = 43.5,
+            enable_o2 = true,
+            closure_scheme = :nemotke
+        )
+        @test haskey(test_model.tracers, :T)
+        @test haskey(test_model.tracers, :S)
+        @test haskey(test_model.tracers, :O2)
+    end
+
 end
+
