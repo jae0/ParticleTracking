@@ -529,8 +529,8 @@ function run_segment_model(;
 
     tidal_forcing = if opts.enable_tides
         println("Configuring astronomical tidal body forcing (M2 + S2 spring-neap envelope)...")
-        u_amps = Dict(:M2 => opts.tidal_u_amp, :S2 => 0.44 * opts.tidal_u_amp)
-        v_amps = Dict(:M2 => opts.tidal_v_amp, :S2 => 0.42 * opts.tidal_v_amp)
+        u_amps = Dict(:M2 => opts.tidal_u_amp, :S2 => opts.s2_u_scale * opts.tidal_u_amp)
+        v_amps = Dict(:M2 => opts.tidal_v_amp, :S2 => opts.s2_v_scale * opts.tidal_v_amp)
         build_tidal_body_forcing(
             constituents = [:M2, :S2],
             u_amplitudes = u_amps,
@@ -592,7 +592,12 @@ function run_segment_model(;
         closure = closure_choice,
         ν = 1e-2,
         κ = 1e-2,
-        tracers = (:T, :S)
+        tracers = (:T, :S),
+        lateral_boundary_relaxation = opts.boundary_method != :none,
+        sponge_width = opts.sponge_layer_width,
+        sponge_tau = opts.sponge_timescale,
+        u_inflow = opts.u_inflow,
+        v_inflow = opts.v_inflow
     )
 
     # Initialize thermal and haline stratification
@@ -783,14 +788,19 @@ function run_segment_simulation(;
     cp_dir_target = isempty(opts.checkpoint_dir) ?
         joinpath(out_dir_target, "checkpoints") : opts.checkpoint_dir
 
-    println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt=$(opts.sim_dt)s)...")
+    # Initial time step: start at 10% of the configured sim_dt to allow the
+    # CFL wizard to safely ramp up from rest without violating barotropic CFL.
+    init_Δt  = Float64(opts.sim_dt) * 0.10
+    max_Δt   = Float64(opts.max_dt)
+
+    println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt₀=$(init_Δt)s, max_Δt=$(max_Δt)s)...")
     sim = setup_hydrodynamic_simulation(
         target_model,
-        Δt = min(4.0, Float64(opts.sim_dt)),
+        Δt = init_Δt,
         stop_time = opts.sim_duration,
         adaptive_time_step = opts.adaptive_cfl,
         target_cfl = opts.target_cfl,
-        max_Δt = min(6.0, Float64(opts.sim_dt)),
+        max_Δt = max_Δt,
         output_dir = out_dir_target,
         output_filename = jld2_filename,
         output_schedule = 50,

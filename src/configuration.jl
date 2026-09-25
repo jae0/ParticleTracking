@@ -191,6 +191,14 @@ struct HydrodynamicOptions
     anim_depth               :: Float64
     anim_overlay_particles   :: Bool
     anim_output_path         :: String
+    # Lateral boundary relaxation parameters (Price & Aumont 2011)
+    boundary_method          :: Symbol   # :relaxation | :none
+    sponge_layer_width       :: Float64  # sponge buffer width (degrees)
+    sponge_timescale         :: Float64  # relaxation timescale (s)
+    u_inflow                 :: Float64  # reference zonal inflow velocity (m/s)
+    v_inflow                 :: Float64  # reference meridional inflow velocity (m/s)
+    # Time integration ceiling
+    max_dt                   :: Float64  # maximum allowable time step (s)
 end
 
 function HydrodynamicOptions(;
@@ -263,7 +271,13 @@ function HydrodynamicOptions(;
     anim_format              :: AbstractString = "mp4",
     anim_depth               :: Real = -2.5,
     anim_overlay_particles   :: Bool = false,
-    anim_output_path         :: AbstractString = ""
+    anim_output_path         :: AbstractString = "",
+    boundary_method          :: Symbol = :relaxation,
+    sponge_layer_width       :: Real = 0.35,
+    sponge_timescale         :: Real = 3600.0,
+    u_inflow                 :: Real = -0.15,
+    v_inflow                 :: Real = 0.05,
+    max_dt                   :: Real = 600.0
 )
     resolved_cp_prefix = if !isempty(strip(checkpoint_prefix)) && checkpoint_prefix != "checkpoint"
         String(checkpoint_prefix)
@@ -342,7 +356,13 @@ function HydrodynamicOptions(;
         String(anim_format),
         Float64(anim_depth),
         anim_overlay_particles,
-        String(anim_output_path)
+        String(anim_output_path),
+        boundary_method,
+        Float64(sponge_layer_width),
+        Float64(sponge_timescale),
+        Float64(u_inflow),
+        Float64(v_inflow),
+        Float64(max_dt)
     )
 end
 
@@ -863,6 +883,16 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     obc_src = Symbol(lowercase(String(get_val("boundaries", "ocean_boundary_source", "glorys12v1"))))
     obc_tp = Symbol(lowercase(String(get_val("boundaries", "obc_type", "flather_chapman"))))
 
+    # Lateral boundary relaxation (Price & Aumont 2011) parameters
+    boundary_method = Symbol(lowercase(String(get_val("boundaries", "method", "relaxation"))))
+    sponge_width_val = Float64(get_val("boundaries", "sponge_layer_width", 0.35))
+    sponge_tau_val   = Float64(get_val("boundaries", "sponge_timescale_seconds", 3600.0))
+    u_inflow_val     = Float64(get_val("boundaries", "u_inflow", -0.15))
+    v_inflow_val     = Float64(get_val("boundaries", "v_inflow", 0.05))
+
+    # Maximum allowable time step ceiling
+    max_dt_val = Float64(get_val("hydrodynamics", "max_dt_seconds", sim_dt))
+
     # Voronoi tessellation parameters
     enable_voronoi = Bool(get_val("tessellation", "enable_voronoi", false))
     voronoi_n_units = Int(get_val("tessellation", "n_units", 5000))
@@ -944,6 +974,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         anim_depth = anim_depth,
         anim_overlay_particles = anim_overlay,
         anim_output_path = anim_out_path,
+        boundary_method = boundary_method,
+        sponge_layer_width = sponge_width_val,
+        sponge_timescale = sponge_tau_val,
+        u_inflow = u_inflow_val,
+        v_inflow = v_inflow_val,
+        max_dt = max_dt_val,
         overrides...
     )
 end

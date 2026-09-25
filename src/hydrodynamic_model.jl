@@ -174,54 +174,82 @@ and Patankar-type quasi-implicit quadratic bottom drag.
 struct HorizontalMomentumForcingU{TF}
     tidal          :: TF
     has_sponge     :: Bool
-    sponge_bound_x :: Float64
-    sponge_bound_y :: Float64
-    sponge_width   :: Float64
-    sponge_tau     :: Float64
-    climatology    :: Bool
-    u_inflow_mean  :: Float64
-    u_inflow_decay :: Float64
-    omega_M2       :: Float64
-    omega_S2       :: Float64
+    lon_min        :: Float64   # western domain boundary (°E)
+    lon_max        :: Float64   # eastern domain boundary (°E)
+    lat_min        :: Float64   # southern domain boundary (°N)
+    lat_max        :: Float64   # northern domain boundary (°N)
+    sponge_width   :: Float64   # sponge buffer width (degrees)
+    sponge_tau     :: Float64   # relaxation timescale (s)
+    u_inflow_mean  :: Float64   # reference zonal inflow velocity (m/s)
+    u_inflow_decay :: Float64   # depth e-folding scale (m)
     bottom_drag    :: Float64
     cd_drag        :: Float64
 end
 
+"""
+    (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
+
+Zonal momentum forcing: tidal body force + multi-boundary quadratic sponge relaxation
+(Price & Aumont 2011) + Patankar-implicit quadratic bottom drag.
+
+Sponge gamma is the maximum of all four boundary ramp functions, ramping quadratically
+from 0 at the inner sponge edge to 1 at the domain wall. This is identical to the
+formulation in `LateralBoundaryRelaxation` and avoids ad-hoc sine-taper momentum
+discontinuities that cause CFL blow-up near immersed boundaries.
+"""
 @inline function (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
-    taper = 1.0
     sponge_val = 0.0
     if m.has_sponge
-        wall_x = m.sponge_bound_x + m.sponge_width
-        wall_y = m.sponge_bound_y - m.sponge_width
-        taper_x = x > m.sponge_bound_x ?
-            sin(0.5π * max(0.0, wall_x - x) / m.sponge_width) : 1.0
-        taper_y = y < m.sponge_bound_y ?
-            sin(0.5π * max(0.0, y - wall_y) / m.sponge_width) : 1.0
-        taper = taper_x * taper_y
+        # Eastern boundary (x → lon_max)
+        gamma_e = if x >= m.lon_max
+            1.0
+        elseif x <= (m.lon_max - m.sponge_width)
+            0.0
+        else
+            ((x - (m.lon_max - m.sponge_width)) / m.sponge_width)^2
+        end
 
-        if x > m.sponge_bound_x
-            dist_x = x - m.sponge_bound_x
-            gamma = if x >= wall_x
-                1.0
-            elseif x <= m.sponge_bound_x
-                0.0
-            else
-                (dist_x / m.sponge_width)^2
-            end
-            t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
-            u_target = taper * (m.u_inflow_mean * exp(Float64(z) / m.u_inflow_decay) +
-                       0.12 * sin(m.omega_M2 * t_eff) + 0.05 * sin(m.omega_S2 * t_eff))
-            sponge_val = -gamma * (u - u_target) / m.sponge_tau
+        # Western boundary (x → lon_min)
+        gamma_w = if x <= m.lon_min
+            1.0
+        elseif x >= (m.lon_min + m.sponge_width)
+            0.0
+        else
+            (((m.lon_min + m.sponge_width) - x) / m.sponge_width)^2
+        end
+
+        # Northern boundary (y → lat_max)
+        gamma_n = if y >= m.lat_max
+            1.0
+        elseif y <= (m.lat_max - m.sponge_width)
+            0.0
+        else
+            ((y - (m.lat_max - m.sponge_width)) / m.sponge_width)^2
+        end
+
+        # Southern boundary (y → lat_min)
+        gamma_s = if y <= m.lat_min
+            1.0
+        elseif y >= (m.lat_min + m.sponge_width)
+            0.0
+        else
+            (((m.lat_min + m.sponge_width) - y) / m.sponge_width)^2
+        end
+
+        gamma = max(gamma_e, gamma_w, gamma_n, gamma_s)
+        if gamma > 0.0
+            u_target = m.u_inflow_mean * exp(Float64(z) / m.u_inflow_decay)
+            sponge_val = -gamma * (Float64(u) - u_target) / m.sponge_tau
         end
     end
 
-    tide_val = taper * m.tidal(x, y, z, t)
+    tide_val = m.tidal(x, y, z, t)
 
     speed = sqrt(u^2 + v^2)
     tau_ref = 120.0
     drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
                  (1.0 + (m.bottom_drag + m.cd_drag * speed) * tau_ref)
-    drag_val = -drag_coeff * u
+    drag_val = -drag_coeff * Float64(u)
     return tide_val + sponge_val + drag_val
 end
 
@@ -231,61 +259,80 @@ end
 """
     HorizontalMomentumForcingV{TF}
 
-Bitstype callable struct for meridional momentum forcing on GPU/CPU with field dependencies.
-Combines harmonic tidal body forcing, wall-tapered lateral sponge relaxation,
-and Patankar-type quasi-implicit quadratic bottom drag.
+Bitstype callable struct for meridional momentum forcing on GPU/CPU.
+Combines harmonic tidal body forcing, multi-boundary quadratic sponge relaxation
+(Price & Aumont 2011), and Patankar-type quasi-implicit quadratic bottom drag.
+No sine wall tapering is applied to tidal forcing; relaxation covers all four
+open boundaries symmetrically.
 """
 struct HorizontalMomentumForcingV{TF}
     tidal          :: TF
     has_sponge     :: Bool
-    sponge_bound_x :: Float64
-    sponge_bound_y :: Float64
-    sponge_width   :: Float64
-    sponge_tau     :: Float64
-    climatology    :: Bool
-    v_inflow_mean  :: Float64
-    v_inflow_decay :: Float64
-    omega_M2       :: Float64
-    omega_S2       :: Float64
+    lon_min        :: Float64   # western domain boundary (°E)
+    lon_max        :: Float64   # eastern domain boundary (°E)
+    lat_min        :: Float64   # southern domain boundary (°N)
+    lat_max        :: Float64   # northern domain boundary (°N)
+    sponge_width   :: Float64   # sponge buffer width (degrees)
+    sponge_tau     :: Float64   # relaxation timescale (s)
+    v_inflow_mean  :: Float64   # reference meridional inflow velocity (m/s)
+    v_inflow_decay :: Float64   # depth e-folding scale (m)
     bottom_drag    :: Float64
     cd_drag        :: Float64
 end
 
 @inline function (m::HorizontalMomentumForcingV)(x, y, z, t, u, v)
-    taper = 1.0
     sponge_val = 0.0
     if m.has_sponge
-        wall_x = m.sponge_bound_x + m.sponge_width
-        wall_y = m.sponge_bound_y - m.sponge_width
-        taper_x = x > m.sponge_bound_x ?
-            sin(0.5π * max(0.0, wall_x - x) / m.sponge_width) : 1.0
-        taper_y = y < m.sponge_bound_y ?
-            sin(0.5π * max(0.0, y - wall_y) / m.sponge_width) : 1.0
-        taper = taper_x * taper_y
+        # Eastern boundary (x → lon_max)
+        gamma_e = if x >= m.lon_max
+            1.0
+        elseif x <= (m.lon_max - m.sponge_width)
+            0.0
+        else
+            ((x - (m.lon_max - m.sponge_width)) / m.sponge_width)^2
+        end
 
-        if y < m.sponge_bound_y
-            dist_y = m.sponge_bound_y - y
-            gamma = if y <= wall_y
-                1.0
-            elseif y >= m.sponge_bound_y
-                0.0
-            else
-                (dist_y / m.sponge_width)^2
-            end
-            t_eff = m.climatology ? mod(Float64(t), 31557600.0) : Float64(t)
-            v_target = taper * (m.v_inflow_mean * exp(Float64(z) / m.v_inflow_decay) +
-                       0.06 * cos(m.omega_M2 * t_eff))
-            sponge_val = -gamma * (v - v_target) / m.sponge_tau
+        # Western boundary (x → lon_min)
+        gamma_w = if x <= m.lon_min
+            1.0
+        elseif x >= (m.lon_min + m.sponge_width)
+            0.0
+        else
+            (((m.lon_min + m.sponge_width) - x) / m.sponge_width)^2
+        end
+
+        # Northern boundary (y → lat_max)
+        gamma_n = if y >= m.lat_max
+            1.0
+        elseif y <= (m.lat_max - m.sponge_width)
+            0.0
+        else
+            ((y - (m.lat_max - m.sponge_width)) / m.sponge_width)^2
+        end
+
+        # Southern boundary (y → lat_min)
+        gamma_s = if y <= m.lat_min
+            1.0
+        elseif y >= (m.lat_min + m.sponge_width)
+            0.0
+        else
+            (((m.lat_min + m.sponge_width) - y) / m.sponge_width)^2
+        end
+
+        gamma = max(gamma_e, gamma_w, gamma_n, gamma_s)
+        if gamma > 0.0
+            v_target = m.v_inflow_mean * exp(Float64(z) / m.v_inflow_decay)
+            sponge_val = -gamma * (Float64(v) - v_target) / m.sponge_tau
         end
     end
 
-    tide_val = taper * m.tidal(x, y, z, t)
+    tide_val = m.tidal(x, y, z, t)
 
     speed = sqrt(u^2 + v^2)
     tau_ref = 120.0
     drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
                  (1.0 + (m.bottom_drag + m.cd_drag * speed) * tau_ref)
-    drag_val = -drag_coeff * v
+    drag_val = -drag_coeff * Float64(v)
     return tide_val + sponge_val + drag_val
 end
 
@@ -378,6 +425,13 @@ function build_hydrodynamic_model(
     tracers::Tuple = (:T, :S),
     enable_o2::Bool = false,
     lateral_boundary_relaxation::Bool = false,
+    sponge_width::Float64 = 0.35,
+    sponge_tau::Float64 = 3600.0,
+    u_inflow::Float64 = -0.15,
+    v_inflow::Float64 = 0.05,
+    u_decay::Float64 = 200.0,
+    omega_m2::Float64 = (2π / 44712.0), # M2 period ≈ 12.42 h
+    omega_s2::Float64 = (2π / 43200.0),  # S2 period ≈ 12.0 h
     free_surface = ImplicitFreeSurface(),
     momentum_advection = WENOVectorInvariant(),
     tracer_advection = WENO()
@@ -428,69 +482,43 @@ function build_hydrodynamic_model(
         boundary_conditions[:O2] = FieldBoundaryConditions()
     end
 
-    # Grid-aware domain boundaries for lateral relaxation sponges
+    # Grid-aware full domain boundaries for lateral relaxation sponges.
+    # Extract all four domain edges so the sponge covers E/W/N/S uniformly,
+    # consistent with LateralBoundaryRelaxation (Price & Aumont 2011).
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    lon_min_grid = hasproperty(base_g, :λᶠᵃᵃ) ?
+        Float64(base_g.λᶠᵃᵃ[1]) : -68.0
     lon_max_grid = hasproperty(base_g, :λᶠᵃᵃ) ?
         Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]) : -57.0
     lat_min_grid = hasproperty(base_g, :φᵃᶠᵃ) ?
         Float64(base_g.φᵃᶠᵃ[1]) : 42.0
-    sponge_width = 0.35
-    sponge_bound_x = lon_max_grid - sponge_width
-    sponge_bound_y = lat_min_grid + sponge_width
+    lat_max_grid = hasproperty(base_g, :φᵃᶠᵃ) ?
+        Float64(base_g.φᵃᶠᵃ[base_g.Ny + 1]) : 47.5
 
-    # Active sponge relaxation for open boundary conditions on bounded regional domains
-    # Formulated following Price & Aumont (2011) without artificial clamping
+    # Active sponge relaxation following Price & Aumont (2011).
+    # Uses LateralBoundaryRelaxation directly for CPU path, or builds it into the
+    # bitstype HorizontalMomentumForcingU/V structs for GPU bitstype compatibility.
+    # u_decay / v_decay are depth e-folding scales (meters, positive value).
+    u_decay = 200.0
+    v_decay = 500.0
     active_sponge = if !isnothing(sponge_forcing)
         sponge_forcing
     elseif !isnothing(open_boundary_conditions) || lateral_boundary_relaxation
-        obc = open_boundary_conditions
-        u_ext = (!isnothing(obc) && hasproperty(obc, :u_east)) ? obc.u_east :
-                ((y, z, t) -> -0.15 * exp(Float64(z) / 200.0))
-        v_ext = (!isnothing(obc) && hasproperty(obc, :v_south)) ? obc.v_south :
-                ((x, z, t) -> 0.05 * exp(Float64(z) / 500.0))
+        # Build a LateralBoundaryRelaxation object and wrap into named-tuple closures
+        # so the CPU forcing path can dispatch identically to the GPU bitstype path.
+        lbr = LateralBoundaryRelaxation(
+            (lon_min_grid, lon_max_grid),
+            (lat_min_grid, lat_max_grid);
+            sponge_width_deg = sponge_width,
+            tau_relax        = sponge_tau,
+            u_inflow         = u_inflow,
+            v_inflow         = v_inflow,
+            u_ref            = (x, y, z, t) -> Float64(u_inflow) * exp(Float64(z) / u_decay),
+            v_ref            = (x, y, z, t) -> Float64(v_inflow) * exp(Float64(z) / v_decay)
+        )
         (
-            u = (x, y, z, t, u) -> begin
-                wall_x = sponge_bound_x + sponge_width
-                γ = if x <= sponge_bound_x
-                    0.0
-                elseif x >= wall_x
-                    1.0
-                else
-                    ((x - sponge_bound_x) / sponge_width)^2
-                end
-                wall_dist_x = max(0.0, wall_x - x)
-                taper_x = sin(0.5π * wall_dist_x / sponge_width)
-                wall_y = sponge_bound_y - sponge_width
-                taper_y = if y < sponge_bound_y
-                    wall_dist_y = max(0.0, y - wall_y)
-                    sin(0.5π * wall_dist_y / sponge_width)
-                else
-                    1.0
-                end
-                target = taper_x * taper_y * Float64(u_ext(y, z, t))
-                γ > 0.0 ? -γ * (u - target) / 3600.0 : 0.0
-            end,
-            v = (x, y, z, t, v) -> begin
-                wall_y = sponge_bound_y - sponge_width
-                γ = if y >= sponge_bound_y
-                    0.0
-                elseif y <= wall_y
-                    1.0
-                else
-                    ((sponge_bound_y - y) / sponge_width)^2
-                end
-                wall_dist_y = max(0.0, y - wall_y)
-                taper_y = sin(0.5π * wall_dist_y / sponge_width)
-                wall_x = sponge_bound_x + sponge_width
-                taper_x = if x > sponge_bound_x
-                    wall_dist_x = max(0.0, wall_x - x)
-                    sin(0.5π * wall_dist_x / sponge_width)
-                else
-                    1.0
-                end
-                target = taper_y * taper_x * Float64(v_ext(x, z, t))
-                γ > 0.0 ? -γ * (v - target) / 3600.0 : 0.0
-            end
+            u = (x, y, z, t, u) -> lbr(x, y, z, t, :u, u),
+            v = (x, y, z, t, v) -> lbr(x, y, z, t, :v, v)
         )
     else
         nothing
@@ -556,66 +584,58 @@ function build_hydrodynamic_model(
         has_obc = !isnothing(open_boundary_conditions) ||
                   !isnothing(sponge_forcing) ||
                   lateral_boundary_relaxation
-        obc = open_boundary_conditions
-        clim = !isnothing(obc) && hasproperty(obc, :climatology) ? obc.climatology : false
 
+        # GPU bitstype structs: multi-boundary quadratic sponge, no sine wall tapering.
+        # u_decay / v_decay are depth e-folding scales (m, positive).
+        u_decay_gpu = 200.0
+        v_decay_gpu = 500.0
         fu_gpu = HorizontalMomentumForcingU(
-            tf_u, has_obc, sponge_bound_x, sponge_bound_y, sponge_width, 3600.0, clim,
-            -0.15, 200.0, 2π / 44712.0, 2π / 43200.0,
+            tf_u,
+            has_obc,
+            lon_min_grid, lon_max_grid,
+            lat_min_grid, lat_max_grid,
+            sponge_width,
+            sponge_tau,
+            Float64(u_inflow), u_decay_gpu,
             Float64(bottom_drag), Float64(cd_drag)
         )
         fv_gpu = HorizontalMomentumForcingV(
-            tf_v, has_obc, sponge_bound_x, sponge_bound_y, sponge_width, 3600.0, clim,
-            0.05, 500.0, 2π / 44712.0, 2π / 43200.0,
+            tf_v,
+            has_obc,
+            lon_min_grid, lon_max_grid,
+            lat_min_grid, lat_max_grid,
+            sponge_width,
+            sponge_tau,
+            Float64(v_inflow), v_decay_gpu,
             Float64(bottom_drag), Float64(cd_drag)
         )
 
         (u = Forcing(fu_gpu, field_dependencies = (:u, :v)),
          v = Forcing(fv_gpu, field_dependencies = (:u, :v)))
     else
+        # CPU path: tidal forcing is passed without any boundary wall taper.
+        # Sponge relaxation is handled by active_sponge (LateralBoundaryRelaxation).
         total_Fu(x, y, z, t, u, v) = begin
-            raw_tide = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.u(x, y, z, t)
-            wall_x = sponge_bound_x + sponge_width
-            wall_y = sponge_bound_y - sponge_width
-            taper_x = x > sponge_bound_x ?
-                sin(0.5π * max(0.0, wall_x - x) / sponge_width) : 1.0
-            taper_y = y < sponge_bound_y ?
-                sin(0.5π * max(0.0, y - wall_y) / sponge_width) : 1.0
-            taper = taper_x * taper_y
-            tide_val = taper * raw_tide
+            tide_val = isnothing(tidal_forcing) ? 0.0 : Float64(tidal_forcing.u(x, y, z, t))
             speed = sqrt(u^2 + v^2)
             tau_ref = 120.0
             drag_coeff = (bottom_drag + cd_drag * speed) /
                          (1.0 + (bottom_drag + cd_drag * speed) * tau_ref)
-            drag_val = -drag_coeff * u
-            sponge_val = 0.0
-            if !isnothing(active_sponge) && hasproperty(active_sponge, :u)
-                sponge_val = active_sponge.u isa Function ?
-                    active_sponge.u(x, y, z, t, u) : 0.0
-            end
+            drag_val = -drag_coeff * Float64(u)
+            sponge_val = (!isnothing(active_sponge) && hasproperty(active_sponge, :u)) ?
+                Float64(active_sponge.u(x, y, z, t, u)) : 0.0
             return tide_val + drag_val + sponge_val
         end
 
         total_Fv(x, y, z, t, u, v) = begin
-            raw_tide = isnothing(tidal_forcing) ? 0.0 : tidal_forcing.v(x, y, z, t)
-            wall_x = sponge_bound_x + sponge_width
-            wall_y = sponge_bound_y - sponge_width
-            taper_x = x > sponge_bound_x ?
-                sin(0.5π * max(0.0, wall_x - x) / sponge_width) : 1.0
-            taper_y = y < sponge_bound_y ?
-                sin(0.5π * max(0.0, y - wall_y) / sponge_width) : 1.0
-            taper = taper_x * taper_y
-            tide_val = taper * raw_tide
+            tide_val = isnothing(tidal_forcing) ? 0.0 : Float64(tidal_forcing.v(x, y, z, t))
             speed = sqrt(u^2 + v^2)
             tau_ref = 120.0
             drag_coeff = (bottom_drag + cd_drag * speed) /
                          (1.0 + (bottom_drag + cd_drag * speed) * tau_ref)
-            drag_val = -drag_coeff * v
-            sponge_val = 0.0
-            if !isnothing(active_sponge) && hasproperty(active_sponge, :v)
-                sponge_val = active_sponge.v isa Function ?
-                    active_sponge.v(x, y, z, t, v) : 0.0
-            end
+            drag_val = -drag_coeff * Float64(v)
+            sponge_val = (!isnothing(active_sponge) && hasproperty(active_sponge, :v)) ?
+                Float64(active_sponge.v(x, y, z, t, v)) : 0.0
             return tide_val + drag_val + sponge_val
         end
 
