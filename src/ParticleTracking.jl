@@ -67,6 +67,8 @@ include("empirical_analysis.jl")
 include("voronoi_tessellation.jl")
 include("storage_duckdb.jl")
 include("visualization.jl")
+include("visualization_additions.jl")
+include("gl_visualization.jl")
 
 # Exported APIs
 export
@@ -244,6 +246,15 @@ export
     animate_hydrodynamic_field,
     animate_hydrodynamic_dashboard,
     export_interactive_tracks_html,
-    plot_interactive_trajectories_map
+    plot_interactive_trajectories_map,
+    plot_multi_panel_dashboard,
+    plot_voronoi_tessellation,
+    plot_particle_fate_summary,
+
+    # GLMakie 3D Visualizations
+    GLVisualization,
+    plot_3d_hydrodynamic_field,
+    plot_3d_particle_trajectories,
+    plot_3d_connectivity
 
 end # module ParticleTracking
