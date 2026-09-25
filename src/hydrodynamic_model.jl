@@ -10,6 +10,9 @@ using Oceananigans.Units
 using Oceananigans.Advection: WENOVectorInvariant
 using ClimaOcean
 
+# Import domain constants
+import ..NumericalEarth: STUDY_DOMAIN_LON_RANGE, STUDY_DOMAIN_LAT_RANGE
+
 """
     ZeroForcing
 
@@ -109,43 +112,12 @@ function LateralBoundaryRelaxation(
 end
 
 @inline function (r::LateralBoundaryRelaxation)(x, y, z, t, var::Symbol, psi::Real)
-    # Eastern boundary sponge (x -> lon_max)
-    gamma_e = if x >= r.lon_domain[2]
-        1.0
-    elseif x <= (r.lon_domain[2] - r.sponge_width_deg)
-        0.0
-    else
-        ((x - (r.lon_domain[2] - r.sponge_width_deg)) / r.sponge_width_deg)^2
-    end
-
-    # Western boundary sponge (x -> lon_min)
-    gamma_w = if x <= r.lon_domain[1]
-        1.0
-    elseif x >= (r.lon_domain[1] + r.sponge_width_deg)
-        0.0
-    else
-        (((r.lon_domain[1] + r.sponge_width_deg) - x) / r.sponge_width_deg)^2
-    end
-
-    # Northern boundary sponge (y -> lat_max)
-    gamma_n = if y >= r.lat_domain[2]
-        1.0
-    elseif y <= (r.lat_domain[2] - r.sponge_width_deg)
-        0.0
-    else
-        ((y - (r.lat_domain[2] - r.sponge_width_deg)) / r.sponge_width_deg)^2
-    end
-
-    # Southern boundary sponge (y -> lat_min)
-    gamma_s = if y <= r.lat_domain[1]
-        1.0
-    elseif y >= (r.lat_domain[1] + r.sponge_width_deg)
-        0.0
-    else
-        (((r.lat_domain[1] + r.sponge_width_deg) - y) / r.sponge_width_deg)^2
-    end
-
-    gamma = max(gamma_e, gamma_w, gamma_n, gamma_s)
+    gamma = compute_sponge_gamma(
+        x, y,
+        r.lon_domain[1], r.lon_domain[2],
+        r.lat_domain[1], r.lat_domain[2],
+        r.sponge_width_deg
+    )
     if gamma <= 0.0
         return 0.0
     end
@@ -163,6 +135,73 @@ end
 
 @inline (r::LateralBoundaryRelaxation)(x, y, z, t, psi) = r(x, y, z, t, :u, psi)
 @inline (r::LateralBoundaryRelaxation)(x, y, z, t) = 0.0
+
+"""
+    compute_sponge_gamma(x, y, lon_min, lon_max, lat_min, lat_max, sponge_width) -> Float64
+
+Compute the quadratic sponge relaxation weight γ ∈ [0, 1] for multi-boundary
+relaxation following Price & Aumont (2011). Returns the maximum relaxation weight
+across all four boundaries (east, west, north, south).
+"""
+@inline function compute_sponge_gamma(
+    x::Real, y::Real,
+    lon_min::Real, lon_max::Real,
+    lat_min::Real, lat_max::Real,
+    sponge_width::Real
+)::Float64
+    # Eastern boundary (x → lon_max)
+    gamma_e = if x >= lon_max
+        1.0
+    elseif x <= (lon_max - sponge_width)
+        0.0
+    else
+        ((x - (lon_max - sponge_width)) / sponge_width)^2
+    end
+
+    # Western boundary (x → lon_min)
+    gamma_w = if x <= lon_min
+        1.0
+    elseif x >= (lon_min + sponge_width)
+        0.0
+    else
+        (((lon_min + sponge_width) - x) / sponge_width)^2
+    end
+
+    # Northern boundary (y → lat_max)
+    gamma_n = if y >= lat_max
+        1.0
+    elseif y <= (lat_max - sponge_width)
+        0.0
+    else
+        ((y - (lat_max - sponge_width)) / sponge_width)^2
+    end
+
+    # Southern boundary (y → lat_min)
+    gamma_s = if y <= lat_min
+        1.0
+    elseif y >= (lat_min + sponge_width)
+        0.0
+    else
+        (((lat_min + sponge_width) - y) / sponge_width)^2
+    end
+
+    return max(gamma_e, gamma_w, gamma_n, gamma_s)
+end
+
+"""
+    compute_sponge_velocity_target(u_inflow_mean, v_inflow_mean, u_decay, v_decay, z) -> Tuple{Float64, Float64}
+
+Compute the target velocity for sponge relaxation with exponential depth decay.
+"""
+@inline function compute_sponge_velocity_target(
+    u_inflow_mean::Real, v_inflow_mean::Real,
+    u_decay::Real, v_decay::Real,
+    z::Real
+)::Tuple{Float64, Float64}
+    u_target = Float64(u_inflow_mean) * exp(Float64(z) / Float64(u_decay))
+    v_target = Float64(v_inflow_mean) * exp(Float64(z) / Float64(v_decay))
+    return (u_target, v_target)
+end
 
 """
     HorizontalMomentumForcingU{TF}
@@ -200,43 +239,12 @@ discontinuities that cause CFL blow-up near immersed boundaries.
 @inline function (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
     sponge_val = 0.0
     if m.has_sponge
-        # Eastern boundary (x → lon_max)
-        gamma_e = if x >= m.lon_max
-            1.0
-        elseif x <= (m.lon_max - m.sponge_width)
-            0.0
-        else
-            ((x - (m.lon_max - m.sponge_width)) / m.sponge_width)^2
-        end
-
-        # Western boundary (x → lon_min)
-        gamma_w = if x <= m.lon_min
-            1.0
-        elseif x >= (m.lon_min + m.sponge_width)
-            0.0
-        else
-            (((m.lon_min + m.sponge_width) - x) / m.sponge_width)^2
-        end
-
-        # Northern boundary (y → lat_max)
-        gamma_n = if y >= m.lat_max
-            1.0
-        elseif y <= (m.lat_max - m.sponge_width)
-            0.0
-        else
-            ((y - (m.lat_max - m.sponge_width)) / m.sponge_width)^2
-        end
-
-        # Southern boundary (y → lat_min)
-        gamma_s = if y <= m.lat_min
-            1.0
-        elseif y >= (m.lat_min + m.sponge_width)
-            0.0
-        else
-            (((m.lat_min + m.sponge_width) - y) / m.sponge_width)^2
-        end
-
-        gamma = max(gamma_e, gamma_w, gamma_n, gamma_s)
+        gamma = compute_sponge_gamma(
+            x, y,
+            m.lon_min, m.lon_max,
+            m.lat_min, m.lat_max,
+            m.sponge_width
+        )
         if gamma > 0.0
             u_target = m.u_inflow_mean * exp(Float64(z) / m.u_inflow_decay)
             sponge_val = -gamma * (Float64(u) - u_target) / m.sponge_tau
@@ -283,43 +291,12 @@ end
 @inline function (m::HorizontalMomentumForcingV)(x, y, z, t, u, v)
     sponge_val = 0.0
     if m.has_sponge
-        # Eastern boundary (x → lon_max)
-        gamma_e = if x >= m.lon_max
-            1.0
-        elseif x <= (m.lon_max - m.sponge_width)
-            0.0
-        else
-            ((x - (m.lon_max - m.sponge_width)) / m.sponge_width)^2
-        end
-
-        # Western boundary (x → lon_min)
-        gamma_w = if x <= m.lon_min
-            1.0
-        elseif x >= (m.lon_min + m.sponge_width)
-            0.0
-        else
-            (((m.lon_min + m.sponge_width) - x) / m.sponge_width)^2
-        end
-
-        # Northern boundary (y → lat_max)
-        gamma_n = if y >= m.lat_max
-            1.0
-        elseif y <= (m.lat_max - m.sponge_width)
-            0.0
-        else
-            ((y - (m.lat_max - m.sponge_width)) / m.sponge_width)^2
-        end
-
-        # Southern boundary (y → lat_min)
-        gamma_s = if y <= m.lat_min
-            1.0
-        elseif y >= (m.lat_min + m.sponge_width)
-            0.0
-        else
-            (((m.lat_min + m.sponge_width) - y) / m.sponge_width)^2
-        end
-
-        gamma = max(gamma_e, gamma_w, gamma_n, gamma_s)
+        gamma = compute_sponge_gamma(
+            x, y,
+            m.lon_min, m.lon_max,
+            m.lat_min, m.lat_max,
+            m.sponge_width
+        )
         if gamma > 0.0
             v_target = m.v_inflow_mean * exp(Float64(z) / m.v_inflow_decay)
             sponge_val = -gamma * (Float64(v) - v_target) / m.sponge_tau
@@ -487,13 +464,13 @@ function build_hydrodynamic_model(
     # consistent with LateralBoundaryRelaxation (Price & Aumont 2011).
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     lon_min_grid = hasproperty(base_g, :λᶠᵃᵃ) ?
-        Float64(base_g.λᶠᵃᵃ[1]) : -68.0
+        Float64(base_g.λᶠᵃᵃ[1]) : STUDY_DOMAIN_LON_RANGE[1]
     lon_max_grid = hasproperty(base_g, :λᶠᵃᵃ) ?
-        Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]) : -57.0
+        Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]) : STUDY_DOMAIN_LON_RANGE[2]
     lat_min_grid = hasproperty(base_g, :φᵃᶠᵃ) ?
-        Float64(base_g.φᵃᶠᵃ[1]) : 42.0
+        Float64(base_g.φᵃᶠᵃ[1]) : STUDY_DOMAIN_LAT_RANGE[1]
     lat_max_grid = hasproperty(base_g, :φᵃᶠᵃ) ?
-        Float64(base_g.φᵃᶠᵃ[base_g.Ny + 1]) : 47.5
+        Float64(base_g.φᵃᶠᵃ[base_g.Ny + 1]) : STUDY_DOMAIN_LAT_RANGE[2]
 
     # Active sponge relaxation following Price & Aumont (2011).
     # Uses LateralBoundaryRelaxation directly for CPU path, or builds it into the

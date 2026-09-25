@@ -51,7 +51,9 @@ using Oceananigans
 
 # Sub-components (in src/)
 include("numerical_earth.jl")
+include("config_schema.jl")
 include("configuration.jl")
+include("cli_parser.jl")
 include("open_data.jl")
 include("synthetic_data.jl")
 include("architecture.jl")
@@ -83,16 +85,22 @@ export
     configuration_to_options,
     options_to_configuration,
     get_default_configuration,
-    get_snowcrab_configuration,
-    get_snowcrab_tesselated_configuration,
-    SnowCrabRunOptions,
-    SnowCrabTesselatedRunOptions,
     find_default_config_path,
     resolve_config_name,
+
+    # Schema-based configuration (Configurations.jl)
+    ConfigSchema,
+    ParticleTrackingConfig,
+    load_config,
+    save_config,
+    schema_to_options,
+    load_configuration_schema,
 
     # Architecture and device resolution
     resolve_architecture,
 
+    # CLI Parser (ArgParse-based)
+    CLIParser,
 
     # Open real-world data and regridding
     fetch_open_bathymetry,

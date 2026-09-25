@@ -871,48 +871,69 @@ Extract, normalize, and format 2D and 3D hydrodynamic model fields (advection cu
 temperature, salinity, density, stratification, turbulent diffusion, viscosity,
 free surface elevation, and bathymetry) at specific depths and times.
 
+This is the central data extraction utility that handles multiple input formats:
+- Oceananigans model instances (live or serialized)
+- JLD2 simulation output files (timeseries groups with snapshot keys)
+- DuckDB analytical database connections (with optional run_id filter)
+- NamedTuple or Dict with pre-extracted fields
+- `nothing` (generates synthetic test data)
+
 # Mathematical Formulations
 - **Horizontal Advection Current Velocity**:
   ```math
-  \\boldsymbol{u}_h(x, y, z, t) = (u(x, y, z, t), v(x, y, z, t)), \\quad
-  |\\boldsymbol{u}_h| = \\sqrt{u^2 + v^2}
+  \boldsymbol{u}_h(x, y, z, t) = (u(x, y, z, t), v(x, y, z, t)), \quad
+  |\boldsymbol{u}_h| = \sqrt{u^2 + v^2}
   ```
 - **Seawater Temperature & Practical Salinity**:
   \$T(x, y, z, t)\$ in °C, \$S(x, y, z, t)\$ in PSU.
 - **Salinity & Density Stratification**:
   ```math
-  N^2(x, y, z, t) = -\\frac{g}{\\rho_0} \\frac{\\partial \\rho}{\\partial z}, \\quad
-  \\frac{\\partial S}{\\partial z}(x, y, z, t)
+  N^2(x, y, z, t) = -\frac{g}{\rho_0} \frac{\partial \rho}{\partial z}, \quad
+  \frac{\partial S}{\partial z}(x, y, z, t)
   ```
 - **Turbulent Eddy Diffusivity & Viscosity**:
-  \$\\kappa_v(x, y, z, t), \\nu_v(x, y, z, t)\$ in \$m^2 s^{-1}\$ parameterized via Richardson number.
+  \$\kappa_v(x, y, z, t), \nu_v(x, y, z, t)\$ in \$m^2 s^{-1}\$ parameterized via Richardson number.
+- **Gradient Richardson Number**:
+  ```math
+  Ri = \frac{N^2}{(\partial u/\partial z)^2 + (\partial v/\partial z)^2}
+  ```
+- **Relative Vorticity**:
+  ```math
+  \zeta = \frac{\partial v}{\partial x} - \frac{\partial u}{\partial y}
+  ```
 
 # Inputs
 - `hydro_input`: Oceananigans model, JLD2 file path, DuckDB connection, NamedTuple, Dict, or `nothing`.
-- `depth`: Optional continuous depth in meters (e.g. `-25.0` or `25.0`).
-- `depth_level`: Optional vertical level index (1-indexed).
-- `time_seconds`: Optional simulation time in seconds.
-- `time_index`: Optional discrete time snapshot index.
-- `domain_lon`: Longitudinal bounds `(min_lon, max_lon)`.
-- `domain_lat`: Latitudinal bounds `(min_lat, max_lat)`.
-- `grid_size`: Horizontal grid dimension `(nx, ny)`.
+- `depth`: Optional continuous depth in meters (e.g. `-25.0` or `25.0`). Uses nearest depth level.
+- `depth_level`: Optional vertical level index (1-indexed, overrides `depth`).
+- `time_seconds`: Optional simulation time in seconds (selects nearest snapshot).
+- `time_index`: Optional discrete time snapshot index (1-based, overrides `time_seconds`).
+- `domain_lon`: Longitudinal bounds `(min_lon, max_lon)` for synthetic fallback (default: embedding domain).
+- `domain_lat`: Latitudinal bounds `(min_lat, max_lat)` for synthetic fallback (default: embedding domain).
+- `grid_size`: Horizontal grid dimension `(nx, ny)` for synthetic fallback.
 - `target_depths`: Depth coordinates in meters (default `[-2.5, -25.0, -50.0, -100.0]`).
-- `run_id`: Optional DuckDB simulation run identifier.
+- `run_id`: Optional DuckDB simulation run identifier for multi-run queries.
 
 # Outputs
 - `NamedTuple` containing:
-  - `lons`, `lats`, `depths`: Grid coordinates.
+  - `lons`, `lats`, `depths`: Grid coordinate vectors (longitude °E, latitude °N, depth m).
   - `times`, `time_seconds`: Available timestamps and resolved snapshot time.
-  - `depth_index`, `depth_m`: Resolved vertical level and depth in meters.
-  - `u`, `v`, `w`, `speed`: Velocity fields (\$m s^{-1}\$).
-  - `temperature`, `salinity`: Hydrographic tracers (°C, PSU).
-  - `density`: Potential density (\$kg m^{-3}\$).
-  - `stratification`: Buoyancy frequency squared \$N^2\$ (\$s^{-2}\$).
-  - `salinity_stratification`: Vertical salinity gradient (\$PSU m^{-1}\$).
-  - `diffusion`, `viscosity`: Turbulent diffusivities (\$m^2 s^{-1}\$).
-  - `richardson_number`: Gradient Richardson number \$Ri\$.
-  - `vorticity`: Relative vorticity (\$s^{-1}\$).
+  - `depth_index`, `depth_m`: Resolved vertical level index and depth in meters.
+  - `u`, `v`, `w`, `speed`: Velocity fields at target depth (m/s, m/s, m/s, m/s).
+  - `temperature`, `salinity`: Hydrographic tracers at target depth (°C, PSU).
+  - `density`: Potential density at target depth (kg m⁻³).
+  - `stratification`: Buoyancy frequency squared \$N^2\$ at target depth (s⁻²).
+  - `salinity_stratification`: Vertical salinity gradient at target depth (PSU m⁻¹).
+  - `diffusion`, `viscosity`: Turbulent diffusivities at target depth (m²/s).
+  - `richardson_number`: Gradient Richardson number at target depth (dimensionless).
+  - `vorticity`: Relative vorticity at target depth (s⁻¹).
   - `elevation`, `bathymetry`: Surface elevation and seafloor depth (m).
+
+# Notes
+- For JLD2 files: extracts the full 3D fields at the resolved time snapshot, then interpolates
+  horizontally to a regular `(nx, ny)` grid and vertically to `target_depths`.
+- For `nothing` input: generates synthetic test fields matching the specified domain/grid.
+- Bathymetry is extracted from JLD2 `grid` group or computed from model grid.
 """
 function extract_hydrodynamic_dataset(
     hydro_input::Any;
@@ -1999,18 +2020,36 @@ transect line for any active hydrodynamic field (temperature, salinity, stratifi
 advection currents, turbulent diffusion) with seafloor bathymetry masking.
 
 # Inputs
-- `hydrodynamics`: Hydrodynamic model instance, JLD2 file, DuckDB database, or NamedTuple.
-- `variable`: Variable symbol: `:temperature`, `:salinity`, `:density`, `:stratification`,
-  `:diffusion`, `:viscosity`, `:speed`, `:u`, `:v`, `:w`.
-- `transect_type`: `:zonal` (fixed latitude, varying longitude) or `:meridional` (fixed longitude).
-- `coordinate`: Fixed latitude or longitude coordinate in degrees.
-- `time_seconds`: Simulation time in seconds.
-- `time_index`: Snapshot index.
-- `title`: Optional custom title.
-- `output_path`: Destination path.
+- `hydrodynamics`: Hydrodynamic model instance, JLD2 file, DuckDB database, or NamedTuple
+                   containing (lons, lats, depths, bathymetry, u, v, w, temperature, salinity,
+                   elevation, diffusion, viscosity, speed).
+- `variable`: Variable symbol to plot. Options:
+  - `:temperature` / `:T` - Seawater potential temperature (°C)
+  - `:salinity` / `:S` - Practical salinity (PSU)
+  - `:density` / `:rho` - Potential density (kg m⁻³)
+  - `:stratification` / `:N2` - Buoyancy frequency squared N² (10⁻⁴ s⁻²)
+  - `:diffusion` / `:kappa` - Vertical eddy diffusivity κ_v (10⁻⁴ m² s⁻¹)
+  - `:viscosity` / `:nu` - Vertical eddy viscosity ν_v (10⁻⁴ m² s⁻¹)
+  - `:speed` - Horizontal current speed √(u²+v²) (cm s⁻¹)
+  - `:u` - Zonal velocity (cm s⁻¹)
+  - `:v` - Meridional velocity (cm s⁻¹)
+  - `:w` - Vertical velocity (mm s⁻¹)
+- `transect_type`: Transect orientation:
+  - `:zonal` / `:lat` / `:latitude` / `:east_west` - East-west section at fixed latitude
+  - `:meridional` / `:lon` / `:longitude` / `:north_south` - North-south section at fixed longitude
+- `coordinate`: Fixed latitude (°N) for zonal transects, or fixed longitude (°E) for meridional transects.
+- `time_seconds`: Simulation time in seconds (selects nearest snapshot if not exact).
+- `time_index`: Snapshot index (1-based) as alternative to time_seconds.
+- `title`: Optional custom title string.
+- `output_path`: Destination file path (directory created if needed).
 
 # Outputs
-- `Figure`: CairoMakie figure object.
+- `Figure`: CairoMakie figure object with cross-section plot, bathymetry overlay, and colorbar.
+
+# Notes
+- Values below seafloor are masked to NaN (rendered transparent).
+- Cross-section data is extracted by finding the grid index nearest to `coordinate`.
+- Uses 16 contour levels by default; colormap chosen per variable.
 """
 function plot_hydrodynamic_section(
     hydrodynamics::Any;

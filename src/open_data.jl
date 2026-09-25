@@ -7,6 +7,11 @@ and aerodynamic drag formulations for realistic ocean hydrodynamic modeling.
 
 using NCDatasets
 using Downloads
+using Statistics
+using Interpolations
+
+# Import domain constants
+import ..NumericalEarth: STUDY_DOMAIN_LON_RANGE, STUDY_DOMAIN_LAT_RANGE, EMBEDDING_DOMAIN_LON_RANGE, EMBEDDING_DOMAIN_LAT_RANGE
 
 """
     wind_speed_to_kinematic_stress(
@@ -117,7 +122,7 @@ function regrid_2d_field(
     target_lon::AbstractVector,
     target_lat::AbstractVector
 )
-    # Ensure source coordinate sorting (ascending)
+    # Ensure source coordinates are sorted ascending
     lon_perm = sortperm(collect(src_lon))
     lat_perm = sortperm(collect(src_lat))
 
@@ -125,44 +130,23 @@ function regrid_2d_field(
     s_lat = collect(Float64, src_lat[lat_perm])
     s_field = Float64.(src_field[lon_perm, lat_perm])
 
-    n_src_x = length(s_lon)
-    n_src_y = length(s_lat)
+    # Create bilinear interpolation object using Interpolations.jl
+    # extrapolate with boundary value (flat extrapolation)
+    itp = interpolate(
+        (s_lon, s_lat),
+        s_field,
+        Gridded(Interpolations.Linear())
+    )
+    itp_extrap = extrapolate(itp, Interpolations.Flat())
+
+    # Evaluate at target coordinates
     n_tgt_x = length(target_lon)
     n_tgt_y = length(target_lat)
-
-    if n_src_x < 2 || n_src_y < 2
-        error("Source grid must have at least 2 points in each dimension.")
-    end
-
     interpolated = Matrix{Float64}(undef, n_tgt_x, n_tgt_y)
 
-    for (j_idx, y_val) in enumerate(target_lat)
-        # Find bracket in latitude
-        j = searchsortedlast(s_lat, y_val)
-        j = max(1, min(j, n_src_y - 1))
-        t_denom = s_lat[j + 1] - s_lat[j]
-        t = t_denom == 0.0 ? 0.0 : (y_val - s_lat[j]) / t_denom
-        t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t)
-
-        for (i_idx, x_val) in enumerate(target_lon)
-            # Find bracket in longitude
-            i = searchsortedlast(s_lon, x_val)
-            i = max(1, min(i, n_src_x - 1))
-            s_denom = s_lon[i + 1] - s_lon[i]
-            s = s_denom == 0.0 ? 0.0 : (x_val - s_lon[i]) / s_denom
-            s = s < 0.0 ? 0.0 : (s > 1.0 ? 1.0 : s)
-
-            f00 = s_field[i, j]
-            f10 = s_field[i + 1, j]
-            f01 = s_field[i, j + 1]
-            f11 = s_field[i + 1, j + 1]
-
-            val = (1.0 - s) * (1.0 - t) * f00 +
-                  s * (1.0 - t) * f10 +
-                  (1.0 - s) * t * f01 +
-                  s * t * f11
-
-            interpolated[i_idx, j_idx] = val
+    for (i_idx, x_val) in enumerate(target_lon)
+        for (j_idx, y_val) in enumerate(target_lat)
+            interpolated[i_idx, j_idx] = itp_extrap(x_val, y_val)
         end
     end
 
@@ -171,8 +155,8 @@ end
 
 """
     fetch_open_bathymetry(;
-        lon_range = (-68.0, -57.0),
-        lat_range = (42.0, 47.0),
+        lon_range = STUDY_DOMAIN_LON_RANGE,
+        lat_range = STUDY_DOMAIN_LAT_RANGE,
         output_path = joinpath("inputs", "real_bathymetry.nc"),
         dataset_id = "etopo180",
         stride = 1,
@@ -520,8 +504,8 @@ end
 
 """
     fetch_global_wind_atlas_raster(;
-        lon_range = (-68.0, -57.0),
-        lat_range = (42.0, 47.0),
+        lon_range = STUDY_DOMAIN_LON_RANGE,
+        lat_range = STUDY_DOMAIN_LAT_RANGE,
         height = 50,
         output_path = joinpath("inputs", "gwa_wind_speed.nc"),
         verbose = true
@@ -531,8 +515,8 @@ Download a regional GeoTIFF wind speed map from the Global Wind Atlas open GIS i
 and convert/export it into a standardized NetCDF file for hydrodynamic modeling.
 """
 function fetch_global_wind_atlas_raster(; 
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0), 
-    lat_range::Tuple{Real, Real} = (42.0, 47.0), 
+    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE, 
+    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE, 
     height::Int = 50, # Options: 10, 50, 100, 150, 200 meters
     output_path::AbstractString = joinpath("inputs", "gwa_wind_speed.nc"), 
     verbose::Bool = true
@@ -591,8 +575,8 @@ end
 
 """
     fetch_open_meteo_surface_winds(;
-        lon_range = (-68.0, -57.0),
-        lat_range = (42.0, 47.0),
+        lon_range = STUDY_DOMAIN_LON_RANGE,
+        lat_range = STUDY_DOMAIN_LAT_RANGE,
         time_iso = "2023-06-01T00:00:00Z",
         output_path = joinpath("inputs", "wind_active.nc"),
         verbose = true
@@ -628,11 +612,11 @@ Large & Pond (1981) and Wu (1982) and written into a standardized NetCDF file.
 - Large, W. G., & Pond, S. (1981). JPO, 11(3), 324-336.
 """
 function fetch_open_meteo_surface_winds(;
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0),
-    lat_range::Tuple{Real, Real} = (42.0, 47.0),
-    time_iso::AbstractString = "2023-06-01T00:00:00Z",
-    output_path::AbstractString = joinpath("inputs", "wind_active.nc"),
-    verbose::Bool = true
+    lon_range = STUDY_DOMAIN_LON_RANGE,
+    lat_range = STUDY_DOMAIN_LAT_RANGE,
+    time_iso = "2023-06-01T00:00:00Z",
+    output_path = joinpath("inputs", "wind_active.nc"),
+    verbose = true
 )
     mkpath(dirname(output_path))
     date_str = split(time_iso, "T")[1]
@@ -720,8 +704,8 @@ end
 
 """
     fetch_open_surface_winds(;
-        lon_range = (-68.0, -57.0),
-        lat_range = (42.0, 47.0),
+        lon_range = SCOTIAN_SHELF_LON_RANGE,
+        lat_range = SCOTIAN_SHELF_LAT_RANGE,
         time_iso = "2023-06-01T00:00:00Z",
         output_path = joinpath("inputs", "wind_active.nc"),
         verbose = true
@@ -745,11 +729,11 @@ Retrieve real observed/reanalyzed surface winds from open scientific data reposi
 - Large, W. G., & Pond, S. (1981). JPO, 11(3), 324-336.
 """
 function fetch_open_surface_winds(;
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0),
-    lat_range::Tuple{Real, Real} = (42.0, 47.0),
-    time_iso::AbstractString = "2023-06-01T00:00:00Z",
-    output_path::AbstractString = joinpath("inputs", "wind_active.nc"),
-    verbose::Bool = true
+    lon_range = STUDY_DOMAIN_LON_RANGE,
+    lat_range = STUDY_DOMAIN_LAT_RANGE,
+    time_iso = "2023-06-01T00:00:00Z",
+    output_path = joinpath("inputs", "wind_active.nc"),
+    verbose = true
 )
     mkpath(dirname(output_path))
     year_str = split(split(time_iso, "T")[1], "-")[1]
@@ -819,8 +803,8 @@ function fetch_open_surface_winds(;
 end
 
 """
-    fetch_copernicus_physics_subset(; lon_range = (-68.0, -57.0), 
-                                    lat_range = (42.0, 47.0), 
+    fetch_copernicus_physics_subset(; lon_range = STUDY_DOMAIN_LON_RANGE, 
+                                    lat_range = STUDY_DOMAIN_LAT_RANGE, 
                                     start_date = "2023-06-01", 
                                     end_date = "2023-06-30", 
                                     output_path = joinpath("inputs", "copernicus_ts.nc"),
@@ -830,8 +814,8 @@ Download a regional subset of 3D temperature and salinity fields from the Copern
 Marine Service Global Ocean Physics Reanalysis product.
 """
 function fetch_copernicus_physics_subset(; 
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0), 
-    lat_range::Tuple{Real, Real} = (42.0, 47.0), 
+    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE, 
+    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE, 
     start_date::AbstractString = "2023-06-01", 
     end_date::AbstractString = "2023-06-30", 
     output_path::AbstractString = joinpath("inputs", "copernicus_ts.nc"),
@@ -875,8 +859,8 @@ function fetch_copernicus_physics_subset(;
 end
 
 """
-    fetch_copernicus_surface_winds(; lon_range = (-68.0, -57.0), 
-                                   lat_range = (42.0, 47.0), 
+    fetch_copernicus_surface_winds(; lon_range = STUDY_DOMAIN_LON_RANGE, 
+                                   lat_range = STUDY_DOMAIN_LAT_RANGE, 
                                    time_iso = "2023-06-01T00:00:00Z", 
                                    output_path = joinpath("inputs", "copernicus_surface_winds.nc"), 
                                    verbose = true)
@@ -886,8 +870,8 @@ Retrieve 10-meter surface wind components (\$u_{10}, v_{10}\$) from Copernicus C
 Supports both the new Copernicus CDS-Beta infrastructure and legacy CDS API endpoints.
 """
 function fetch_copernicus_surface_winds(; 
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0), 
-    lat_range::Tuple{Real, Real} = (42.0, 47.0), 
+    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE, 
+    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE, 
     time_iso::AbstractString = "2023-06-01T00:00:00Z", 
     output_path::AbstractString = joinpath("inputs", "copernicus_surface_winds.nc"), 
     verbose::Bool = true

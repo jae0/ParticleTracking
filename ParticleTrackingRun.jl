@@ -127,8 +127,8 @@ DuckDB Analytical Storage & Model Averaging:
   --model-average         Compute ensemble model-averaged connectivity and recruitment.
 
 Centralized Configuration:
-  --config=<path>         Path to centralized .config file (default: inputs/ParticleTracking.config).
-  --save-config[=<path>]  Export active parameter options to .config file and exit.
+  --config=<path>         Path to centralized .toml file (default: inputs/ParticleTracking.toml).
+  --save-config[=<path>]  Export active parameter options to .toml file and exit.
 
 Ecosystem & Species Configurations:
   --snowcrab-settings     Load calibrated Snow Crab (Chionoecetes opilio) parameters:
@@ -276,7 +276,8 @@ using
     Oceananigans,
     Oceananigans.Units,
     Oceananigans.Utils,
-    ParticleTracking
+    ParticleTracking,
+    ParticleTracking.CLIParser
 
 """
     resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
@@ -529,8 +530,8 @@ function run_segment_model(;
 
     tidal_forcing = if opts.enable_tides
         println("Configuring astronomical tidal body forcing (M2 + S2 spring-neap envelope)...")
-        u_amps = Dict(:M2 => opts.tidal_u_amp, :S2 => opts.s2_u_scale * opts.tidal_u_amp)
-        v_amps = Dict(:M2 => opts.tidal_v_amp, :S2 => opts.s2_v_scale * opts.tidal_v_amp)
+        u_amps = Dict(:M2 => opts.tidal_u_amp, :S2 => opts.s2_u_amp)
+        v_amps = Dict(:M2 => opts.tidal_v_amp, :S2 => opts.s2_v_amp)
         build_tidal_body_forcing(
             constituents = [:M2, :S2],
             u_amplitudes = u_amps,
@@ -2112,9 +2113,9 @@ function main(args = ARGS)
     is_snowcrab = is_snowcrab_tesselated || "--snowcrab-settings" in args ||
                   "--snowcrab" in args || "--snowcrab-mode" in args
     config_file = if is_snowcrab_tesselated
-        joinpath("inputs", "snowcrab_tesselated.config")
+        joinpath("inputs", "snowcrab_tesselated.toml")
     elseif is_snowcrab
-        joinpath("inputs", "snowcrab.config")
+        joinpath("inputs", "snowcrab.toml")
     else
         find_default_config_path()
     end

@@ -12,6 +12,9 @@ using Oceananigans.OutputWriters: JLD2Writer, Checkpointer, checkpoint
 import Oceananigans.OutputWriters: cleanup_checkpoints
 using JLD2
 
+# Import domain constants for fallback coordinate generation
+import ..NumericalEarth: STUDY_DOMAIN_LON_RANGE, STUDY_DOMAIN_LAT_RANGE
+
 """
     compute_advective_cfl(
         model,
@@ -950,22 +953,22 @@ function create_flow_interpolator_from_jld2(
         end
 
         lon_raw = if !isnothing(ug) && hasproperty(ug, :λᶜᵃᵃ)
-            something(extract_coords(ug.λᶜᵃᵃ), collect(range(-68.0, -57.0, length = Nx)))
+            something(extract_coords(ug.λᶜᵃᵃ), collect(range(STUDY_DOMAIN_LON_RANGE[1], STUDY_DOMAIN_LON_RANGE[2], length = Nx)))
         elseif !isnothing(ug) && hasproperty(ug, :xᶜᵃᵃ)
-            something(extract_coords(ug.xᶜᵃᵃ), collect(range(-68.0, -57.0, length = Nx)))
+            something(extract_coords(ug.xᶜᵃᵃ), collect(range(STUDY_DOMAIN_LON_RANGE[1], STUDY_DOMAIN_LON_RANGE[2], length = Nx)))
         else
-            collect(range(-68.0, -57.0, length = Nx))
+            collect(range(STUDY_DOMAIN_LON_RANGE[1], STUDY_DOMAIN_LON_RANGE[2], length = Nx))
         end
         lons_vec = length(lon_raw) >= (Nx + 2 * Hx) ? lon_raw[i_c] :
                    (length(lon_raw) >= Nx ? lon_raw[1:Nx] :
                     collect(range(first(lon_raw), last(lon_raw), length = Nx)))
 
         lat_raw = if !isnothing(ug) && hasproperty(ug, :φᵃᶜᵃ)
-            something(extract_coords(ug.φᵃᶜᵃ), collect(range(42.0, 47.0, length = Ny)))
+            something(extract_coords(ug.φᵃᶜᵃ), collect(range(STUDY_DOMAIN_LAT_RANGE[1], STUDY_DOMAIN_LAT_RANGE[2], length = Ny)))
         elseif !isnothing(ug) && hasproperty(ug, :yᵃᶜᵃ)
-            something(extract_coords(ug.yᵃᶜᵃ), collect(range(42.0, 47.0, length = Ny)))
+            something(extract_coords(ug.yᵃᶜᵃ), collect(range(STUDY_DOMAIN_LAT_RANGE[1], STUDY_DOMAIN_LAT_RANGE[2], length = Ny)))
         else
-            collect(range(42.0, 47.0, length = Ny))
+            collect(range(STUDY_DOMAIN_LAT_RANGE[1], STUDY_DOMAIN_LAT_RANGE[2], length = Ny))
         end
         lats_vec = length(lat_raw) >= (Ny + 2 * Hy) ? lat_raw[j_c] :
                    (length(lat_raw) >= Ny ? lat_raw[1:Ny] :

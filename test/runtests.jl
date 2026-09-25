@@ -747,7 +747,7 @@ using ParticleTracking
     end
 
     @testset "15. Centralized Configuration File Management & Scenario Metadata" begin
-        config_path = "inputs/ParticleTracking.config"
+        config_path = "inputs/ParticleTracking.toml"
         @test isfile(config_path)
 
         # 1. Load centralized configuration and verify sections
@@ -789,7 +789,7 @@ using ParticleTracking
         @test cfg_out["climate"]["scenario"] == "ssp585"
 
         # 4. Test save and re-load configuration
-        test_save_path = "outputs/test_saved.config"
+        test_save_path = "outputs/test_saved.toml"
         save_configuration(cfg_out, test_save_path)
         @test isfile(test_save_path)
         cfg_reloaded = load_configuration(test_save_path)

@@ -1,0 +1,274 @@
+# ==============================================================================
+# Snow Crab (Chionoecetes opilio) Larval Tracking Configuration
+# Optimized for Scotian Shelf / Northwest Atlantic Domain
+# Generated with best-available open-access data sources
+# run: 
+# julia --project=C:\Users\xyz\projects\ParticleTracking C:\Users\xyz\projects\ParticleTracking\ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml --all --quick 
+# ==============================================================================
+
+[metadata]
+name = "Snow Crab Larval Dispersal Simulation"
+description = "Species-specific larval tracking for Chionoecetes opilio on the Scotian Shelf with thermal biology, DVM, and settlement criteria"
+author = "Jae Choi"
+version = "1.0.0"
+
+[data]
+# Data ingestion settings
+# - "real": fetch real-world bathymetry (ETOPO 2022) and atmospheric forcing (ERA5)
+# - "synthetic": generate idealized shelf bathymetry and analytical wind stress
+data_mode = "real"
+bathy_dataset_id = "etopo2022"   # Best available: ETOPO 2022 15-arcsec global relief model
+wind_dataset_id = "era5"         # Best available: ERA5 hourly reanalysis from Copernicus Climate Data Store
+hydrography_source = "woa23"     # Best available: World Ocean Atlas 2023 climatology
+wind_time_iso = "2020-06-01T00:00:00Z"  # Representative spring transition period for wind field
+inshore_depth = -20.0            # Coastal boundary depth for synthetic shelf (meters)
+shelf_slope = 500.0              # Bathymetric continental slope scale (meters)
+
+[climate]
+# Climate scenario configuration
+# Options: historical, ssp126, ssp245, ssp585, mhw, climatology
+scenario = "climatology"    # Climatological baseline (repeating annual cycle)
+
+projection_year = 2022      # the target year for climate projection (used for CMIP6 scenarios)
+baseline_year = 2020        # reference year for anomaly calculations (historical baseline)
+horizon_year = 2050         # standard CMIP6 projection horizon year (e.g., 2050, 2100)
+
+[domain]
+# Study Domain (Scotian Shelf): the core region of interest
+# lon/lat in degrees East/North; z in meters (negative = depth)
+lon_min = -68.0
+lon_max = -57.0
+lat_min = 42.0
+lat_max = 47.5
+z_min = -5000.0
+z_max = 0.0
+buffer_km = 50.0                 # Spatial buffer for particle seeding (km)
+
+# Embedding Domain: broader Northwest Atlantic region for boundary conditions and forcings
+# These bounds are used for GLORYS open boundary conditions and ERA5 atmospheric forcing
+# which need a larger domain than the study region
+embedding_lon_min = -71.0
+embedding_lon_max = -53.0
+embedding_lat_min = 40.0
+embedding_lat_max = 48.5
+
+[grid]
+# High-resolution grid for Scotian Shelf (~2.5 km resolution)
+# nx/ny: horizontal grid cell counts (zonal/meridional)
+# nz: vertical layers (stretched for surface/bottom resolution)
+# resolution_scale: multiplier for base 1/12° grid (2.5 = ~2.5 km cells)
+# vertical_stretching_mode: "tanh" (hyperbolic tangent, surface-refined) or "uniform" or "csv" (from file)
+# vertical_grid_file: custom vertical coordinate file when mode="csv" (depth in meters, negative=down)
+nx = 345
+ny = 245
+nz = 20
+resolution_scale = 2.5
+vertical_stretching_mode = "tanh"  # Hyperbolic tangent vertical layer stretching (surface/bottom-refined)
+vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"
+
+[bathymetry]
+# Best available bathymetry sources (in order of preference)
+# ETOPO 2022 (15-arcsec) is primary; ETOPO 180-arcsec is fallback
+source = "numerical_earth"      # Use NumericalEarth.jl for ingestion and regridding
+provider = "etopo2022"          # ETOPO 2022 15-arcsec global relief model
+resolution_arcsec = 15          # 15 arc-second resolution (~500 m at mid-latitudes)
+fallback_dataset_id = "etopo180" # Fallback: ETOPO 180-arcsec global relief
+inshore_depth = -20.0           # Coastal boundary depth (meters)
+shelf_slope = 500.0             # Bathymetric continental slope scale (meters)
+
+[atmosphere]
+# Best available atmospheric forcing from ERA5
+source = "era5_climatology"     # ERA5 monthly climatological envelope (seamless 365-day cycle)
+climatology = true              # Seamless cyclic loop (Dec 31 -> Jan 1 wrap-around)
+variables = ["u10", "v10", "t2m", "ssrd", "strd"]  # ERA5 single-level variables
+drag_formulation = "garratt_1977"  # Dynamic drag: Cd = (0.75 + 0.067*U10)*1e-3
+bulk_heat_flux = true           # Kinematic net heat flux (SW + LW + Sensible + Latent)
+
+[boundaries]
+# Open boundary conditions from GLORYS12V1 reanalysis (1/12° global)
+# Embedding domain bounds define the larger region for OBC extraction
+method = "relaxation"                   # Lateral boundary relaxation (Price & Aumont 2011)
+parent_ocean = "glorys_climatology"     # Long-term monthly ocean climatology
+ocean_boundary_source = "glorys12v1"    # GLORYS12V1 1/12° global reanalysis
+climatology = true                      # Seamless boundary cycling across simulation
+obc_type = "flather_chapman"            # Flather radiation for barotropic + Chapman for free surface
+active_boundaries = ["east", "south", "west"]
+sponge_layer_width = 0.25               # Sponge relaxation buffer (degrees lon/lat)
+sponge_timescale_seconds = 3600.0       # 1-hour relaxation timescale toward boundary values
+u_inflow = -0.15                        # Along-shelf upstream inflow velocity (m/s)
+v_inflow = 0.05                         # Cross-shelf upstream reference velocity (m/s)
+
+# Embedding domain bounds for open boundary condition extraction
+# These define the larger Northwest Atlantic region from which GLORYS data is extracted
+# Study domain is nested within this embedding domain
+embedding_lon_min = -71.0
+embedding_lon_max = -53.0
+embedding_lat_min = 40.0
+embedding_lat_max = 48.5
+
+[tides]
+# Astronomical tidal forcing with M2 + S2 spring-neap envelope
+# Tidal constituent data source:
+# - "tpxo9_atlas": Oregon State University TPXO9-Atlas (satellite altimetry constrained)
+# - "fes2014": Aviso FES2014 (altimetry + tide gauges)
+# - "tpxo8_atlas": Legacy TPXO8-Atlas
+# For the Northwest Atlantic, TPXO9 provides best accuracy for M2/S2 semi-diurnal constituents
+tides_source = "tpxo9_atlas"
+constituents = ["M2", "S2"]
+tidal_u_amp = 0.25      # M2 semi-major tidal velocity amplitude (m/s)
+tidal_v_amp = 0.12      # M2 semi-minor tidal velocity amplitude (m/s)
+s2_u_amp = 0.11         # S2 semi-major tidal velocity amplitude (m/s)
+s2_v_amp = 0.05         # S2 semi-minor tidal velocity amplitude (m/s)
+tidal_period = 44712.0  # M2 tidal period in seconds (12.42 hours)
+tidal_phase = 0.0       # Initial tidal phase angle (radians)
+
+[bottom_boundary_layer]
+# Quadratic bottom drag with TKE mixing closure
+cd_drag = 0.0025                    # Quadratic bottom drag coefficient (Cd)
+bottom_drag = 0.0001                # Background linear friction rate (s^-1)
+bbl_mixing_closure = "tke"          # Benthic boundary layer turbulent kinetic energy closure
+
+[hydrodynamics]
+# Multi-year climatological simulation (2 years = 17,520 hours)
+sim_duration_hours = 17520.0        # 2 years * 365 days * 24 hours
+sim_dt_seconds = 180.0              # Initial time step (seconds)
+adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
+target_cfl = 0.20                   # Conservative target advective CFL
+target_wave_cfl = 0.20              # Target wave CFL
+max_dt_seconds = 300.0              # Maximum time step ceiling (seconds)
+min_dt_seconds = 2.0                # Minimum allowable time step (seconds)
+coriolis_latitude = 44.5            # Reference Coriolis latitude (°N)
+divergence_velocity_limit = 20.0    # Stability watchdog threshold (m/s)
+surface_heat_flux = 50.0            # Summer net surface heat flux (W/m²)
+turbulence_closure = "nemotke"      # ClimaOcean NEMO-TKE vertical turbulence closure
+enable_sea_ice = true               # Thermodynamic seawater freezing and frazil diagnostics
+enable_oxygen = true                # Dissolved oxygen (O2) prognostic tracer
+output_schedule_seconds = 21600.0   # Field serialization cadence (every 6 hours)
+hydro_model_file = "hydrodynamics_snowcrab_climatology_2yr.jld2"
+enable_checkpoint = true            # Enable periodic prognostic state serialization
+
+# Checkpoint settings moved to [storage] section to avoid duplication
+# checkpoint_schedule = 3600.0      # Checkpoint frequency (seconds)
+# checkpoint_dir = "checkpoints"    # Checkpoint directory
+
+[tessellation]
+# Depth-stratified Voronoi tessellation for larval release and connectivity analysis
+# Partitions the study domain into N adaptive areal units based on bathymetry
+# Core Nursery Strata (50-350 m): 80% probability, 1.5 km minimum Poisson-disc separation
+#   - Resolves complex banks, gullies, and nursery depressions where snow crab settle
+# Shallow Coastal Strata (0-50 m): 10% probability, 5.0 km minimum separation
+#   - Lower resolution for nearshore areas with less larval settlement
+# Deep Slope & Basin Strata (>350 m): 10% probability, 10.0 km minimum separation
+#   - Coarse resolution for abyssal/slope regions with minimal settlement
+# slope_weighting: refines spacing along steep bathymetric gradients (shelf breaks, canyons)
+# slope_factor: multiplicative refinement factor (higher = more points on steep slopes)
+# Outputs: connectivity matrix P_ij (N×N), macro-strata matrix (3×3), GeoJSON polygons, DuckDB table
+enable_voronoi = true
+n_units = 5000
+bathymetry_source = "numerical_earth"
+core_depth_min = 50.0
+core_depth_max = 350.0
+core_prob = 0.8
+prob_core = 0.8
+core_min_res_km = 1.5
+min_res_core_km = 1.5
+shallow_depth_min = 0.0
+shallow_depth_max = 50.0
+shallow_prob = 0.1
+prob_shallow = 0.1
+shallow_min_res_km = 5.0
+min_res_shallow_km = 5.0
+deep_depth_min = 350.0
+deep_depth_max = 6000.0
+deep_prob = 0.1
+prob_deep = 0.1
+deep_min_res_km = 10.0
+min_res_deep_km = 10.0
+slope_weighting = true
+slope_factor = 15.0
+
+[biology]
+# Snow Crab (Chionoecetes opilio) larval parameters from published literature
+# References:
+# - Sainte-Marie & Sainte-Marie (1999) J. Crustacean Biol. 19(4):743-754
+# - Lovrich & Sainte-Marie (1997) MEPS 148:85-99
+# - Kuhn & Choi (2011) ICES J. Mar. Sci. 68(8):1673-1681
+n_particles = 500
+track_duration_days = 60.0          # Pelagic larval duration (PLD)
+track_dt_seconds = 300.0            # 5-minute Lagrangian integration step
+min_seabed_depth = 50.0             # Minimum water depth for larval release (m)
+diffusivity_h = 10.0                # Horizontal turbulent diffusivity (m²/s)
+diffusivity_v = 1e-4                # Vertical turbulent diffusivity (m²/s)
+release_depth_mode = "bottom"       # Benthic release mode
+bottom_release_offset = [0.5, 3.0]  # Height above seabed (meters)
+enable_initial_ascent = true        # Post-hatch negative geotaxis ascent
+ascent_speed = 0.010                # Ascent swimming speed (~10 mm/s)
+ascent_target_depth = -10.0         # Target epipelagic depth for ascent completion (m)
+buffer_km = 50.0                    # Spatial seeding buffer beyond boundaries (km)
+
+[dvm]
+# Diel Vertical Migration (DVM) parameters for snow crab larvae
+# Stage-specific day/night depths based on field observations (Sainte-Marie et al., Kuhn & Choi 2011)
+# DVM behavior: larvae migrate up at night for feeding, down during day for predator avoidance
+# zoea1_*: Zoea I stage (first larval stage, ~2-3 weeks post-hatch)
+# zoea2_*: Zoea II stage (second larval stage, ~4-6 weeks post-hatch)
+# megalopa_*: Megalopa stage (final larval stage, competent for settlement, ~6-8 weeks)
+# depth_factor: multiplies day/night depth for Zoea II (allows interannual/cohort variation)
+# swim_factor: multiplies vertical swimming speed for Megalopa (stronger swimmers)
+enable_dvm = true
+zoea1_day_depth = -50.0
+zoea1_night_depth = -10.0
+zoea2_day_depth = -55.0
+zoea2_night_depth = -8.0
+megalopa_day_depth = -120.0
+megalopa_night_depth = -60.0
+zoea2_depth_factor = 1.0            # Depth scaling factor for Zoea II
+megalopa_swim_factor = 1.0          # Swimming velocity scaling for Megalopa
+
+[molting_and_settlement]
+# Degree-day based molting and settlement criteria for snow crab
+# Base temperature T_base = -1.5°C for degree-day accumulation
+enable_molting = true
+t_base = -1.5                       # Base development temperature (°C)
+dd_zoea1_to_zoea2 = 65.0            # Zoea I -> Zoea II molt (degree-days)
+dd_zoea2_to_megalopa = 130.0        # Zoea II -> Megalopa molt (degree-days)
+dd_megalopa_to_settle = 200.0       # Megalopa settlement competency (degree-days)
+settlement_min_depth = -350.0       # Nursery maximum depth (meters)
+settlement_max_depth = -50.0        # Nursery minimum depth (meters)
+settlement_max_temp = 6.0           # Maximum benthic temperature for settlement (°C)
+
+# Mortality model: baseline + thermal stress + cold stress
+mortality_base = 0.01               # Baseline natural mortality rate (day^-1)
+mortality_thermal_threshold = 15.0  # Thermal stress threshold temperature (°C)
+mortality_thermal_sensitivity = 0.02 # Thermal excess mortality sensitivity (°C^-1)
+mortality_cold_threshold = 0.0      # Cold stress threshold temperature (°C)
+mortality_cold_sensitivity = 0.01   # Cold excess mortality sensitivity (day^-1 °C^-1)
+
+[storage]
+# Output and checkpoint configuration
+output_filename = "snowcrab.jld2"
+output_schedule_seconds = 21600.0   # Field output frequency (every 6 hours)
+checkpoint_fields = ["u", "v", "w", "T", "S", "η"]
+enable_duckdb = true                # Persist simulation run to DuckDB
+duckdb_path = "work/snowcrab/snowcrab.duckdb"  # Analytical DuckDB database path
+enable_checkpoint = true            # Enable state checkpointing
+checkpoint_prefix = "snowcrab_checkpoint"
+checkpoint_schedule = 21600.0       # Checkpoint cadence (every 6 hours)
+checkpoint_schedule_seconds = 21600.0
+checkpoint_dir = "work/snowcrab/checkpoints"  # Checkpoint directory
+cleanup_checkpoints = true          # Retain only latest checkpoint on disk
+auto_restart = true                 # Automatically resume from checkpoint
+
+[hardware]
+use_gpu = true                      # Enable NVIDIA CUDA GPU acceleration
+fallback_to_cpu = true              # Fallback to multi-threaded CPU if GPU absent
+
+[visualization]
+interactive_map = true              # Generate interactive HTML5 Leaflet.js dashboard
+title = "Snow Crab Larval Dispersal - Scotian Shelf"
+
+[paths]
+# All output goes to work/snowcrab/ when this config is used
+output_dir = "work/snowcrab"
+input_dir = "inputs"
+seed = 42

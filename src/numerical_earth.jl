@@ -23,6 +23,18 @@ using Dates
 using Statistics
 using LinearAlgebra
 using NCDatasets
+using Interpolations
+
+# Domain constants for Scotian Shelf / Northwest Atlantic
+# Study domain: the core region of interest (Scotian Shelf)
+const STUDY_DOMAIN_LON_RANGE = (-68.0, -57.0)  # degrees East
+const STUDY_DOMAIN_LAT_RANGE = (42.0, 47.5)    # degrees North
+const STUDY_DOMAIN_DEPTH_RANGE = (-5000.0, 0.0)  # meters
+
+# Embedding domain: broader Northwest Atlantic region for boundary conditions and forcings
+const EMBEDDING_DOMAIN_LON_RANGE = (-71.0, -53.0)  # degrees East
+const EMBEDDING_DOMAIN_LAT_RANGE = (40.0, 48.5)    # degrees North
+const EMBEDDING_DOMAIN_DEPTH_RANGE = (-5000.0, 0.0)  # meters
 
 # Physical constants for marine boundary layer & seawater thermodynamics
 const ρ_air    = 1.225      # Air density (kg/m³)
@@ -531,30 +543,8 @@ function regrid_bathymetry(
                 raw_e, lo, la
             end
 
-            # 2D bilinear interpolation onto target mesh
-            regridded = Matrix{Float64}(undef, Nx, Ny)
-            for j in 1:Ny
-                y_val = lats[j]
-                j_idx = clamp(searchsortedlast(src_lat, y_val), 1, length(src_lat) - 1)
-                t_denom = src_lat[j_idx + 1] - src_lat[j_idx]
-                t = t_denom == 0.0 ? 0.0 : clamp((y_val - src_lat[j_idx]) / t_denom, 0.0, 1.0)
-
-                for i in 1:Nx
-                    x_val = lons[i]
-                    i_idx = clamp(searchsortedlast(src_lon, x_val), 1, length(src_lon) - 1)
-                    s_denom = src_lon[i_idx + 1] - src_lon[i_idx]
-                    s = s_denom == 0.0 ? 0.0 : clamp((x_val - src_lon[i_idx]) / s_denom, 0.0, 1.0)
-
-                    e00 = elev[i_idx, j_idx]
-                    e10 = elev[i_idx + 1, j_idx]
-                    e01 = elev[i_idx, j_idx + 1]
-                    e11 = elev[i_idx + 1, j_idx + 1]
-
-                    interp_val = (1-s)*(1-t)*e00 + s*(1-t)*e10 + (1-s)*t*e01 + s*t*e11
-                    regridded[i, j] = interp_val
-                end
-            end
-            return regridded
+            # 2D bilinear interpolation onto target mesh using a robust implementation
+            return regrid_2d_bilinear(lons, lats, src_lon, src_lat, elev)
         catch err
             @warn "Failed regridding $(candidates[active_file]): $(err). Generating synthetic profile."
         end
@@ -583,6 +573,48 @@ function regrid_bathymetry(
     end
 
     return bathy
+end
+
+"""
+    regrid_2d_bilinear(tgt_lons, tgt_lats, src_lons, src_lats, src_data) -> Matrix{Float64}
+
+Perform 2D bilinear interpolation from irregular source grid to regular target grid.
+Uses Interpolations.jl for robust, well-tested interpolation.
+"""
+function regrid_2d_bilinear(
+    tgt_lons::Vector{<:Real}, tgt_lats::Vector{<:Real},
+    src_lons::Vector{<:Real}, src_lats::Vector{<:Real},
+    src_data::Matrix{<:Real}
+)::Matrix{Float64}
+    Nx, Ny = length(tgt_lons), length(tgt_lats)
+    n_src_lon, n_src_lat = length(src_lons), length(src_lats)
+    
+    # Ensure sorted source coordinates
+    lon_perm = sortperm(src_lons)
+    sorted_lons = src_lons[lon_perm]
+    lat_perm = sortperm(src_lats)
+    sorted_lats = src_lats[lat_perm]
+    sorted_data = src_data[lon_perm, :][:, lat_perm]
+    
+    # Create bilinear interpolation object
+    itp = interpolate(
+        (sorted_lons, sorted_lats),
+        sorted_data,
+        Gridded(Interpolations.Linear())
+    )
+    itp_extrap = extrapolate(itp, Interpolations.Flat())
+    
+    # Evaluate at target coordinates
+    result = Matrix{Float64}(undef, Nx, Ny)
+    for j in 1:Ny
+        y_val = Float64(tgt_lats[j])
+        for i in 1:Nx
+            x_val = Float64(tgt_lons[i])
+            result[i, j] = itp_extrap(x_val, y_val)
+        end
+    end
+    
+    return result
 end
 
 """
@@ -617,8 +649,8 @@ z \\le 0\\text{ (meters below sea surface)}
 function load_regional_bathymetry(;
     filepath::Union{Nothing, AbstractString} = nothing,
     source::Symbol = :gebco,
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0),
-    lat_range::Tuple{Real, Real} = (42.0, 47.5),
+    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE,
+    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE,
     input_dir::AbstractString = "inputs"
 )::NamedTuple{(:elevation, :lon, :lat), Tuple{Matrix{Float64}, Vector{Float64}, Vector{Float64}}}
     candidates = isnothing(filepath) ? [
@@ -684,8 +716,8 @@ end
 """
     get_bathymetry_interpolator(
         bathymetry = :numerical_earth;
-        lon_range::Tuple{Real, Real} = (-68.0, -57.0),
-        lat_range::Tuple{Real, Real} = (42.0, 47.5),
+        lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE,
+        lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE,
         input_dir::AbstractString = "inputs"
     ) -> Function
 
@@ -694,8 +726,8 @@ mediated by NumericalEarth seabed bathymetry.
 """
 function get_bathymetry_interpolator(
     bathymetry = :numerical_earth;
-    lon_range::Tuple{Real, Real} = (-68.0, -57.0),
-    lat_range::Tuple{Real, Real} = (42.0, 47.5),
+    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE,
+    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE,
     input_dir::AbstractString = "inputs"
 )
     if bathymetry isa Function
@@ -1055,9 +1087,21 @@ import .DataWrangling: regrid_bathymetry,
                       OpenBoundaryConditions,
                       AtmosphericForcing,
                       interpolate_ocean_state,
-                      build_sponge_layer_forcing
+                      build_sponge_layer_forcing,
+                      STUDY_DOMAIN_LON_RANGE,
+                      STUDY_DOMAIN_LAT_RANGE,
+                      STUDY_DOMAIN_DEPTH_RANGE,
+                      EMBEDDING_DOMAIN_LON_RANGE,
+                      EMBEDDING_DOMAIN_LAT_RANGE,
+                      EMBEDDING_DOMAIN_DEPTH_RANGE
 
 export DataWrangling,
+       STUDY_DOMAIN_LON_RANGE,
+       STUDY_DOMAIN_LAT_RANGE,
+       STUDY_DOMAIN_DEPTH_RANGE,
+       EMBEDDING_DOMAIN_LON_RANGE,
+       EMBEDDING_DOMAIN_LAT_RANGE,
+       EMBEDDING_DOMAIN_DEPTH_RANGE,
        regrid_bathymetry,
        load_regional_bathymetry,
        get_bathymetry_interpolator,

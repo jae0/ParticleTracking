@@ -3,7 +3,7 @@
 
 Centralized configuration manager for `ParticleTracking.jl`.
 Provides robust parsing, serialization, validation, and conversion between
-structured TOML/INI configuration files (such as `inputs/ParticleTracking.config`),
+structured TOML configuration files (such as `inputs/ParticleTracking.toml`),
 nested dictionaries, metadata records, and runtime `HydrodynamicOptions` structs.
 """
 
@@ -13,22 +13,22 @@ using TOML
     find_default_config_path() -> String
 
 Locate the default configuration file in the project workspace, checking
-`inputs/ParticalTracking.config`, `inputs/ParticleTracking.config`,
-`ParticalTracking.config`, or `ParticleTracking.config`.
+`inputs/ParticleTracking.toml`, `ParticleTracking.toml`,
+`inputs/ParticleTracking.config`, or `ParticleTracking.config`.
 """
 function find_default_config_path()::String
     candidates = [
+        joinpath("inputs", "ParticleTracking.toml"),
+        "ParticleTracking.toml",
         joinpath("inputs", "ParticleTracking.config"),
-        "ParticleTracking.config",
-        joinpath("inputs", "ParticalTracking.config"),
-        "ParticalTracking.config"
+        "ParticleTracking.config"
     ]
     for p in candidates
         if isfile(p)
             return p
         end
     end
-    return joinpath("inputs", "ParticleTracking.config")
+    return joinpath("inputs", "ParticleTracking.toml")
 end
 
 """
@@ -38,7 +38,7 @@ Extract the base configuration name from a config file path, or return
 the default configuration name (`"ParticleTracking"`) if unspecified or empty.
 
 # Inputs
-- `config_file::AbstractString`: Path to a `.config` file or empty string.
+- `config_file::AbstractString`: Path to a `.toml` file or empty string.
 
 # Outputs
 - `String`: Clean configuration identifier without directory or extension.
@@ -129,6 +129,8 @@ struct HydrodynamicOptions
     enable_tides             :: Bool
     tidal_u_amp              :: Float64
     tidal_v_amp              :: Float64
+    s2_u_amp                 :: Float64
+    s2_v_amp                 :: Float64
     scenario                 :: Symbol
     projection_year          :: Int
     sim_dt                   :: Float64
@@ -210,6 +212,8 @@ function HydrodynamicOptions(;
     enable_tides          :: Bool = true,
     tidal_u_amp           :: Real = 0.25,
     tidal_v_amp           :: Real = 0.12,
+    s2_u_amp              :: Real = 0.11,
+    s2_v_amp              :: Real = 0.05,
     scenario              :: Symbol = :ssp245,
     projection_year       :: Int = 2050,
     sim_dt                :: Real = 120.0,
@@ -295,6 +299,8 @@ function HydrodynamicOptions(;
         enable_tides,
         Float64(tidal_u_amp),
         Float64(tidal_v_amp),
+        Float64(s2_u_amp),
+        Float64(s2_v_amp),
         scenario,
         projection_year,
         Float64(sim_dt),
@@ -369,11 +375,11 @@ end
 """
     load_configuration(config_path::AbstractString = find_default_config_path()) -> Dict{String, Any}
 
-Read and parse a centralized `ParticleTracking.config` file into a nested Julia Dictionary.
+Read and parse a centralized `ParticleTracking.toml` file into a nested Julia Dictionary.
 If the requested file does not exist, returns the default parameter configuration dictionary.
 
 # Inputs
-- `config_path::AbstractString`: Path to the `.config` (TOML format) file.
+- `config_path::AbstractString`: Path to the `.toml` (TOML format) file.
 
 # Outputs
 - `Dict{String, Any}`: Nested dictionary containing all sectioned parameter settings.
@@ -386,32 +392,20 @@ function load_configuration(
             return TOML.parsefile(config_path)
         catch err
             @warn "Failed to parse configuration file at $(config_path): $(err). Using defaults."
-            if occursin("snowcrab_tesselated", lowercase(config_path))
-                return get_snowcrab_tesselated_configuration()
-            elseif occursin("snowcrab", lowercase(config_path))
-                return get_snowcrab_configuration()
-            else
-                return get_default_configuration()
-            end
-        end
-    else
-        if occursin("snowcrab_tesselated", lowercase(config_path))
-            return get_snowcrab_tesselated_configuration()
-        elseif occursin("snowcrab", lowercase(config_path))
-            return get_snowcrab_configuration()
-        else
             return get_default_configuration()
         end
+    else
+        return get_default_configuration()
     end
 end
 
 """
     save_configuration(
         config_dict::AbstractDict,
-        config_path::AbstractString = joinpath("inputs", "ParticleTracking.config")
+        config_path::AbstractString = joinpath("inputs", "ParticleTracking.toml")
     ) -> String
 
-Serialize a nested configuration dictionary to a centralized `.config` file in TOML format.
+Serialize a nested configuration dictionary to a centralized `.toml` file in TOML format.
 
 # Inputs
 - `config_dict::AbstractDict`: Dictionary of configuration sections and key-values.
@@ -422,7 +416,7 @@ Serialize a nested configuration dictionary to a centralized `.config` file in T
 """
 function save_configuration(
     config_dict::AbstractDict,
-    config_path::AbstractString = joinpath("inputs", "ParticleTracking.config")
+    config_path::AbstractString = joinpath("inputs", "ParticleTracking.toml")
 )::String
     out_dir = dirname(abspath(config_path))
     if !isdir(out_dir)
@@ -580,191 +574,6 @@ function get_default_configuration()::Dict{String, Any}
 end
 
 """
-    get_snowcrab_configuration() -> Dict{String, Any}
-
-Generate a configuration dictionary calibrated specifically for snow crab (*Chionoecetes opilio*)
-larval transport modeling across the Scotian Shelf and Northwest Atlantic.
-
-# Biophysical Calibration & Parameters
-- **Domain**: Scotian Shelf & continental slope (`lon`: [-68.0, -57.0] °E, `lat`: [42.0, 47.5] °N, `z`: [-3500.0, 0.0] m).
-- **Grid**: High-resolution 100 × 100 × 20 cells.
-- **Data**: Real bathymetry and atmospheric forcing (`data_mode`: "real").
-- **Tides**: M2 (0.25 m/s) + S2 (0.11 m/s) tidal current forcing with quadratic bottom drag.
-- **Biology**: 500 larvae released from commercial nursery depths (≥ 100 m) in benthic boundary layer ([0.5, 3.0] m off bed).
-- **Behaviors**: Active vertical ascent (10 mm/s to -10 m), stage-dependent DVM, and degree-day thermal molting
-  (base temperature \$T_{base} = -1.5\$ °C; stage thresholds: 65, 130, 200 DD).
-- **Duration**: 60.0 days pelagic larval duration (PLD) advected at 300 s time steps.
-- **Storage**: DuckDB target configured as `outputs/snowcrab_tracking.duckdb`.
-
-# Outputs
-- `Dict{String, Any}`: Nested dictionary containing snow crab calibrated parameters.
-"""
-function get_snowcrab_configuration()::Dict{String, Any}
-    return Dict{String, Any}(
-        "domain" => Dict{String, Any}(
-            "lon_min" => -68.0,
-            "lon_max" => -57.0,
-            "lat_min" => 42.0,
-            "lat_max" => 47.5,
-            "z_min" => -3500.0,
-            "z_max" => 0.0,
-            "buffer_km" => 100.0
-        ),
-        "grid" => Dict{String, Any}(
-            "nx" => 345,
-            "ny" => 245,
-            "nz" => 20,
-            "resolution_scale" => 2.5,
-            "vertical_stretching_mode" => "tanh",
-            "vertical_grid_file" => "inputs/scotian_shelf_vertical_grid.csv"
-        ),
-        "data" => Dict{String, Any}(
-            "data_mode" => "real",
-            "bathy_dataset_id" => "etopo180",
-            "wind_dataset_id" => "erdBSwinds1day",
-            "wind_time_iso" => "2020-06-01T00:00:00Z",
-            "inshore_depth" => -100.0,
-            "shelf_slope" => 500.0
-        ),
-        "tides" => Dict{String, Any}(
-            "enable_tides" => true,
-            "constituents" => ["M2", "S2"],
-            "tidal_u_amp" => 0.25,
-            "tidal_v_amp" => 0.12,
-            "s2_u_amp" => 0.11,
-            "s2_v_amp" => 0.05,
-            "tidal_period" => 44712.0,
-            "tidal_phase" => 0.0
-        ),
-        "climate" => Dict{String, Any}(
-            "scenario" => "historical",
-            "projection_year" => 2020,
-            "baseline_year" => 2020,
-            "horizon_year" => 2050
-        ),
-        "hydrodynamics" => Dict{String, Any}(
-            "sim_duration_hours" => 120.0,
-            "sim_dt_seconds" => 120.0,
-            "adaptive_cfl" => true,
-            "target_cfl" => 0.2,
-            "divergence_velocity_limit" => 20.0,
-            "coriolis_latitude" => 44.5,
-            "surface_heat_flux" => 50.0
-        ),
-        "biology" => Dict{String, Any}(
-            "n_particles" => 500,
-            "track_duration_days" => 60.0,
-            "track_dt_seconds" => 300.0,
-            "min_seabed_depth" => 100.0,
-            "buffer_km" => 100.0,
-            "diffusivity_h" => 10.0,
-            "diffusivity_v" => 1e-4,
-            "release_depth_mode" => "bottom",
-            "bottom_release_offset" => [0.5, 3.0],
-            "enable_initial_ascent" => true,
-            "ascent_speed" => 0.010,
-            "ascent_target_depth" => -10.0
-        ),
-        "dvm" => Dict{String, Any}(
-            "enable_dvm" => true,
-            "megalopa_day_depth" => -120.0,
-            "megalopa_night_depth" => -60.0,
-            "zoea2_depth_factor" => 1.2,
-            "megalopa_swim_factor" => 1.5
-        ),
-        "molting_and_settlement" => Dict{String, Any}(
-            "enable_molting" => true,
-            "t_base" => -1.5,
-            "dd_zoea1_to_zoea2" => 65.0,
-            "dd_zoea2_to_megalopa" => 130.0,
-            "dd_megalopa_to_settle" => 200.0,
-            "mortality_base" => 0.02,
-            "mortality_thermal_threshold" => 7.0,
-            "mortality_thermal_sensitivity" => 0.35,
-            "mortality_cold_threshold" => -1.5,
-            "mortality_cold_sensitivity" => 0.02,
-            "settlement_min_depth" => -250.0,
-            "settlement_max_depth" => -50.0,
-            "settlement_max_temp" => 6.0
-        ),
-        "storage" => Dict{String, Any}(
-            "enable_duckdb" => true,
-            "duckdb_path" => "outputs/snowcrab_tracking.duckdb",
-            "enable_checkpoint" => true,
-            "checkpoint_prefix" => "checkpoint_snowcrab",
-            "checkpoint_schedule_seconds" => 21600.0,
-            "checkpoint_dir" => "outputs/checkpoints",
-            "checkpoint_cleanup" => true
-        ),
-        "hardware" => Dict{String, Any}(
-            "use_gpu" => true,
-            "fallback_to_cpu" => true
-        ),
-        "atmosphere" => Dict{String, Any}(
-            "source" => "era5",
-            "drag_formulation" => "garratt_1977",
-            "bulk_heat_flux" => true,
-            "climatology" => false
-        ),
-        "boundaries" => Dict{String, Any}(
-            "ocean_boundary_source" => "glorys12v1",
-            "obc_type" => "flather_chapman",
-            "sponge_layer_width" => 0.25,
-            "sponge_timescale" => 3600.0
-        ),
-        "visualization" => Dict{String, Any}(
-            "interactive_map" => true,
-            "title" => "Scotian Shelf Snow Crab Larval Dispersal & Demographic Connectivity"
-        ),
-        "paths" => Dict{String, Any}(
-            "output_dir" => "outputs",
-            "input_dir" => "inputs",
-            "seed" => 42
-        )
-    )
-end
-
-"""
-    get_snowcrab_tesselated_configuration() -> Dict{String, Any}
-
-Generate a configuration dictionary calibrated specifically for snow crab (*Chionoecetes opilio*)
-larval transport with multi-resolution, depth-stratified Voronoi tessellation analysis.
-
-# Biophysical Calibration & Parameters
-- Inherits all baseline Scotian Shelf biophysical calibrations from `get_snowcrab_configuration()`.
-- Incorporates a dedicated `[tessellation]` block configuring \$N = 5000\$ Voronoi units:
-  - **Core Nursery Strata** (50 to 350 m depth): Probability weight \$p = 0.8\$, minimum
-    separation distance 1.5 km (resolving complex banks, gullies, and nursery depressions).
-  - **Shallow Coastal Strata** (0 to 50 m depth): Probability weight \$p = 0.1\$, minimum
-    separation distance 5.0 km.
-  - **Deep Slope & Basin Strata** (> 350 m depth): Probability weight \$p = 0.1\$, minimum
-    separation distance 10.0 km.
-- Persistence configured to `outputs/snowcrab_tesselated.duckdb`.
-
-# Outputs
-- `Dict{String, Any}`: Nested dictionary containing snow crab tessellated parameter settings.
-"""
-function get_snowcrab_tesselated_configuration()::Dict{String, Any}
-    cfg = get_snowcrab_configuration()
-    cfg["storage"]["duckdb_path"] = "outputs/snowcrab_tesselated.duckdb"
-    cfg["storage"]["checkpoint_prefix"] = "checkpoint_snowcrab_tesselated"
-    cfg["visualization"]["title"] = "Scotian Shelf Snow Crab Multi-Resolution Voronoi Dispersal & Connectivity"
-    cfg["tessellation"] = Dict{String, Any}(
-        "enable_voronoi" => true,
-        "n_units" => 5000,
-        "prob_core" => 0.8,
-        "prob_shallow" => 0.1,
-        "prob_deep" => 0.1,
-        "min_res_core_km" => 1.5,
-        "min_res_shallow_km" => 5.0,
-        "min_res_deep_km" => 10.0,
-        "core_depth_min" => -350.0,
-        "core_depth_max" => -50.0
-    )
-    return cfg
-end
-
-"""
     configuration_to_options(config_dict::AbstractDict; overrides...) -> HydrodynamicOptions
 
 Convert a configuration dictionary into a validated `HydrodynamicOptions` instance,
@@ -804,6 +613,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     enable_tides = Bool(get_val("tides", "enable_tides", true))
     tidal_u = Float64(get_val("tides", "tidal_u_amp", 0.25))
     tidal_v = Float64(get_val("tides", "tidal_v_amp", 0.12))
+    s2_u = Float64(get_val("tides", "s2_u_amp", 0.11))
+    s2_v = Float64(get_val("tides", "s2_v_amp", 0.05))
 
     scenario = Symbol(get_val("climate", "scenario", "ssp245"))
     proj_year = Int(get_val("climate", "projection_year", 2050))
@@ -913,6 +724,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         enable_tides = enable_tides,
         tidal_u_amp = tidal_u,
         tidal_v_amp = tidal_v,
+        s2_u_amp = s2_u,
+        s2_v_amp = s2_v,
         scenario = scenario,
         projection_year = proj_year,
         sim_dt = sim_dt,
@@ -1023,7 +836,9 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         "tides" => Dict{String, Any}(
             "enable_tides" => opts.enable_tides,
             "tidal_u_amp" => opts.tidal_u_amp,
-            "tidal_v_amp" => opts.tidal_v_amp
+            "tidal_v_amp" => opts.tidal_v_amp,
+            "s2_u_amp" => opts.s2_u_amp,
+            "s2_v_amp" => opts.s2_v_amp
         ),
         "climate" => Dict{String, Any}(
             "scenario" => string(opts.scenario),
@@ -1100,71 +915,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "seed" => opts.seed
         )
     )
-end
-
-"""
-    SnowCrabRunOptions(; kwargs...) -> HydrodynamicOptions
-
-Construct a `HydrodynamicOptions` instance pre-configured with calibrated physical
-and biophysical parameters for snow crab (*Chionoecetes opilio*) larval transport
-across the Scotian Shelf and Northwest Atlantic continental slope.
-
-# Mathematical & Biophysical Formulations
-Snow crab larvae hatch from benthic nurseries (\$z_{\\text{bed}} \\le -100\\text{ m}\$)
-and actively ascend to the epipelagic zone:
-- **Larval Cohort**: 500 larvae tracked for 60.0 days pelagic larval duration (PLD)
-  at \$\\Delta t = 300\\text{ s}\$.
-- **Spatial Domain**: Scotian Shelf & slope (\$\\lambda \\in [-68.0, -57.0]^\\circ\\text{E}\$,
-  \$\\phi \\in [42.0, 47.5]^\\circ\\text{N}\$, \$z \\in [-3500.0, 0.0]\\text{ m}\$).
-- **Grid Resolution**: \$100 \\times 100 \\times 20\$ grid cells with \$100\\text{ km}\$
-  CFA buffer.
-- **Benthic Release & Active Ascent**: Initial placement in near-bottom boundary layer
-  ([0.5, 3.0] m off bed) with directed upward swimming (\$w = 0.010\\text{ m/s}\$)
-  relaxing toward \$-10.0\\text{ m}\$, smoothly transitioning to stage-dependent DVM.
-- **Degree-Day Thermal Molting**: Base temperature \$T_{\\text{base}} = -1.5^\\circ\\text{C}\$
-  with cumulative degree-day thresholds (Zoea I \$\\to\$ Zoea II: 65 DD,
-  Zoea II \$\\to\$ Megalopa: 130 DD, Megalopa \$\\to\$ Benthic Settlement: 200 DD).
-- **Environmental Forcing & Storage**: Real bathymetry and winds, \$M_2 + S_2\$ tidal
-  harmonics, summer heat flux (\$50\\text{ W/m}^2\$), and DuckDB storage
-  (`outputs/snowcrab_tracking.duckdb`).
-
-# Inputs
-- `kwargs...`: Optional keyword overrides for any field of `HydrodynamicOptions`
-  (e.g., `n_particles = 200`, `ascent_speed = 0.015`, `hydro_model_file = "..."`,
-  `track_only = true`, `run_id = "cohort_2020"`).
-
-# Outputs
-- `HydrodynamicOptions`: Validated runtime options instance with snow crab defaults.
-
-# References
-- Sainte-Marie, G., & Sainte-Marie, B. (1999). Hatching and larval release in the
-  snow crab, *Chionoecetes opilio*. *Journal of Crustacean Biology*, 19(4), 743-754.
-- Lovrich, G. A., & Sainte-Marie, B. (1997). Cannibalism in the snow crab:
-  implications for larval recruitment. *Marine Ecology Progress Series*, 148, 85-99.
-- Kuhn, P. S., & Choi, J. S. (2011). Influence of temperature on snow crab larval
-  development. *ICES Journal of Marine Science*, 68(8), 1673-1681.
-"""
-function SnowCrabRunOptions(; kwargs...)::HydrodynamicOptions
-    cfg = get_snowcrab_configuration()
-    return configuration_to_options(cfg; kwargs...)
-end
-
-"""
-    SnowCrabTesselatedRunOptions(; kwargs...) -> HydrodynamicOptions
-
-Construct a `HydrodynamicOptions` instance pre-configured with calibrated physical
-and biophysical parameters for snow crab (*Chionoecetes opilio*) and multi-resolution
-depth-stratified Voronoi tessellation analysis.
-
-# Inputs
-- `kwargs...`: Optional keyword overrides for any field of `HydrodynamicOptions`.
-
-# Outputs
-- `HydrodynamicOptions`: Validated runtime options instance with snow crab tessellated defaults.
-"""
-function SnowCrabTesselatedRunOptions(; kwargs...)::HydrodynamicOptions
-    cfg = get_snowcrab_tesselated_configuration()
-    return configuration_to_options(cfg; kwargs...)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1436,6 +1186,145 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         Float64(d[:settlement_max_temp]), Bool(d[:enable_duckdb]),
         String(d[:duckdb_path]), String(d[:run_id]), Int(d[:seed])
     )
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema-based Configuration Conversion
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    schema_to_options(config::ConfigSchema.ParticleTrackingConfig) -> HydrodynamicOptions
+
+Convert a validated schema-based configuration to runtime HydrodynamicOptions.
+"""
+function schema_to_options(config::ConfigSchema.ParticleTrackingConfig)::HydrodynamicOptions
+    # Helper for converting string to symbol
+    str_to_sym(s::String) = Symbol(lowercase(s))
+    
+    # Build vertical grid file path
+    v_grid_file = config.grid.vertical_grid_file
+    if !isempty(v_grid_file) && !isabspath(v_grid_file) && !startswith(v_grid_file, "inputs/")
+        v_grid_file = joinpath("inputs", v_grid_file)
+    end
+    
+    # Parse vertical stretching mode
+    v_mode = str_to_sym(config.grid.vertical_stretching_mode)
+    
+    # Parse data mode
+    data_mode = str_to_sym(config.data.data_mode)
+    
+    # Parse scenario
+    scenario = str_to_sym(config.climate.scenario)
+    
+    # Parse atmospheric source
+    atmo_src = str_to_sym(config.atmosphere.source)
+    
+    # Parse ocean boundary source
+    obc_src = str_to_sym(config.boundaries.ocean_boundary_source)
+    
+    # Parse OBC type
+    obc_tp = str_to_sym(config.boundaries.obc_type)
+    
+    # Parse boundary method
+    boundary_method = str_to_sym(config.boundaries.method)
+    
+    # Parse release depth mode
+    rel_mode = str_to_sym(config.biology.release_depth_mode)
+    
+    # Build bottom release offset tuple
+    bot_off = if length(config.biology.bottom_release_offset) >= 2
+        (config.biology.bottom_release_offset[1], config.biology.bottom_release_offset[2])
+    else
+        (0.5, 3.0)
+    end
+    
+    # Parse DVM depths (these are in the DVM config section)
+    # We'll keep the existing defaults for DVM depths since the new schema has them
+    
+    return HydrodynamicOptions(;
+        domain_lon = (config.domain.lon_min, config.domain.lon_max),
+        domain_lat = (config.domain.lat_min, config.domain.lat_max),
+        domain_z = (config.domain.z_min, config.domain.z_max),
+        grid_size = (config.grid.nx, config.grid.ny, config.grid.nz),
+        data_mode = data_mode,
+        enable_tides = config.tides.enable_tides,
+        tidal_u_amp = config.tides.tidal_u_amp,
+        tidal_v_amp = config.tides.tidal_v_amp,
+        s2_u_amp = config.tides.s2_u_amp,
+        s2_v_amp = config.tides.s2_v_amp,
+        scenario = scenario,
+        projection_year = config.climate.projection_year,
+        sim_dt = config.hydrodynamics.sim_dt_seconds,
+        sim_duration = config.hydrodynamics.sim_duration_hours * 3600.0,
+        adaptive_cfl = config.hydrodynamics.adaptive_cfl,
+        target_cfl = config.hydrodynamics.target_cfl,
+        surface_heat_flux = config.hydrodynamics.surface_heat_flux,
+        n_particles = config.biology.n_particles,
+        track_duration = config.biology.track_duration_days * 86400.0,
+        track_dt = config.biology.track_dt_seconds,
+        diffusivity_h = config.biology.diffusivity_h,
+        diffusivity_v = config.biology.diffusivity_v,
+        enable_dvm = config.dvm.enable_dvm,
+        enable_molting = config.molting_and_settlement.enable_molting,
+        min_seabed_depth = config.biology.min_seabed_depth,
+        buffer_km = config.biology.buffer_km,
+        release_depth_mode = rel_mode,
+        bottom_release_offset = bot_off,
+        enable_initial_ascent = config.biology.enable_initial_ascent,
+        ascent_speed = config.biology.ascent_speed,
+        ascent_target_depth = config.biology.ascent_target_depth,
+        use_gpu = config.hardware.use_gpu,
+        fallback_to_cpu = config.hardware.fallback_to_cpu,
+        interactive_map = config.visualization.interactive_map,
+        enable_duckdb = config.storage.enable_duckdb,
+        duckdb_path = config.storage.duckdb_path,
+        output_dir = config.paths.output_dir,
+        input_dir = config.paths.input_dir,
+        seed = config.paths.seed,
+        hydro_model_file = config.hydrodynamics.hydro_model_file,
+        hydro_only = false,  # Not in schema, default false
+        track_only = false,  # Not in schema, default false
+        reuse_hydro = false, # Not in schema, default false
+        enable_checkpoint = config.storage.enable_checkpoint,
+        checkpoint_prefix = config.storage.checkpoint_prefix,
+        checkpoint_schedule = config.storage.checkpoint_schedule,
+        checkpoint_dir = config.storage.checkpoint_dir,
+        checkpoint_cleanup = config.storage.cleanup_checkpoints,
+        auto_restart = config.storage.auto_restart,
+        run_id = "",  # Not in schema, empty default
+        vertical_stretching_mode = v_mode,
+        vertical_grid_file = v_grid_file,
+        resolution_scale = config.grid.resolution_scale,
+        atmospheric_source = atmo_src,
+        ocean_boundary_source = obc_src,
+        obc_type = obc_tp,
+        enable_voronoi = config.tessellation.enable_voronoi,
+        voronoi_n_units = config.tessellation.n_units,
+        voronoi_prob_core = config.tessellation.prob_core,
+        voronoi_prob_shallow = config.tessellation.prob_shallow,
+        voronoi_prob_deep = config.tessellation.prob_deep,
+        voronoi_min_res_core_km = config.tessellation.min_res_core_km,
+        voronoi_min_res_shallow_km = config.tessellation.min_res_shallow_km,
+        voronoi_min_res_deep_km = config.tessellation.min_res_deep_km,
+        animate_hydro = false,  # Not in schema, default false
+        anim_variable = :dashboard,
+        anim_fps = 10,
+        anim_format = "mp4",
+        anim_depth = -2.5,
+        anim_overlay_particles = false,
+        anim_output_path = "",
+        boundary_method = boundary_method,
+        sponge_layer_width = config.boundaries.sponge_layer_width,
+        sponge_timescale = config.boundaries.sponge_timescale_seconds,
+        u_inflow = config.boundaries.u_inflow,
+        v_inflow = config.boundaries.v_inflow,
+        max_dt = config.hydrodynamics.max_dt_seconds
+    )
+end
+
+# Updated load_configuration to use schema when available
+function load_configuration_schema(config_path::AbstractString = find_default_config_path())::ConfigSchema.ParticleTrackingConfig
+    return ConfigSchema.load_config(config_path)
 end
 
 

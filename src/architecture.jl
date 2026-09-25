@@ -2,13 +2,14 @@
 using Oceananigans
 using Oceananigans.Architectures: AbstractArchitecture, CPU, GPU
 using CUDA
+using Preferences
 
 """
     resolve_architecture(arch::Union{Symbol, String, Bool, AbstractArchitecture} = :cpu; 
                          fallback_to_cpu::Bool = false) -> AbstractArchitecture
 
 Resolve and instantiate the computational architecture (`CPU()` or `GPU(...)`) for 
-Oceananigans hydrodynamic simulations and particle tracking routines, with world-age safety for Julia 1.12+.
+Oceananigans hydrodynamic simulations and particle tracking routines.
 """
 function resolve_architecture(
     arch::Union{Symbol, String, Bool, AbstractArchitecture} = :cpu; 
@@ -25,54 +26,34 @@ function resolve_architecture(
         return CPU() 
     end
 
-    # Check CUDA availability safely avoiding world-age issues under Julia 1.12+ and Revise
-    cuda_functional = false
-    try
-        if isdefined(Main, :CUDA) && isdefined(Main.CUDA, :functional)
-            cuda_functional = Base.invokelatest(Main.CUDA.functional)
-        elseif isdefined(Oceananigans, :CUDA) && isdefined(Oceananigans.CUDA, :functional)
-            cuda_functional = Base.invokelatest(Oceananigans.CUDA.functional)
+    # Check CUDA availability using modern CUDA.jl API
+    cuda_functional = CUDA.functional()
+    
+    if !cuda_functional
+        if fallback_to_cpu
+            @warn "CUDA GPU hardware was requested, but no functional NVIDIA CUDA environment " *
+                  "was detected (ensure the CUDA.jl package is installed and NVIDIA drivers " *
+                  "are accessible). Falling back to CPU()."
+            return CPU()
         else
-            # Attempt dynamic check if CUDA package is loaded or loadable
-            cuda_functional = Base.invokelatest(CUDA.functional)
+            error(
+                "CUDA GPU acceleration was requested (`arch = $(arch)`), but no functional " *
+                "NVIDIA CUDA driver or GPU device was detected on this system.\n" *
+                "To execute on CPU, set `architecture = :cpu` (or `--cpu` CLI flag).\n" *
+                "To enable automatic fallback, set `fallback_to_cpu = true`."
+            )
         end
+    end
+
+    # Create GPU backend - use Oceananigans' GPU constructor which handles backend creation
+    try
+        return GPU()
     catch err
-        @debug "CUDA availability check encountered an error: $(err)"
-        cuda_functional = false
-    end
-
-    if cuda_functional
-        try
-            backend = CUDA.CUDABackend()
-            if isdefined(Oceananigans, :GPU)
-                return Oceananigans.GPU(backend)
-            elseif isdefined(Oceananigans.Architectures, :GPU)
-                return Oceananigans.Architectures.GPU(backend)
-            end
-        catch err
-            try
-                if isdefined(Oceananigans, :GPU)
-                    return Oceananigans.GPU()
-                elseif isdefined(Oceananigans.Architectures, :GPU)
-                    return Oceananigans.Architectures.GPU()
-                end
-            catch err2
-                @warn "Failed to construct Oceananigans.GPU device: $(err); fallback error: $(err2)"
-            end
+        if fallback_to_cpu
+            @warn "Failed to initialize GPU backend: $(err). Falling back to CPU()."
+            return CPU()
+        else
+            error("Failed to initialize GPU backend: $(err)")
         end
-    end
-
-    if fallback_to_cpu
-        @warn "CUDA GPU hardware was requested, but no functional NVIDIA CUDA environment " *
-              "was detected (ensure the CUDA.jl package is installed and NVIDIA drivers " *
-              "are accessible). Falling back to CPU()."
-        return CPU()
-    else
-        error(
-            "CUDA GPU acceleration was requested (`arch = $(arch)`), but no functional " *
-            "NVIDIA CUDA driver or GPU device was detected on this system.\n" *
-            "To execute on CPU, set `architecture = :cpu` (or `--cpu` CLI flag).\n" *
-            "To enable automatic fallback, set `fallback_to_cpu = true`."
-        )
     end
 end
