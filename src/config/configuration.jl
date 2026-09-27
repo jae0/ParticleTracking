@@ -32,6 +32,54 @@ function find_default_config_path()::String
 end
 
 """
+    study_domain_ranges(cfg) -> NamedTuple
+
+Geographic bounds of the *study domain* — the computational/analysis grid — read from a
+parsed configuration.
+
+Authoritative source is the TOML `[domain]` section (`lon_min`, `lon_max`, `lat_min`,
+`lat_max`). No domain is compiled into the package: the configuration file is the single
+source of truth, so a run against a different shelf only requires editing TOML.
+
+# Inputs
+- `cfg`: Parsed configuration `AbstractDict` (e.g. from [`load_configuration`](@ref)).
+
+# Outputs
+- `NamedTuple`: `(lon = (lon_min, lon_max), lat = (lat_min, lat_max))`, in degrees.
+"""
+function study_domain_ranges(cfg)::NamedTuple
+    d = get(cfg, "domain", Dict{String, Any}())
+    return (
+        lon = (Float64(get(d, "lon_min", -68.0)), Float64(get(d, "lon_max", -57.0))),
+        lat = (Float64(get(d, "lat_min", 42.0)), Float64(get(d, "lat_max", 47.5)))
+    )
+end
+
+"""
+    embedding_domain_ranges(cfg) -> NamedTuple
+
+Geographic bounds of the *embedding domain* — the larger region from which open boundary
+and atmospheric forcing data are extracted — read from a parsed configuration.
+
+Authoritative source is the TOML `[boundaries]` section (`embedding_lon_min`,
+`embedding_lon_max`, `embedding_lat_min`, `embedding_lat_max`). The study domain nests
+inside this region.
+
+# Inputs
+- `cfg`: Parsed configuration `AbstractDict`.
+
+# Outputs
+- `NamedTuple`: `(lon = (lon_min, lon_max), lat = (lat_min, lat_max))`, in degrees.
+"""
+function embedding_domain_ranges(cfg)::NamedTuple
+    b = get(cfg, "boundaries", Dict{String, Any}())
+    return (
+        lon = (Float64(get(b, "embedding_lon_min", -71.0)), Float64(get(b, "embedding_lon_max", -53.0))),
+        lat = (Float64(get(b, "embedding_lat_min", 40.0)), Float64(get(b, "embedding_lat_max", 48.5)))
+    )
+end
+
+"""
     resolve_config_name(config_file::AbstractString = "") -> String
 
 Extract the base configuration name from a config file path, or return
@@ -177,6 +225,14 @@ struct HydrodynamicOptions
     resolution_scale         :: Float64
     atmospheric_source       :: Symbol
     ocean_boundary_source    :: Symbol
+    # Source for the 3-D hydrographic (T, S) initial state. This is deliberately
+    # separate from `data_mode`/`ocean_boundary_source`, which govern bathymetry,
+    # wind and lateral boundaries: the initial water column is its own choice.
+    #   :synthetic — analytic profile from `set_initial_stratification!`
+    #   :woa23     — World Ocean Atlas 2023 climatology (keyless, NOAA NCEI)
+    #   :glorys12v1— GLORYS12V1 reanalysis (requires copernicusmarine credentials)
+    hydrography_source       :: Symbol
+    hydrography_month        :: Int      # WOA23 month selector (0 = annual climatology)
     obc_type                 :: Symbol
     enable_voronoi           :: Bool
     voronoi_n_units          :: Int
@@ -201,6 +257,11 @@ struct HydrodynamicOptions
     v_inflow                 :: Float64  # reference meridional inflow velocity (m/s)
     # Time integration ceiling
     max_dt                   :: Float64  # maximum allowable time step (s)
+    # Stochastic biology parameters
+    settlement_stochastic    :: Bool     # whether settlement uses probabilistic HSI draw
+    cv_molt                  :: Float64  # coefficient of variation for molt thresholds (default 0.25)
+    cv_mortality             :: Float64  # coefficient of variation for mortality (default 0.25)
+    cv_settlement            :: Float64  # coefficient of variation for settlement HSI (default 0.25)
 end
 
 function HydrodynamicOptions(;
@@ -260,6 +321,8 @@ function HydrodynamicOptions(;
     resolution_scale         :: Real = 1.0,
     atmospheric_source       :: Symbol = :era5,
     ocean_boundary_source    :: Symbol = :glorys12v1,
+    hydrography_source       :: Symbol = :synthetic,
+    hydrography_month        :: Int     = 0,
     obc_type                 :: Symbol = :flather_chapman,
     enable_voronoi           :: Bool = false,
     voronoi_n_units          :: Int = 5000,
@@ -281,7 +344,11 @@ function HydrodynamicOptions(;
     sponge_timescale         :: Real = 3600.0,
     u_inflow                 :: Real = -0.15,
     v_inflow                 :: Real = 0.05,
-    max_dt                   :: Real = 600.0
+    max_dt                   :: Real = 600.0,
+    settlement_stochastic    :: Bool = true,
+    cv_molt                  :: Real = 0.25,
+    cv_mortality             :: Real = 0.25,
+    cv_settlement            :: Real = 0.25
 )
     resolved_cp_prefix = if !isempty(strip(checkpoint_prefix)) && checkpoint_prefix != "checkpoint"
         String(checkpoint_prefix)
@@ -347,6 +414,8 @@ function HydrodynamicOptions(;
         Float64(resolution_scale),
         atmospheric_source,
         ocean_boundary_source,
+        hydrography_source,
+        hydrography_month,
         obc_type,
         enable_voronoi,
         voronoi_n_units,
@@ -368,7 +437,11 @@ function HydrodynamicOptions(;
         Float64(sponge_timescale),
         Float64(u_inflow),
         Float64(v_inflow),
-        Float64(max_dt)
+        Float64(max_dt),
+        settlement_stochastic,
+        Float64(cv_molt),
+        Float64(cv_mortality),
+        Float64(cv_settlement)
     )
 end
 
@@ -649,6 +722,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     enable_dvm = Bool(get_val("dvm", "enable_dvm", true))
     enable_molting = Bool(get_val("molting_and_settlement", "enable_molting", true))
 
+    # Stochastic biology parameters
+    settlement_stochastic = Bool(get_val("biology", "settlement_stochastic", true))
+    cv_molt = Float64(get_val("biology", "cv_molt", 0.25))
+    cv_mortality = Float64(get_val("biology", "cv_mortality", 0.25))
+    cv_settlement = Float64(get_val("biology", "cv_settlement", 0.25))
+
     use_gpu      = Bool(get_val("hardware", "use_gpu", false))
     fallback_cpu = Bool(get_val("hardware", "fallback_to_cpu", true))
     interactive  = Bool(get_val("visualization", "interactive_map", true))
@@ -693,6 +772,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     atmo_src = Symbol(lowercase(String(get_val("atmosphere", "source", "era5"))))
     obc_src = Symbol(lowercase(String(get_val("boundaries", "ocean_boundary_source", "glorys12v1"))))
     obc_tp = Symbol(lowercase(String(get_val("boundaries", "obc_type", "flather_chapman"))))
+
+    # Initial 3-D hydrography (T, S). Read from `[data]`, independent of the
+    # bathymetry/wind `data_mode` and the lateral `ocean_boundary_source`, because the
+    # initial water column is a separate choice from the forcing and the boundaries.
+    hydro_src = Symbol(lowercase(String(get_val("data", "hydrography_source", "synthetic"))))
+    hydro_month = Int(get_val("data", "hydrography_month", 0))
 
     # Lateral boundary relaxation (Price & Aumont 2011) parameters
     boundary_method = Symbol(lowercase(String(get_val("boundaries", "method", "relaxation"))))
@@ -769,8 +854,10 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         vertical_stretching_mode = v_mode,
         vertical_grid_file = v_file,
         resolution_scale = res_scale,
-        atmospheric_source = atmo_src,
-        ocean_boundary_source = obc_src,
+    atmospheric_source = atmo_src,
+    ocean_boundary_source = obc_src,
+    hydrography_source = hydro_src,
+    hydrography_month = hydro_month,
         obc_type = obc_tp,
         enable_voronoi = enable_voronoi,
         voronoi_n_units = voronoi_n_units,
@@ -793,6 +880,10 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         u_inflow = u_inflow_val,
         v_inflow = v_inflow_val,
         max_dt = max_dt_val,
+        settlement_stochastic = settlement_stochastic,
+        cv_molt = cv_molt,
+        cv_mortality = cv_mortality,
+        cv_settlement = cv_settlement,
         overrides...
     )
 end
@@ -826,10 +917,17 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "boundaries" => Dict{String, Any}(
             "ocean_boundary_source" => string(opts.ocean_boundary_source),
-            "obc_type" => string(opts.obc_type)
+            "obc_type" => string(opts.obc_type),
+            "method" => string(opts.boundary_method),
+            "sponge_layer_width" => opts.sponge_layer_width,
+            "sponge_timescale_seconds" => opts.sponge_timescale,
+            "u_inflow" => opts.u_inflow,
+            "v_inflow" => opts.v_inflow
         ),
         "data" => Dict{String, Any}(
             "data_mode" => string(opts.data_mode),
+            "hydrography_source" => string(opts.hydrography_source),
+            "hydrography_month" => opts.hydrography_month,
             "inshore_depth" => -100.0,
             "shelf_slope" => 500.0
         ),
@@ -849,6 +947,7 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "sim_dt_seconds" => opts.sim_dt,
             "adaptive_cfl" => opts.adaptive_cfl,
             "target_cfl" => opts.target_cfl,
+            "max_dt_seconds" => opts.max_dt,
             "surface_heat_flux" => opts.surface_heat_flux,
             "hydro_model_file" => opts.hydro_model_file,
             "hydro_only" => opts.hydro_only,
@@ -867,13 +966,19 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "bottom_release_offset" => [opts.bottom_release_offset[1], opts.bottom_release_offset[2]],
             "enable_initial_ascent" => opts.enable_initial_ascent,
             "ascent_speed" => opts.ascent_speed,
-            "ascent_target_depth" => opts.ascent_target_depth
+            "ascent_target_depth" => opts.ascent_target_depth,
+            "settlement_stochastic" => opts.settlement_stochastic,
+            "cv_molt" => opts.cv_molt,
+            "cv_mortality" => opts.cv_mortality,
+            "cv_settlement" => opts.cv_settlement
         ),
         "dvm" => Dict{String, Any}(
             "enable_dvm" => opts.enable_dvm
         ),
         "molting_and_settlement" => Dict{String, Any}(
-            "enable_molting" => opts.enable_molting
+            "enable_molting" => opts.enable_molting,
+            "cv_molt" => opts.cv_molt,
+            "cv_mortality" => opts.cv_mortality
         ),
         "storage" => Dict{String, Any}(
             "enable_duckdb" => opts.enable_duckdb,
@@ -1015,6 +1120,10 @@ struct LarvalDispersalConfig
     settlement_min_depth     :: Float64
     settlement_max_depth     :: Float64
     settlement_max_temp      :: Float64
+    settlement_stochastic    :: Bool
+    cv_molt                  :: Float64
+    cv_mortality             :: Float64
+    cv_settlement            :: Float64
     enable_duckdb            :: Bool
     duckdb_path              :: String
     run_id                   :: String
@@ -1056,9 +1165,11 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :climatology              => false,
         :mhw_temp_anomaly         => opts.scenario == :mhw ? 3.5 : 0.0,
         :ocean_boundary_source    => opts.ocean_boundary_source,
+        :hydrography_source       => opts.hydrography_source,
+        :hydrography_month        => opts.hydrography_month,
         :obc_type                 => opts.obc_type,
-        :sponge_layer_width       => 0.25,
-        :sponge_timescale         => 3600.0,
+        :sponge_layer_width       => opts.sponge_layer_width,
+        :sponge_timescale         => opts.sponge_timescale,
         :enable_tides             => opts.enable_tides,
         :tides_source             => :tpxo9_atlas,
         :tidal_constituents       => [:M2, :S2],
@@ -1072,7 +1183,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :adaptive_cfl             => opts.adaptive_cfl,
         :target_cfl               => opts.target_cfl,
         :target_wave_cfl          => 0.20,
-        :max_dt_seconds           => 90.0,
+        :max_dt_seconds           => opts.max_dt,
         :min_dt_seconds           => 2.0,
         :coriolis_latitude        => 44.5,
         :divergence_limit         => 20.0,
@@ -1158,6 +1269,10 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         :settlement_min_depth     => -250.0,
         :settlement_max_depth     => -50.0,
         :settlement_max_temp      => 6.0,
+        :settlement_stochastic    => opts.settlement_stochastic,
+        :cv_molt                  => opts.cv_molt,
+        :cv_mortality             => opts.cv_mortality,
+        :cv_settlement            => opts.cv_settlement,
         :enable_duckdb            => opts.enable_duckdb,
         :duckdb_path              => opts.duckdb_path,
         :run_id                   => opts.run_id,
@@ -1183,148 +1298,10 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         Float64(d[:mortality_thermal_thresh]), Float64(d[:mortality_thermal_sens]),
         Float64(d[:mortality_cold_thresh]), Float64(d[:mortality_cold_sens]),
         Float64(d[:settlement_min_depth]), Float64(d[:settlement_max_depth]),
-        Float64(d[:settlement_max_temp]), Bool(d[:enable_duckdb]),
+        Float64(d[:settlement_max_temp]), Bool(d[:settlement_stochastic]),
+        Float64(d[:cv_molt]), Float64(d[:cv_mortality]), Float64(d[:cv_settlement]),
+        Bool(d[:enable_duckdb]),
         String(d[:duckdb_path]), String(d[:run_id]), Int(d[:seed])
     )
 end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Schema-based Configuration Conversion
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""
-    schema_to_options(config::ConfigSchema.ParticleTrackingConfig) -> HydrodynamicOptions
-
-Convert a validated schema-based configuration to runtime HydrodynamicOptions.
-"""
-function schema_to_options(config::ConfigSchema.ParticleTrackingConfig)::HydrodynamicOptions
-    # Helper for converting string to symbol
-    str_to_sym(s::String) = Symbol(lowercase(s))
-    
-    # Build vertical grid file path
-    v_grid_file = config.grid.vertical_grid_file
-    if !isempty(v_grid_file) && !isabspath(v_grid_file) && !startswith(v_grid_file, "inputs/")
-        v_grid_file = joinpath("inputs", v_grid_file)
-    end
-    
-    # Parse vertical stretching mode
-    v_mode = str_to_sym(config.grid.vertical_stretching_mode)
-    
-    # Parse data mode
-    data_mode = str_to_sym(config.data.data_mode)
-    
-    # Parse scenario
-    scenario = str_to_sym(config.climate.scenario)
-    
-    # Parse atmospheric source
-    atmo_src = str_to_sym(config.atmosphere.source)
-    
-    # Parse ocean boundary source
-    obc_src = str_to_sym(config.boundaries.ocean_boundary_source)
-    
-    # Parse OBC type
-    obc_tp = str_to_sym(config.boundaries.obc_type)
-    
-    # Parse boundary method
-    boundary_method = str_to_sym(config.boundaries.method)
-    
-    # Parse release depth mode
-    rel_mode = str_to_sym(config.biology.release_depth_mode)
-    
-    # Build bottom release offset tuple
-    bot_off = if length(config.biology.bottom_release_offset) >= 2
-        (config.biology.bottom_release_offset[1], config.biology.bottom_release_offset[2])
-    else
-        (0.5, 3.0)
-    end
-    
-    # Parse DVM depths (these are in the DVM config section)
-    # We'll keep the existing defaults for DVM depths since the new schema has them
-    
-    return HydrodynamicOptions(;
-        domain_lon = (config.domain.lon_min, config.domain.lon_max),
-        domain_lat = (config.domain.lat_min, config.domain.lat_max),
-        domain_z = (config.domain.z_min, config.domain.z_max),
-        grid_size = (config.grid.nx, config.grid.ny, config.grid.nz),
-        data_mode = data_mode,
-        enable_tides = config.tides.enable_tides,
-        tidal_u_amp = config.tides.tidal_u_amp,
-        tidal_v_amp = config.tides.tidal_v_amp,
-        s2_u_amp = config.tides.s2_u_amp,
-        s2_v_amp = config.tides.s2_v_amp,
-        scenario = scenario,
-        projection_year = config.climate.projection_year,
-        sim_dt = config.hydrodynamics.sim_dt_seconds,
-        sim_duration = config.hydrodynamics.sim_duration_hours * 3600.0,
-        adaptive_cfl = config.hydrodynamics.adaptive_cfl,
-        target_cfl = config.hydrodynamics.target_cfl,
-        surface_heat_flux = config.hydrodynamics.surface_heat_flux,
-        n_particles = config.biology.n_particles,
-        track_duration = config.biology.track_duration_days * 86400.0,
-        track_dt = config.biology.track_dt_seconds,
-        diffusivity_h = config.biology.diffusivity_h,
-        diffusivity_v = config.biology.diffusivity_v,
-        enable_dvm = config.dvm.enable_dvm,
-        enable_molting = config.molting_and_settlement.enable_molting,
-        min_seabed_depth = config.biology.min_seabed_depth,
-        buffer_km = config.biology.buffer_km,
-        release_depth_mode = rel_mode,
-        bottom_release_offset = bot_off,
-        enable_initial_ascent = config.biology.enable_initial_ascent,
-        ascent_speed = config.biology.ascent_speed,
-        ascent_target_depth = config.biology.ascent_target_depth,
-        use_gpu = config.hardware.use_gpu,
-        fallback_to_cpu = config.hardware.fallback_to_cpu,
-        interactive_map = config.visualization.interactive_map,
-        enable_duckdb = config.storage.enable_duckdb,
-        duckdb_path = config.storage.duckdb_path,
-        output_dir = config.paths.output_dir,
-        input_dir = config.paths.input_dir,
-        seed = config.paths.seed,
-        hydro_model_file = config.hydrodynamics.hydro_model_file,
-        hydro_only = false,  # Not in schema, default false
-        track_only = false,  # Not in schema, default false
-        reuse_hydro = false, # Not in schema, default false
-        enable_checkpoint = config.storage.enable_checkpoint,
-        checkpoint_prefix = config.storage.checkpoint_prefix,
-        checkpoint_schedule = config.storage.checkpoint_schedule,
-        checkpoint_dir = config.storage.checkpoint_dir,
-        checkpoint_cleanup = config.storage.cleanup_checkpoints,
-        auto_restart = config.storage.auto_restart,
-        run_id = "",  # Not in schema, empty default
-        vertical_stretching_mode = v_mode,
-        vertical_grid_file = v_grid_file,
-        resolution_scale = config.grid.resolution_scale,
-        atmospheric_source = atmo_src,
-        ocean_boundary_source = obc_src,
-        obc_type = obc_tp,
-        enable_voronoi = config.tessellation.enable_voronoi,
-        voronoi_n_units = config.tessellation.n_units,
-        voronoi_prob_core = config.tessellation.prob_core,
-        voronoi_prob_shallow = config.tessellation.prob_shallow,
-        voronoi_prob_deep = config.tessellation.prob_deep,
-        voronoi_min_res_core_km = config.tessellation.min_res_core_km,
-        voronoi_min_res_shallow_km = config.tessellation.min_res_shallow_km,
-        voronoi_min_res_deep_km = config.tessellation.min_res_deep_km,
-        animate_hydro = false,  # Not in schema, default false
-        anim_variable = :dashboard,
-        anim_fps = 10,
-        anim_format = "mp4",
-        anim_depth = -2.5,
-        anim_overlay_particles = false,
-        anim_output_path = "",
-        boundary_method = boundary_method,
-        sponge_layer_width = config.boundaries.sponge_layer_width,
-        sponge_timescale = config.boundaries.sponge_timescale_seconds,
-        u_inflow = config.boundaries.u_inflow,
-        v_inflow = config.boundaries.v_inflow,
-        max_dt = config.hydrodynamics.max_dt_seconds
-    )
-end
-
-# Updated load_configuration to use schema when available
-function load_configuration_schema(config_path::AbstractString = find_default_config_path())::ConfigSchema.ParticleTrackingConfig
-    return ConfigSchema.load_config(config_path)
-end
-
 

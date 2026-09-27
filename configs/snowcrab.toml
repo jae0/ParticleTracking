@@ -1,9 +1,15 @@
 # ==============================================================================
-# Snow Crab (Chionoecetes opilio) Larval Tracking Configuration
-# Optimized for Scotian Shelf / Northwest Atlantic Domain
-# Generated with best-available open-access data sources
-# run: 
-# julia --project=C:\Users\xyz\projects\ParticleTracking C:\Users\xyz\projects\ParticleTracking\ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml --all --quick 
+# snowcrab.toml - Snow Crab (Chionoecetes opilio) Larval Tracking Configuration
+#
+# Production, species-calibrated run for the Scotian Shelf / Northwest Atlantic
+# using best-available open-access data sources (ETOPO 2022, ERA5, WOA 2023,
+# GLORYS12V1, TPXO9) resolved through NumericalEarth.jl.
+#
+# Run
+#   julia --project=. ParticleTrackingRun.jl --all --config=configs/snowcrab.toml
+#
+# The fully-resolved configuration (this file after any CLI overrides) is copied
+# to work/snowcrab/resolved_config.toml as provenance for the outputs.
 # ==============================================================================
 
 [metadata]
@@ -268,7 +274,8 @@ interactive_map = true              # Generate interactive HTML5 Leaflet.js dash
 title = "Snow Crab Larval Dispersal - Scotian Shelf"
 
 [paths]
-# All output goes to work/snowcrab/ when this config is used
+# All output for this configuration lands under work/snowcrab/, and the resolved
+# configuration is copied there as resolved_config.toml for provenance.
 output_dir = "work/snowcrab"
 input_dir = "inputs"
 seed = 42

@@ -8,6 +8,8 @@ using Oceananigans
 using Oceananigans.Grids: Face, Center, znode
 using Oceananigans.Architectures: architecture, on_architecture, CPU, GPU
 using NCDatasets
+using Interpolations
+using NumericalEarth: ETOPO2022, regrid_bathymetry, smooth_topography!, BoundingBox
 
 """
     build_shelf_grid(;
@@ -50,10 +52,11 @@ function build_shelf_grid(;
     lat_range::Tuple{Real, Real} = (40.0, 48.5),
     z_range::Tuple{Real, Real} = (-3500.0, 0.0),
     z_faces::Union{Nothing, AbstractVector, Function} = nothing,
-    grid_size::Tuple{Int, Int, Int} = (50, 50, 10),
-    topology::Tuple = (Bounded, Bounded, Bounded),
-    fallback_to_cpu::Bool = false
-)
+       grid_size::Tuple{Int, Int, Int} = (50, 50, 10),
+       halo::Tuple{Int, Int, Int} = (7, 7, 5),
+       topology::Tuple = (Bounded, Bounded, Bounded),
+       fallback_to_cpu::Bool = false
+   )
     if lon_range[1] >= lon_range[2]
         error("Invalid longitude range: $(lon_range). lon_min must be < lon_max.")
     end
@@ -84,14 +87,14 @@ function build_shelf_grid(;
     arch = resolve_architecture(architecture; fallback_to_cpu = fallback_to_cpu)
      
     grid = LatitudeLongitudeGrid(
-        arch;
-        size = grid_size,
-        longitude = lon_range,
-        latitude = lat_range,
-        z = z_specification,
-        topology = topology,
-        halo = (7, 7, 5)
-    )
+           arch;
+           size = grid_size,
+           longitude = lon_range,
+           latitude = lat_range,
+           z = z_specification,
+           topology = topology,
+           halo = halo
+       )
     return grid
 end
 
@@ -205,7 +208,7 @@ function load_bathymetry_from_netcdf(
                 @warn "load_bathymetry_from_netcdf: elevation matrix " *
                       "size $(size(elevation_data)) does not match coordinate " *
                       "lengths $(expected) after transposition. " *
-                      "Verify file dimension ordering." _file = filepath
+                      "Verify dimension ordering in $(filepath)."
             end
         end
 
@@ -215,6 +218,64 @@ function load_bathymetry_from_netcdf(
             lat = lat_coords
         )
     end
+end
+
+"""
+    write_bathymetry_netcdf(bathy, filepath; varname = "elevation") -> String
+
+Persist a bathymetry `NamedTuple` `(lon, lat, elevation)` to a CF-style NetCDF file that
+round-trips through [`load_bathymetry_from_netcdf`](@ref).
+
+Arrays are written as `(longitude, latitude)` with `elevation` indexed `[i_lon, j_lat]`,
+matching the in-memory convention used throughout this package. Coordinates are written as
+1-D variables named `longitude` and `latitude`; the loader also accepts the CF-preferred
+`lat`/`lon` aliases.
+
+# Inputs
+- `bathy`: `NamedTuple` with `lon`, `lat`, and `elevation` fields.
+- `filepath`: Destination NetCDF path (parent directories are created).
+- `varname`: Name of the elevation variable in the output file.
+
+# Outputs
+- `String`: The written filepath.
+"""
+function write_bathymetry_netcdf(
+    bathy,
+    filepath::AbstractString;
+    varname::AbstractString = "elevation"
+)::String
+    hasproperty(bathy, :lon) || error("bathy must have a :lon field")
+    hasproperty(bathy, :lat) || error("bathy must have a :lat field")
+    hasproperty(bathy, :elevation) || error("bathy must have an :elevation field")
+
+    lons = Float64.(bathy.lon)
+    lats = Float64.(bathy.lat)
+    elev = Float64.(bathy.elevation)
+
+    size(elev) == (length(lons), length(lats)) || error(
+        "elevation size $(size(elev)) must equal (length(lon), length(lat)) = " *
+        "($(length(lons)), $(length(lats)))"
+    )
+
+    mkpath(dirname(abspath(filepath)))
+
+    ds = NCDatasets.Dataset(filepath, "c")
+    try
+        NCDatasets.defDim(ds, "longitude", length(lons))
+        NCDatasets.defDim(ds, "latitude", length(lats))
+        lon_v = NCDatasets.defVar(ds, "longitude", Float64, ("longitude",))
+        lat_v = NCDatasets.defVar(ds, "latitude", Float64, ("latitude",))
+        z_v = NCDatasets.defVar(ds, varname, Float64, ("longitude", "latitude"),
+                                fillvalue = Float32(NaN))
+        lon_v[:] = lons
+        lat_v[:] = lats
+        z_v[:, :] = elev
+    finally
+        # NCDatasets variables are closed with the dataset; no per-variable close.
+        close(ds)
+    end
+
+    return String(filepath)
 end
 
 """
@@ -291,27 +352,149 @@ function get_bathymetry_interpolator(
               "lons sorted: $(issorted(lons)), lats sorted: $(issorted(lats)).")
     end
 
+    # Bilinear interpolation delegated to Interpolations.jl, with flat extrapolation so
+    # queries marginally outside the surveyed box clamp to the nearest edge cell rather
+    # than returning NaN.
+    itp = interpolate((lons, lats), elev, Gridded(Interpolations.Linear()))
+    itp_flat = extrapolate(itp, Interpolations.Flat())
+
     return function (lon::Real, lat::Real)
-        i = searchsortedlast(lons, Float64(lon))
-        j = searchsortedlast(lats, Float64(lat))
-        i = clamp(i, 1, n_lon - 1)
-        j = clamp(j, 1, n_lat - 1)
-
-        dlon = lons[i + 1] - lons[i]
-        dlat = lats[j + 1] - lats[j]
-        tx = dlon > 0.0 ? clamp((Float64(lon) - lons[i]) / dlon, 0.0, 1.0) : 0.0
-        ty = dlat > 0.0 ? clamp((Float64(lat) - lats[j]) / dlat, 0.0, 1.0) : 0.0
-
-        z00 = elev[i, j]
-        z10 = elev[i + 1, j]
-        z01 = elev[i, j + 1]
-        z11 = elev[i + 1, j + 1]
-
-        return (1.0 - tx) * (1.0 - ty) * z00 +
-               tx * (1.0 - ty) * z10 +
-               (1.0 - tx) * ty * z01 +
-               tx * ty * z11
+        return Float64(itp_flat(Float64(lon), Float64(lat)))
     end
+end
+
+"""
+    regrid_bathymetry_from_etopo(grid;
+        minimum_depth = 0.0,
+        interpolation_passes = 1,
+        major_basins = 1,
+        cache = true) -> Field
+
+Regridded seafloor bottom height (m, negative in the ocean) for `grid`, obtained from the
+`NumericalEarth.jl` ETOPO 2022 15-arcsec global relief dataset.
+
+This is the supported replacement for hand-rolled bathymetic regridding: `NumericalEarth`
+downloads and caches the dataset, builds its native grid, interpolates in one or more
+progressively coarsening passes, enforces a minimum wet-cell depth, removes minor basins,
+and returns an Oceananigans `Field{Center,Center,Nothing}` on `grid`.
+
+# Inputs
+- `grid`: Target `LatitudeLongitudeGrid` (or an `ImmersedBoundaryGrid`'s underlying grid).
+- `minimum_depth`: Positive minimum depth (m) for wet cells; shallower cells become land.
+- `interpolation_passes`: Number of progressive interpolation passes. Coarsening passes
+  double as a smoothing filter; use 1 to preserve the native ETOPO detail.
+- `major_basins`: Number of independent submerged basins to retain. `1` keeps only the
+  largest connected wet region, which removes spurious inland seas; use `Inf` to keep all.
+- `cache`: Reuse the on-disk regridded-bathymetry cache across runs.
+
+# Outputs
+- `Field{Center, Center, Nothing}`: Bottom height in metres, on `grid`.
+"""
+function regrid_bathymetry_from_etopo(
+    grid;
+    minimum_depth::Real = 0.0,
+    interpolation_passes::Integer = 1,
+    major_basins::Real = 1,
+    cache::Bool = true
+)
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    return regrid_bathymetry(base_g;
+        dataset = ETOPO2022(),
+        minimum_depth = Float64(minimum_depth),
+        interpolation_passes = Int(interpolation_passes),
+        major_basins = Float64(major_basins),
+        cache = cache
+    )
+end
+
+"""
+    etopo_bathymetry_interpolator(grid; kwargs...) -> Function
+
+Continuous `(lon, lat) -> z_bed` sampler (metres; `z <= 0` in the ocean) built from
+`NumericalEarth.jl`'s ETOPO 2022 dataset regridded onto `grid`.
+
+Regrids bathymetry once with [`regrid_bathymetry_from_etopo`](@ref), then returns a
+bilinear sampler over the regridded field so that repeated point queries (larval
+placement, settlement checks) are cheap and do not re-trigger dataset downloads.
+
+# Inputs
+- `grid`: Target grid defining the spatial extent and resolution.
+- `kwargs...`: Forwarded to [`regrid_bathymetry_from_etopo`](@ref).
+
+# Outputs
+- `Function`: `(lon::Real, lat::Real) -> Float64` seafored elevation in metres.
+"""
+function etopo_bathymetry_interpolator(grid; kwargs...)
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    z = regrid_bathymetry_from_etopo(base_g; kwargs...)
+
+    lons = collect(Float64, base_g.λᶜᵃᵃ)[base_g.Hx+1 : base_g.Hx+base_g.Nx]
+    lats = collect(Float64, base_g.φᵃᶜᵃ)[base_g.Hy+1 : base_g.Hy+base_g.Ny]
+    elev = Array(interior(z, :, :, 1))
+
+    itp = interpolate((lons, lats), elev, Gridded(Interpolations.Linear()))
+    itp_flat = extrapolate(itp, Interpolations.Flat())
+
+    return function (lon::Real, lat::Real)
+        return Float64(itp_flat(Float64(lon), Float64(lat)))
+    end
+end
+
+"""
+    etopo_bathymetry_field(lon_range, lat_range; resolution = 600, kwargs...) -> NamedTuple
+
+Regional seabed topography over an arbitrary bounding box, sourced from `NumericalEarth.jl`'s
+ETOPO 2022 15-arcsec global relief model.
+
+This is the supported replacement for ad-hoc ETOPO/GEBCO download and hand-rolled
+regridding. `NumericalEarth` handles dataset download and caching, native-grid
+construction, and progressive interpolation passes; this wrapper only maps a bounding box
+onto a scratch `LatitudeLongitudeGrid` and returns plain arrays for downstream consumers
+(e.g. Voronoi tessellation, coastal classification) that do not operate on Oceananigans
+grids.
+
+# Inputs
+- `lon_range`: `(lon_min, lon_max)` in degrees East.
+- `lat_range`: `(lat_min, lat_max)` in degrees North.
+- `resolution`: Target grid resolution in metres per cell; converted to a grid dimension
+  from the box extents and clamped to a sane range.
+- `kwargs...`: Forwarded to [`regrid_bathymetry_from_etopo`](@ref) (`minimum_depth`,
+  `interpolation_passes`, `major_basins`, `cache`).
+
+# Outputs
+- `NamedTuple`: `(lon::Vector{Float64}, lat::Vector{Float64}, elevation::Matrix{Float64})`
+  with `elevation` indexed `[lon, lat]`, negative in the ocean and positive on land.
+"""
+function etopo_bathymetry_field(
+    lon_range::Tuple{<:Real, <:Real},
+    lat_range::Tuple{<:Real, <:Real};
+    resolution::Real = 600,
+    kwargs...
+)
+    lon_min, lon_max = Float64(lon_range[1]), Float64(lon_range[2])
+    lat_min, lat_max = Float64(lat_range[1]), Float64(lat_range[2])
+
+    # Approximate metres per degree at mid-latitude for the box, then size the grid.
+    lat_mid = 0.5 * (lat_min + lat_max)
+    m_per_deg = 111_320.0 * cosd(lat_mid)
+    n_lon = clamp(round(Int, abs(lon_max - lon_min) * m_per_deg / Float64(resolution)), 16, 21600)
+    n_lat = clamp(round(Int, abs(lat_max - lat_min) * m_per_deg / Float64(resolution)), 16, 10800)
+
+    scratch = LatitudeLongitudeGrid(
+        CPU(), Float32;
+        size = (n_lon, n_lat, 1),
+        longitude = (lon_min, lon_max),
+        latitude = (lat_min, lat_max),
+        z = (-1.0, 0.0)
+    )
+
+    z = regrid_bathymetry_from_etopo(scratch; kwargs...)
+    elevation = Array(interior(z, :, :, 1))
+
+    lons = collect(Float64, scratch.λᶜᵃᵃ)[scratch.Hx+1 : scratch.Hx+scratch.Nx]
+    lats = collect(Float64, scratch.φᵃᶜᵃ)[scratch.Hy+1 : scratch.Hy+scratch.Ny]
+
+    return (lon = lons, lat = lats, elevation = elevation)
 end
 
 """
@@ -1352,43 +1535,49 @@ end
 """
     extract_grid_coordinates(grid) -> NamedTuple
 
-Extract 1D continuous cell-center spatial coordinates `(lons, lats, depths)`
-from an Oceananigans computational grid, supporting both `LatitudeLongitudeGrid`
-and `ImmersedBoundaryGrid`.
+Extract 1D cell-center spatial coordinates `(lons, lats, depths)` from an
+Oceananigans computational grid, returning geographic coordinates in **degrees**
+and the vertical coordinate in **metres**.
 
-# Mathematical Formulation
-Retrieves cell-center spatial nodes \$\\lambda_i = \\text{xnode}(i, \\text{grid}, \\text{Center}())\$,
-\$\\phi_j = \\text{ynode}(j, \\text{grid}, \\text{Center}())\$, and
-\$z_k = \\text{znode}(k, \\text{grid}, \\text{Center}())\$ along each spatial dimension.
+# Notes
+Oceananigans distinguishes between *metric* coordinates (`xnode`, `ynode` — Cartesian
+components in metres) and *geographic* coordinates (longitude/latitude in degrees). For a
+`LatitudeLongitudeGrid` the horizontal grid vectors are stored directly in degrees, so the
+typed accessors `λᶜᵃᵃ` and `φᵃᶜᵃ` are used, with the halo region stripped using the grid's
+own `Hx`/`Hy` extents. The vertical coordinate is genuinely metric, so `znode` is correct
+for depth.
+
+Using `xnode`/`ynode` for the horizontal axes would silently return metres and corrupt
+downstream geospatial products (e.g. DuckDB archival, map axes, transect selection).
 
 # Inputs
-- `grid`: `LatitudeLongitudeGrid` or `ImmersedBoundaryGrid`.
+- `grid`: `LatitudeLongitudeGrid` or `ImmersedBoundaryGrid` wrapping one.
 
 # Outputs
-- `NamedTuple`: `(lons::Vector{Float64}, lats::Vector{Float64}, depths::Vector{Float64})`.
+- `NamedTuple`: `(lons::Vector{Float64}, lats::Vector{Float64}, depths::Vector{Float64})`
+  with lengths `(Nx, Ny, Nz)`, halo excluded, ascending in each axis.
 """
 function extract_grid_coordinates(grid)
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
     nx, ny, nz = cpu_g.Nx, cpu_g.Ny, cpu_g.Nz
 
-    lons = try
-        [Float64(Oceananigans.Grids.xnode(i, cpu_g, Oceananigans.Grids.Center())) for i in 1:nx]
-    catch
-        collect(Float64, range(cpu_g.λᶠᵃᵃ[1], cpu_g.λᶠᵃᵃ[cpu_g.Nx + 1], length = nx))
+    if !(cpu_g isa LatitudeLongitudeGrid)
+        error(
+            "extract_grid_coordinates requires a LatitudeLongitudeGrid (or an " *
+            "ImmersedBoundaryGrid wrapping one) to report geographic coordinates in " *
+            "degrees; received $(nameof(typeof(cpu_g))). Metric-distance grids must be " *
+            "converted to geographic coordinates before extraction."
+        )
     end
 
-    lats = try
-        [Float64(Oceananigans.Grids.ynode(j, cpu_g, Oceananigans.Grids.Center())) for j in 1:ny]
-    catch
-        collect(Float64, range(cpu_g.φᵃᶠᵃ[1], cpu_g.φᵃᶠᵃ[cpu_g.Ny + 1], length = ny))
-    end
+    # Geographic horizontal coordinates (degrees), halo region stripped.
+    lons = collect(Float64, cpu_g.λᶜᵃᵃ)[cpu_g.Hx+1 : cpu_g.Hx+nx]
+    lats = collect(Float64, cpu_g.φᵃᶜᵃ)[cpu_g.Hy+1 : cpu_g.Hy+ny]
 
-    depths = try
-        [Float64(Oceananigans.Grids.znode(k, cpu_g, Oceananigans.Grids.Center())) for k in 1:nz]
-    catch
-        collect(Float64, range(-1000.0, 0.0, length = nz))
-    end
+    # Vertical coordinate (metres) is genuinely metric, so `znode` is appropriate.
+    depths = [Float64(Oceananigans.Grids.znode(k, cpu_g, Oceananigans.Grids.Center()))
+              for k in 1:nz]
 
     return (lons = lons, lats = lats, depths = depths)
 end

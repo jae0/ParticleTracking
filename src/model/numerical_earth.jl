@@ -1,12 +1,12 @@
 """
     numerical_earth.jl
 
-Integration layer providing `NumericalEarth.jl` and `NumericalEarth.DataWrangling`
+Integration layer providing `NumericalEarth.jl` and `ShelfDataWrangling.DataWrangling`
 interfaces for high-resolution geophysical data ingestion, boundary condition
 formulation, and surface forcing in regional Oceananigans shelf simulations.
 """
 
-module NumericalEarth
+module ShelfDataWrangling
 
 using Oceananigans
 using Oceananigans.Units
@@ -27,14 +27,8 @@ using Interpolations
 
 # Domain constants for Scotian Shelf / Northwest Atlantic
 # Study domain: the core region of interest (Scotian Shelf)
-const STUDY_DOMAIN_LON_RANGE = (-68.0, -57.0)  # degrees East
-const STUDY_DOMAIN_LAT_RANGE = (42.0, 47.5)    # degrees North
-const STUDY_DOMAIN_DEPTH_RANGE = (-5000.0, 0.0)  # meters
 
 # Embedding domain: broader Northwest Atlantic region for boundary conditions and forcings
-const EMBEDDING_DOMAIN_LON_RANGE = (-71.0, -53.0)  # degrees East
-const EMBEDDING_DOMAIN_LAT_RANGE = (40.0, 48.5)    # degrees North
-const EMBEDDING_DOMAIN_DEPTH_RANGE = (-5000.0, 0.0)  # meters
 
 # Physical constants for marine boundary layer & seawater thermodynamics
 const ρ_air    = 1.225      # Air density (kg/m³)
@@ -649,8 +643,8 @@ z \\le 0\\text{ (meters below sea surface)}
 function load_regional_bathymetry(;
     filepath::Union{Nothing, AbstractString} = nothing,
     source::Symbol = :gebco,
-    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE,
-    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE,
+    lon_range::Union{Nothing, Tuple{Real, Real}} = nothing,
+    lat_range::Union{Nothing, Tuple{Real, Real}} = nothing,
     input_dir::AbstractString = "inputs"
 )::NamedTuple{(:elevation, :lon, :lat), Tuple{Matrix{Float64}, Vector{Float64}, Vector{Float64}}}
     candidates = isnothing(filepath) ? [
@@ -716,8 +710,8 @@ end
 """
     get_bathymetry_interpolator(
         bathymetry = :numerical_earth;
-        lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE,
-        lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE,
+        lon_range::Union{Nothing, Tuple{Real, Real}} = nothing,
+        lat_range::Union{Nothing, Tuple{Real, Real}} = nothing,
         input_dir::AbstractString = "inputs"
     ) -> Function
 
@@ -726,8 +720,8 @@ mediated by NumericalEarth seabed bathymetry.
 """
 function get_bathymetry_interpolator(
     bathymetry = :numerical_earth;
-    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE,
-    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE,
+    lon_range::Union{Nothing, Tuple{Real, Real}} = nothing,
+    lat_range::Union{Nothing, Tuple{Real, Real}} = nothing,
     input_dir::AbstractString = "inputs"
 )
     if bathymetry isa Function
@@ -1087,21 +1081,9 @@ import .DataWrangling: regrid_bathymetry,
                       OpenBoundaryConditions,
                       AtmosphericForcing,
                       interpolate_ocean_state,
-                      build_sponge_layer_forcing,
-                      STUDY_DOMAIN_LON_RANGE,
-                      STUDY_DOMAIN_LAT_RANGE,
-                      STUDY_DOMAIN_DEPTH_RANGE,
-                      EMBEDDING_DOMAIN_LON_RANGE,
-                      EMBEDDING_DOMAIN_LAT_RANGE,
-                      EMBEDDING_DOMAIN_DEPTH_RANGE
+                      build_sponge_layer_forcing
 
 export DataWrangling,
-       STUDY_DOMAIN_LON_RANGE,
-       STUDY_DOMAIN_LAT_RANGE,
-       STUDY_DOMAIN_DEPTH_RANGE,
-       EMBEDDING_DOMAIN_LON_RANGE,
-       EMBEDDING_DOMAIN_LAT_RANGE,
-       EMBEDDING_DOMAIN_DEPTH_RANGE,
        regrid_bathymetry,
        load_regional_bathymetry,
        get_bathymetry_interpolator,
@@ -1110,5 +1092,5 @@ export DataWrangling,
        interpolate_ocean_state,
        build_sponge_layer_forcing
 
-end # module NumericalEarth
+end # module ShelfDataWrangling
 

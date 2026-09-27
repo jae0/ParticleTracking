@@ -1,518 +1,531 @@
-# Hydrodynamic Model for Snow Crab Larval Particle Tracking
+# ParticleTrackingRun.jl — CLI & Workflow Execution Guide
 
 ## Overview
 
-This workflow establishes a regional hydrodynamic model of the Scotian Shelf and
-adjacent slope waters using [Oceananigans.jl](https://github.com/CliMA/Oceananigans.jl).
-The hydrodynamic solution provides time-evolving advection ($\boldsymbol{u} = (u, v, w)$)
-and turbulent diffusion ($\kappa_h, \kappa_v$) fields. These physical fields drive
-Lagrangian particle tracking of planktonic (Zoea I, Zoea II) and semiplanktonic (Megalopa)
-snow crab (*Chionoecetes opilio*) larvae undergoing stage-specific vertical migration,
-temperature-dependent development, and spatial dispersal across coastal nursery habitats.
+This workflow establishes a regional 3D hydrodynamic model using
+[Oceananigans.jl](https://github.com/CliMA/Oceananigans.jl) coupled to individual-based
+Lagrangian particle tracking. The hydrodynamic solution provides time-evolving advection
+($\boldsymbol{u} = (u, v, w)$) and turbulent diffusion ($\kappa_h, \kappa_v$) fields, which
+drive Lagrangian tracking of pelagic and semiplanktonic larvae undergoing stage-specific
+vertical migration, temperature-dependent development, and spatial dispersal across
+coastal nursery habitats.
 
-
-
-## Command-Line Interface (CLI) Reference (`ParticleTrackingRun.jl`)
-
-The command-line runner [`ParticleTrackingRun.jl`](file:///c:/home/jae/projects/ParticleTracking/ParticleTrackingRun.jl) provides full operational control over segmented execution, parameter overrides, DuckDB queries, and scenario comparisons.
-
-### Syntax
-```bash
-julia --project=. ParticleTrackingRun.jl [OPTIONS...]
-```
-
-### Complete CLI Flags Reference
-
-| Category                | Flag / Option                            | Argument Type   | Default Value                      | Description                                                                                |
-| :------------------------| :-----------------------------------------| :----------------| :-----------------------------------| :-------------------------------------------------------------------------------------------|
-| **Execution Modes**     | `--all`                                  | Flag            | —                                  | Execute complete 8-segment production pipeline.                                            |
-|                         | `--quick`, `-q`                          | Flag            | —                                  | Fast debug mode ($15\times 15\times 5$, $1\text{ h}$ hydro, $2\text{ d}$ track).           |
-|                         | `--segment=<name>`                       | String          | `all`                              | Run segment: `data`, `grid`, `model`, `climate`, `sim`, `track`, `metrics`, `viz`, `all`.  |
-| **Decoupled Hydro**     | `--hydro-model=<path>`                   | String          | `hydrodynamics_<scen>_<yr>.jld2`   | Target hydrodynamic JLD2 model file path (input or output).                                |
-|                         | `--hydro-only`                           | Flag            | —                                  | Execute hydrodynamic simulation only (Segments 1–5), saving solution to `--hydro-model`.   |
-|                         | `--track-only`                           | Flag            | —                                  | Execute larval tracking only (Segments 6–8), reading flow fields from `--hydro-model`.     |
-|                         | `--reuse-hydro`                          | Flag            | —                                  | Reuse existing `--hydro-model` if present; otherwise run hydrodynamic integration.         |
-|                         | `--run-id=<string>`                      | String          | `run_<scenario>_<year>`            | Unique cohort run identifier for DuckDB persistence and figure naming.                     |
-| **Segment Execution**   | `--data`                                 | Flag            | —                                  | Run environmental data ingestion (Segment 1).                                              |
-|                         | `--grid`                                 | Flag            | —                                  | Run grid & immersed boundary construction (Segment 2).                                     |
-|                         | `--model`                                | Flag            | —                                  | Run hydrodynamic model setup & tidal forcing (Segment 3).                                  |
-|                         | `--climate`                              | Flag            | —                                  | Run CMIP6 climate scenario & thermal biology (Segment 4).                                  |
-|                         | `--sim`, `--simulation`                  | Flag            | —                                  | Run Oceananigans hydrodynamic time stepping (Segment 5).                                   |
-|                         | `--track`, `--tracking`                  | Flag            | —                                  | Run Lagrangian particle tracking & DVM (Segment 6).                                        |
-|                         | `--metrics`                              | Flag            | —                                  | Compute retention, diffusion & connectivity (Segment 7).                                   |
-|                         | `--viz`, `--visualize`                   | Flag            | —                                  | Generate Makie figures & Leaflet map (Segment 8).                                          |
-| **DuckDB Analytics**    | `--duckdb`                               | Flag            | `true`                             | Enable DuckDB scenario storage archiving.                                                  |
-|                         | `--no-duckdb`                            | Flag            | —                                  | Disable DuckDB storage archiving.                                                          |
-|                         | `--db-path=<path>`                       | String          | `outputs/particle_tracking.duckdb` | Custom file path for the DuckDB analytical database.                                       |
-|                         | `--list-runs`                            | Flag            | —                                  | Query and print all archived simulation runs.                                              |
-|                         | `--compare-scenarios`                    | Flag            | —                                  | Query and print multi-scenario comparative analytics.                                      |
-|                         | `--model-average`                        | Flag            | —                                  | Compute Bayesian / ensemble model-averaged connectivity and recruitment.   |
-| **Configuration**       | `--config=<path>`                        | String          | `inputs/ParticleTracking.config`   | Load parameter settings from custom `.config` file.                                        |
-|                         | `--save-config[=<path>]`                 | String          | `inputs/ParticleTracking.config`   | Export active CLI options to `.config` file and exit.                                      |
-| **Species Calibration** | `--snowcrab-settings`                    | Flag            | —                                  | Load calibrated Snow Crab defaults (500 larvae, 60d PLD, ascent, 100x100x20, -3500m to 0m) |
-|                         | `--snowcrab`, `--snowcrab-mode`          | Flag            | —                                  | Aliases for `--snowcrab-settings`.                                                         |
-|                         | `--tesselated`, `--voronoi`              | Flag            | —                                  | Enable depth-stratified multi-resolution Voronoi spatial units (core: 50-350m).           |
-|                         | `--voronoi-units=<int>`                  | Int             | `5000` (`200` quick)               | Number of depth-stratified Voronoi areal units to generate.                                |
-|                         | `--voronoi-prob-core=<val>`              | Float           | `0.8`                              | Core stratum (50-350m) sampling probability.                                               |
-|                         | `--voronoi-prob-shallow=<val>`           | Float           | `0.1`                              | Shallow stratum (0-50m) sampling probability.                                              |
-|                         | `--voronoi-prob-deep=<val>`              | Float           | `0.1`                              | Deep stratum (>350m) sampling probability.                                                 |
-|                         | `--voronoi-min-res-core=<km>`            | Float (km)      | `1.5`                              | Minimum Poisson separation in core stratum (km).                                           |
-|                         | `--voronoi-min-res-shallow=<km>`         | Float (km)      | `5.0`                              | Minimum Poisson separation in shallow stratum (km).                                        |
-|                         | `--voronoi-min-res-deep=<km>`            | Float (km)      | `10.0`                             | Minimum Poisson separation in deep stratum (km).                                           |
-|                         | `--real-5yr`                             | Flag            | —                                  | Execute 5-Year physical hydrodynamic cycle scenario (`historical`, 2020).                  |
-|                         | `--climatology-2yr`                      | Flag            | —                                  | Execute 2-Year climatological average cycle scenario (`ssp245`, 2022).                     |
-|                         | `--compare`                              | Flag            | —                                  | Query DuckDB database and print comparative analytics across runs.                         |
-| **Hardware**            | `--gpu`, `--cuda`                        | Flag            | —                                  | Enable NVIDIA CUDA GPU acceleration for hydrodynamics.                                     |
-|                         | `--cpu`                                  | Flag            | `true`                             | Execute on multi-threaded CPU.                                                             |
-|                         | `--fallback-cpu`                         | Flag            | —                                  | Automatically fall back to CPU if CUDA GPU is absent.                                      |
-| **Visualization**       | `--interactive`                          | Flag            | `true`                             | Export standalone interactive HTML5 Leaflet dashboard.                                     |
-|                         | `--no-interactive`                       | Flag            | —                                  | Disable interactive HTML map generation.                                                   |
-|                         | `--animate-hydro`, `--anim-hydro`        | Flag            | —                                  | Render animated MP4/GIF video of hydrodynamic fields.                                      |
-|                         | `--no-animate-hydro`                     | Flag            | `true`                             | Disable hydrodynamic animation rendering.                                                  |
-|                         | `--anim-variable=<name>`                 | String          | `dashboard`                        | Diagnostic field: `dashboard`, `temperature` (`T`), `advection` (`speed`), `diffusion` (`kappa`), `salinity` (`S`), `viscosity` (`nu`), `stratification` (`N2`), `density` (`rho`), `vorticity` (`zeta`), `elevation` (`eta`), `w`, `richardson` (`Ri`). |
-|                         | `--anim-fps=<int>`                       | Int             | `10`                               | Playback framerate in frames/second.                                                       |
-|                         | `--anim-format=<mp4\|gif>`               | String          | `mp4`                              | Video output format container (`mp4` or `gif`).                                            |
-|                         | `--anim-depth=<meters>`                  | Float (m)       | `-2.5`                             | Target depth in meters (e.g. `0.0`, `-2.5` surface, `-50.0` CIL, `-150.0` deep shelf).       |
-|                         | `--anim-output=<path>`, `--anim-file=<path>` | String      | `""`                               | Designate custom destination path (e.g. `outputs/flow.mp4`). If empty, auto-names.         |
-|                         | `--anim-overlay-particles`               | Flag            | —                                  | Synchronously overlay active Lagrangian larvae drifting with currents.                     |
-| **Spatial Domain**      | `--lon=<min,max>`                        | Real,Real       | `-68.0,-57.0`                      | Longitude bounding range in degrees East.                                                  |
-|                         | `--lat=<min,max>`                        | Real,Real       | `42.0,47.0`                        | Latitude bounding range in degrees North.                                                  |
-|                         | `--depth-range=<min,max>`                | Real,Real       | `-1000.0,0.0`                      | Vertical depth range in meters ($z_{\text{bottom}}, z_{\text{surface}}$).                  |
-|                         | `--grid=<nx,ny,nz>`                      | Int,Int,Int     | `50,50,10`                         | Grid cell resolution ($N_\lambda, N_\phi, N_z$).                                           |
-|                         | `--nx=<int>`, `--ny=<int>`, `--nz=<int>` | Int             | `50`, `50`, `10`                   | Individual grid axis dimensions.                                                           |
-| **Data & Tides**        | `--real`                                 | Flag            | —                                  | Fetch real-world NOAA ERDDAP bathymetry and winds.                                         |
-|                         | `--synthetic`                            | Flag            | `true`                             | Generate idealized synthetic shelf data.                                                   |
-|                         | `--tides`                                | Flag            | `true`                             | Enable astronomical tidal body forcing ($M_2 + S_2$).                                      |
-|                         | `--no-tides`                             | Flag            | —                                  | Disable tidal body forcing.                                                                |
-|                         | `--tidal-u=<val>`                        | Float (m/s)     | `0.25`                             | Semi-major barotropic tidal current amplitude.                                             |
-|                         | `--tidal-v=<val>`                        | Float (m/s)     | `0.12`                             | Semi-minor barotropic tidal current amplitude.                                             |
-|                         | `--heat-flux=<val>`                      | Float ($W/m^2$) | `50.0`                             | Net atmospheric surface heat flux (positive warming).                                      |
-| **Climate Scenarios**   | `--scenario=<name>`                      | Symbol          | `historical`                       | Climate scenario: `historical`, `ssp126`, `ssp245`, `ssp585`, `mhw`.                       |
-|                         | `--year=<int>`                           | Int             | `2020`                             | Climate projection horizon year.                                                           |
-| **Simulation**          | `--duration=<hours>`                     | Float (hrs)     | `120.0`                            | Hydrodynamic simulation duration in hours.                                                 |
-|                         | `--sim-duration=<sec>`                   | Float (sec)     | `432000.0`                         | Hydrodynamic simulation duration in seconds.                                               |
-|                         | `--sim-dt=<sec>`                         | Float (sec)     | `120.0`                            | Initial hydrodynamic time integration step.                                                |
-|                         | `--adaptive-cfl`                         | Flag            | `true`                             | Enable advective CFL-limited adaptive time stepping.                                       |
-|                         | `--no-adaptive-cfl`                      | Flag            | —                                  | Disable adaptive CFL time stepping.                                                        |
-|                         | `--target-cfl=<val>`                     | Float           | `0.2`                              | Target advective Courant-Friedrichs-Lewy limit.                                            |
-|                         | `--restart`                              | Flag            | `true`                             | Automatically resume incomplete hydrodynamic runs from latest checkpoint.                   |
-|                         | `--no-restart`, `--force-new`            | Flag            | —                                  | Disallow restart pickup; overwrite or compute from scratch.                                |
-|                         | `--checkpoint`                           | Flag            | `true`                             | Enable periodic Oceananigans model state checkpointing.                                    |
-|                         | `--no-checkpoint`                        | Flag            | —                                  | Disable model checkpointing.                                                               |
-|                         | `--checkpoint-interval=<sec|iter>`       | Real / Int      | `output_schedule`                  | Periodic state serialization frequency (seconds or iterations).                            |
-|                         | `--checkpoints-dir=<path>`               | String          | `<output-dir>/checkpoints`         | Directory path for checkpoint archive files.                                               |
-| **Lagrangian Drift**    | `--particles=<int>`                      | Int             | `100`                              | Number of larvae to initialize and track.                                                  |
-|                         | `--track-duration=<days>`                | Float (days)    | `5.0`                              | Larval cohort tracking duration in days.                                                   |
-|                         | `--track-dt=<sec>`                       | Float (sec)     | `300.0`                            | Lagrangian advection time step in seconds.                                                 |
-|                         | `--min-depth=<meters>`                   | Float (m)       | `100.0`                            | Minimum water depth for larval placement.                                                  |
-|                         | `--release-mode=<mode>`                  | Symbol          | `bottom`                           | Larval release depth mode (`bottom`, `range`, `surface`).                                  |
-|                         | `--ascent`                               | Flag            | `true`                             | Enable post-hatch vertical ascent toward surface.                                          |
-|                         | `--no-ascent`                            | Flag            | —                                  | Disable initial vertical ascent.                                                           |
-|                         | `--ascent-speed=<val>`                   | Float (m/s)     | `0.010`                            | Vertical ascent swimming speed (~10 mm/s).                                                 |
-|                         | `--ascent-target=<val>`                  | Float (m)       | `-10.0`                            | Target depth for ascent completion.                                                        |
-|                         | `--dvm`                                  | Flag            | `true`                             | Enable stage-dependent Diel Vertical Migration.                                            |
-|                         | `--no-dvm`                               | Flag            | —                                  | Disable Diel Vertical Migration.                                                           |
-|                         | `--molting`                              | Flag            | `true`                             | Enable degree-day thermal molting & mortality.                                             |
-|                         | `--no-molting`                           | Flag            | —                                  | Disable thermal molting calculations.                                                      |
-|                         | `--diff-h=<val>`                         | Float ($m^2/s$) | `10.0`                             | Horizontal turbulent diffusivity ($\kappa_h$).                                             |
-|                         | `--diff-v=<val>`                         | Float ($m^2/s$) | `1e-4`                             | Vertical turbulent diffusivity ($\kappa_v$).                                               |
-| **I/O & Environment**   | `--output-dir=<path>`                    | String          | `outputs`                          | Target directory for outputs and figures.                                                  |
-|                         | `--input-dir=<path>`                     | String          | `inputs`                           | Cache directory for input NetCDF datasets.                                                 |
-|                         | `--seed=<int>`                           | Int             | `42`                               | Pseudorandom number generator seed.                                                        |
-|                         | `--help`, `-h`                           | Flag            | —                                  | Print command-line help and flag reference.                                                |
+The engine is **species-agnostic and region-agnostic**: all biological, ecological, and
+domain-specific parameters are supplied through TOML configuration files rather than
+compiled-in defaults or species-specific CLI flags.
 
 ---
 
-### Common Operational CLI Workflows
+## Quick Start
+
+```bash
+# Instantiate dependencies
+julia --project=. -e "using Pkg; Pkg.instantiate()"
+
+# Fast end-to-end debug verification (coarse grid, short durations)
+julia --project=. ParticleTrackingRun.jl --all --quick
+
+# Production run driven by a TOML configuration
+julia --project=. ParticleTrackingRun.jl --all --config=work/snowcrab/snowcrab.toml
+
+# Print full CLI help
+julia --project=. ParticleTrackingRun.jl --help
+```
+
+---
+
+## Architecture: Eight-Segment Pipeline
+
+The runner decomposes the modelling workflow into eight independently addressable
+segments. Each may be run alone, or as a complete pipeline via `--all`.
+
+| # | Segment | Purpose |
+|---|---------|---------|
+| 1 | `data`     | Environmental data ingestion (bathymetry, winds, hydrography) and drag processing |
+| 2 | `grid`     | Spherical grid construction and immersed boundary (bathymetry) regridding |
+| 3 | `model`    | Hydrodynamic model assembly, tidal forcing, OBC and atmospheric fluxes |
+| 4 | `climate`  | Climate scenario integration and thermal ecology |
+| 5 | `sim`      | Oceananigans hydrodynamic time integration with checkpointing |
+| 6 | `track`    | Lagrangian particle tracking with DVM, molting, and settlement |
+| 7 | `metrics`  | Empirical movement, recruitment, connectivity, Voronoi tessellation |
+| 8 | `viz`      | Scientific visualizations and spatial figures |
+
+---
+
+## CLI Flags Reference
+
+### Execution Modes
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--all` | Flag | — | Execute the complete 8-segment production pipeline |
+| `--quick`, `-q` | Flag | — | Fast debug mode (coarse grid, ~1 h hydrodynamics, ~2 d tracking) |
+| `--segment=<name>` | String | `all` | Run a single segment: `data`, `grid`, `model`, `climate`, `sim`, `track`, `metrics`, `viz`, `all` |
+| `--help`, `-h` | Flag | — | Print CLI help |
+
+### Decoupled Hydrodynamics & Multi-Cohort Tracking
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--hydro-model=<path>` | String | `<output_dir>/hydrodynamics.jld2` | Hydrodynamic JLD2 file (output for `--hydro-only`, input for `--track-only`) |
+| `--hydro-only` | Flag | — | Run Segments 1–5 only; save flow fields to `--hydro-model` |
+| `--track-only` | Flag | — | Run Segments 6–8 only; read flow fields from `--hydro-model` |
+| `--reuse-hydro` | Flag | — | Reuse existing `--hydro-model` if complete; otherwise integrate |
+| `--run-id=<string>` | String | `run_<scenario>_<year>` | Cohort identifier for DuckDB persistence and figure naming |
+| `--restart` | Flag | `true` | Resume from the latest checkpoint if an incomplete run exists |
+| `--no-restart`, `--force-new` | Flag | — | Ignore existing checkpoints and restart from $t=0$ |
+| `--checkpoint` | Flag | `true` | Enable prognostic state checkpointing |
+| `--no-checkpoint` | Flag | — | Disable prognostic state checkpointing |
+| `--checkpoint-interval=<spec>` | String | output cadence | Checkpoint interval: seconds (`3600`), hours (`6h`), or days (`1d`) |
+| `--checkpoints-dir=<path>` | String | `<output_dir>/checkpoints` | Checkpoint archive directory |
+| `--checkpoint-prefix=<name>` | String | `checkpoint` | Checkpoint filename prefix |
+| `--checkpoint-cleanup` | Flag | — | Retain only the latest checkpoint on disk |
+| `--no-checkpoint-cleanup` | Flag | `true` | Keep all intermediate checkpoints |
+
+### Configuration
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--config=<path>` | String | `inputs/ParticleTracking.toml` | Load parameters from a TOML configuration file |
+| `--save-config[=<path>]` | String | — | Export the active resolved configuration to TOML and exit |
+
+**All species-specific and domain-specific parameters belong in the TOML file**, not the CLI.
+The runner has no `--snowcrab*`, `--real-5yr`, or `--climatology-2yr` flags; select a
+scenario by pointing `--config` at the corresponding TOML file.
+
+### DuckDB Analytics
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--duckdb` | Flag | `true` | Enable DuckDB archiving |
+| `--no-duckdb` | Flag | — | Disable DuckDB archiving |
+| `--db-path=<path>` | String | `outputs/particle_tracking.duckdb` | DuckDB database path |
+| `--list-runs` | Flag | — | Print all archived simulation runs |
+| `--compare-scenarios` | Flag | — | Print multi-scenario comparative analytics |
+| `--model-average` | Flag | — | Compute ensemble model-averaged connectivity and recruitment |
+
+### Hardware
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--gpu`, `--cuda` | Flag | — | Enable NVIDIA CUDA GPU acceleration |
+| `--cpu` | Flag | `true` | Execute on multi-threaded CPU |
+| `--fallback-cpu` | Flag | — | Fall back to CPU automatically if CUDA is unavailable |
+
+### Spatial Domain & Grid
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--lon=<min,max>` | String | from config | Longitude bounds (°E) |
+| `--lat=<min,max>` | String | from config | Latitude bounds (°N) |
+| `--depth-range=<min,max>` | String | from config | Vertical depth range (m) |
+| `--grid=<nx,ny,nz>` | String | from config | Grid cell dimensions |
+| `--nx=<int>`, `--ny=<int>`, `--nz=<int>` | Int | from config | Individual grid axis dimensions |
+| `--res-scale=<float>` | Float | `1.0` | Resolution scaling factor |
+| `--stretched-z` | Flag | — | Enable hyperbolic-tangent vertical stretching |
+| `--uniform-z` | Flag | — | Use uniform vertical layer thicknesses |
+| `--z-file`, `--vertical-grid-file` | String | `inputs/scotian_shelf_vertical_grid.csv` | Vertical coordinate CSV |
+
+### Environmental Data & Forcing
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--real` | Flag | — | Fetch real bathymetry and atmospheric forcing |
+| `--synthetic` | Flag | `true` | Generate idealized synthetic shelf data |
+| `--tides` | Flag | `true` | Enable astronomical tidal body forcing |
+| `--no-tides` | Flag | — | Disable tidal forcing |
+| `--tidal-u=<val>` | Float (m/s) | `0.25` | M2 semi-major tidal velocity amplitude |
+| `--tidal-v=<val>` | Float (m/s) | `0.12` | M2 semi-minor tidal velocity amplitude |
+| `--era5-forcing`, `--era5` | Flag | — | Enable ERA5 atmospheric surface forcing |
+| `--no-era5` | Flag | — | Use analytical wind stress forcing |
+| `--obc` | Flag | — | Enable GLORYS open boundary conditions |
+| `--no-obc` | Flag | — | Disable open boundary conditions |
+| `--obc-source` | String | `glorys12v1` | Open boundary data source |
+| `--obc-type` | String | `flather_chapman` | Open boundary condition scheme |
+
+### Climate Scenarios
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--scenario=<name>` | String | `ssp245` | `historical`, `ssp126`, `ssp245`, `ssp585`, `mhw`, `climatology` |
+| `--year=<int>` | Int | `2050` | Climate projection horizon year |
+| `--heat-flux=<val>` | Float (W/m²) | `50.0` | Net atmospheric surface heat flux |
+
+### Hydrodynamic Simulation
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--duration=<hours>` | Float | from config | Simulation duration in hours |
+| `--sim-duration=<sec>` | Float | from config | Simulation duration in seconds |
+| `--sim-dt=<sec>` | Float | `120.0` | Initial hydrodynamic time step |
+| `--adaptive-cfl` | Flag | `true` | Enable CFL-limited adaptive time stepping |
+| `--no-adaptive-cfl` | Flag | — | Disable adaptive CFL stepping |
+| `--target-cfl=<val>` | Float | `0.2` | Target advective Courant–Friedrichs–Lewy number |
+
+### Lagrangian Particle Tracking & Larval Ecology
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--particles=<int>` | Int | `100` | Cohort size |
+| `--track-duration=<days>` | Float | `5.0` | Tracking duration in days |
+| `--track-dt=<sec>` | Float | `300.0` | Lagrangian integration time step |
+| `--min-depth=<m>` | Float | `100.0` | Minimum water depth for larval placement |
+| `--buffer-km`, `--buffer`, `--buf` | Float | `100.0` | Spatial buffer beyond stratum boundaries (km) |
+| `--dvm` | Flag | `true` | Enable Diel Vertical Migration |
+| `--no-dvm` | Flag | — | Disable DVM |
+| `--molting` | Flag | `true` | Enable degree-day molting and mortality |
+| `--no-molting` | Flag | — | Disable thermal molting |
+| `--diff-h`, `--diffusivity-h` | Float (m²/s) | `10.0` | Horizontal turbulent diffusivity |
+| `--diff-v`, `--diffusivity-v` | Float (m²/s) | `1e-4` | Vertical turbulent diffusivity |
+| `--release-mode` | String | `bottom` | `bottom`, `range`, `surface` |
+| `--ascent` | Flag | `true` | Enable post-hatch vertical ascent |
+| `--no-ascent` | Flag | — | Disable initial vertical ascent |
+| `--ascent-speed` | Float (m/s) | `0.010` | Ascent swimming speed |
+| `--ascent-target` | Float (m) | `-10.0` | Target depth for ascent completion |
+
+### Voronoi Tessellation
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--voronoi-units`, `--n-units` | Int | `5000` | Number of depth-stratified Voronoi units |
+| `--voronoi-prob-core` | Float | `0.8` | Core stratum sampling probability |
+| `--voronoi-prob-shallow` | Float | `0.1` | Shallow stratum sampling probability |
+| `--voronoi-prob-deep` | Float | `0.1` | Deep stratum sampling probability |
+| `--voronoi-min-core` | Float (km) | `1.5` | Minimum separation, core stratum |
+| `--voronoi-min-shallow` | Float (km) | `5.0` | Minimum separation, shallow stratum |
+| `--voronoi-min-deep` | Float (km) | `10.0` | Minimum separation, deep stratum |
+
+### Visualization & Animation
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--interactive` | Flag | `true` | Export interactive HTML5 Leaflet map |
+| `--no-interactive` | Flag | — | Disable interactive HTML map |
+| `--animate-hydro`, `--anim-hydro` | Flag | — | Render MP4/GIF animation of hydrodynamic fields |
+| `--no-animate-hydro` | Flag | `true` | Disable hydrodynamic animation |
+| `--anim-variable=<name>` | String | `dashboard` | Diagnostic field (see table below) |
+| `--anim-fps=<int>` | Int | `10` | Playback framerate |
+| `--anim-format` | String | `mp4` | `mp4` or `gif` |
+| `--anim-depth=<m>` | Float | `-2.5` | Target depth for 2D field slices |
+| `--anim-output`, `--anim-file` | String | `""` | Custom output video path |
+| `--anim-overlay-particles`, `--anim-particles` | Flag | — | Overlay Lagrangian particles on animation |
+
+### I/O & Environment
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--output-dir=<path>` | String | from config | Output directory for figures and datasets |
+| `--input-dir=<path>` | String | from config | Input cache directory |
+| `--seed=<int>` | Int | `42` | Random number generator seed |
+
+---
+
+## Configuration Files (TOML)
+
+Configuration files use [TOML](https://toml.io) syntax and are validated against a typed
+schema (`src/config_schema.jl`) via **Configurations.jl**. Files are located by
+`--config=<path>`; the default is resolved by `find_default_config_path()`.
+
+### Available Configurations
+
+| File | Description |
+| :--- | :--- |
+| `inputs/ParticleTracking.toml` | Default regional modelling configuration |
+| `inputs/hydrodynamics_climatology_2yr.toml` | 2-year climatological circulation (repeating annual cycle) |
+| `inputs/hydrodynamics_2020_2yr.toml` | 2020–2022 real-data hindcast |
+| `inputs/hydrodynamics_mhw_2yr.toml` | Marine heat wave scenario with thermal anomaly |
+| `work/snowcrab/snowcrab.toml` | Snow crab larval dispersal; all outputs under `work/snowcrab/` |
+
+### Section Reference
+
+| Section | Purpose |
+| :--- | :--- |
+| `[metadata]` | Run name, description, author, version |
+| `[data]` | Data ingestion mode and source dataset identifiers |
+| `[climate]` | Scenario, projection/baseline/horizon years |
+| `[domain]` | Study domain bounds (`lon_*`, `lat_*`, `z_*`) and buffer |
+| `[grid]` | Grid dimensions, resolution scale, vertical stretching |
+| `[bathymetry]` | Bathymetry provider, resolution, fallbacks |
+| `[atmosphere]` | Atmospheric forcing source, variables, drag formulation |
+| `[boundaries]` | OBC method, source, sponge parameters, embedding domain |
+| `[tides]` | Tidal constituents, amplitudes, period, phase |
+| `[bottom_boundary_layer]` | Quadratic drag and benthic mixing closure |
+| `[hydrodynamics]` | Duration, time step, CFL control, tracers, model file |
+| `[tessellation]` | Depth-stratified Voronoi unit parameters |
+| `[biology]` | Cohort size, tracking duration, diffusivity, release, ascent |
+| `[dvm]` | Stage-specific diel vertical migration depths |
+| `[molting_and_settlement]` | Degree-day thresholds, settlement criteria, mortality |
+| `[storage]` | Output filename, DuckDB path, checkpoint cadence and directory |
+| `[hardware]` | GPU preference and CPU fallback |
+| `[visualization]` | Interactive map toggle and figure title |
+| `[paths]` | `output_dir`, `input_dir`, RNG `seed` |
+
+### Two Domain Scales
+
+Two distinct spatial scales are used and are declared separately in the TOML:
+
+- **Study domain** (`[domain]`): the computational grid and analysis region — here the
+  Scotian Shelf, `lon ∈ [-68.0, -57.0]°E`, `lat ∈ [42.0, 47.5]°N`.
+- **Embedding domain** (`[boundaries]`): the larger Northwest Atlantic region
+  (`lon ∈ [-71.0, -53.0]°E`, `lat ∈ [40.0, 48.5]°N`) from which open boundary and
+  atmospheric forcing data are extracted. The study domain nests inside it.
+
+### Path Resolution
+
+`[paths] output_dir` is the single source of truth for all generated artefacts. Within it:
+
+- `output_filename` — hydrodynamic field archive (`.jld2`)
+- `duckdb_path` — analytical database
+- `checkpoint_dir` — restart checkpoint archive
+
+Set `checkpoint_dir = ""` to inherit `<output_dir>/checkpoints` automatically.
+
+### Exporting Configuration
+
+```bash
+# Resolve CLI overrides and export to TOML
+julia --project=. ParticleTrackingRun.jl \
+    --particles=1000 --min-depth=120.0 --ascent-speed=0.012 \
+    --save-config=inputs/deep_shelf.toml
+```
+
+---
+
+## Decoupled Multi-Cohort Workflow
+
+Lagrangian tracking is orders of magnitude cheaper than solving the 3D primitive
+equations. Compute the circulation once, archive it, then run many cohorts against it.
+
+```bash
+# 1. Solve hydrodynamics once
+julia --project=. ParticleTrackingRun.jl \
+    --config=work/snowcrab/snowcrab.toml \
+    --hydro-only \
+    --hydro-model=work/snowcrab/hydrodynamics_base.jld2
+
+# 2. Cohort A — benthic release with active ascent
+julia --project=. ParticleTrackingRun.jl \
+    --config=work/snowcrab/snowcrab.toml \
+    --track-only --hydro-model=work/snowcrab/hydrodynamics_base.jld2 \
+    --run-id=cohort_spring --ascent --ascent-speed=0.010 --seed=101
+
+# 3. Cohort B — faster ascent
+julia --project=. ParticleTrackingRun.jl \
+    --config=work/snowcrab/snowcrab.toml \
+    --track-only --hydro-model=work/snowcrab/hydrodynamics_base.jld2 \
+    --run-id=cohort_fast --ascent --ascent-speed=0.015 --seed=202
+
+# 4. Cohort C — surface release control
+julia --project=. ParticleTrackingRun.jl \
+    --config=work/snowcrab/snowcrab.toml \
+    --track-only --hydro-model=work/snowcrab/hydrodynamics_base.jld2 \
+    --run-id=cohort_control --release-mode=surface --no-ascent --seed=303
+
+# 5. Compare all cohorts
+julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=work/snowcrab/snowcrab.duckdb
+```
+
+---
+
+## Checkpointing and Graceful Restart
+
+1. **Automatic periodic checkpointing** — Oceananigans `Checkpointer` serializes the full
+   prognostic state ($u, v, w, T, S, \eta$, clock) into
+   `<checkpoint_dir>/<prefix>_iteration<N>.jld2`. With `cleanup_checkpoints = true`, only
+   the newest file is retained, preventing storage exhaustion on long integrations.
+2. **Emergency checkpointing on interruption** — `run_hydrodynamic_simulation!` traps
+   `InterruptException` (`Ctrl+C`, SLURM walltime) and flushes state before exiting cleanly.
+3. **Seamless resumption** — with `auto_restart = true` the runner inspects the diagnostic
+   timeseries and checkpoint directory; if $t_{\text{last}} < t_{\text{stop}}$ it picks up
+   from the newest checkpoint and appends new output without overwriting existing records.
+   `--no-restart` / `--force-new` forces a fresh integration from $t=0$.
+
+```bash
+# Resume after interruption (default behaviour)
+julia --project=. ParticleTrackingRun.jl --config=inputs/hydrodynamics_2020_2yr.toml \
+    --hydro-only --restart
+
+# Force a clean re-run
+julia --project=. ParticleTrackingRun.jl --config=inputs/hydrodynamics_2020_2yr.toml \
+    --hydro-only --force-new
+```
+
+---
+
+## Depth-Stratified Voronoi Tessellation
+
+Refines demographic resolution in core nursery habitats without incurring prohibitive
+Eulerian CFL penalties, by post-processing Lagrangian endpoints into adaptive areal units.
+
+### Stratum Sampling Strategy
+
+| Stratum | Depth range | Probability | Min. separation |
+| :--- | :--- | :--- | :--- |
+| Core nursery | 50–350 m | $P = 0.8$ | 1.5 km |
+| Shallow / inshore | 0–50 m | $P = 0.1$ | 5.0 km |
+| Deep slope / basin | > 350 m | $P = 0.1$ | 10.0 km |
+
+$N$ units (default 5000; 200 in `--quick`) are sampled by Poisson-disc process across the
+regional bathymetry. `slope_weighting` refines spacing along steep shelf breaks and canyons
+by `slope_factor`.
+
+### Usage
+
+```bash
+# Tessellation parameters come from the [tessellation] section of the TOML
+julia --project=. ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml --all
+
+# Override on the CLI
+julia --project=. ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml --all \
+    --voronoi-units=5000 --voronoi-prob-core=0.85 --voronoi-min-core=1.5
+```
+
+### Outputs
+
+- **$N \times N$ connectivity matrix** $P_{ij}$ across Voronoi units
+- **$3 \times 3$ macro-strata matrix** (shallow ↔ core ↔ deep)
+- **GeoJSON polygons** — `<output_dir>/voronoi_units.geojson`
+- **DuckDB table** `voronoi_units` — coordinates, stratum, depth, area, settlement density
+- **Figure** `<output_dir>/voronoi_tessellation.png` — stratum-coloured cells with settlement density
+
+---
+
+## Visualization System
+
+Segment 8 renders a full set of publication figures. All functions respect the resolved
+`output_dir` from the TOML and use a shared masking helper so land and below-seafloor cells
+render transparently rather than producing degenerate colour ranges.
+
+### 2D Figures (CairoMakie)
+
+| Artefact | Content |
+| :--- | :--- |
+| `larval_trajectories.png` | Trajectory map coloured by developmental stage |
+| `dvm_depth_profiles.png` | Stage-specific diel depth distributions |
+| `settlement_density.png` | Gridded benthic settlement density |
+| `empirical_movement_field.png` | Quiver field of empirical displacement and diffusivity |
+| `regional_connectivity_matrix.png` | Macro-stratum transition matrix $P_{ij}$ |
+| `thermal_exposure_map.png` | Degree-day thermal exposure |
+| `recruitment_summary.png` | Survival and recruitment bar summary |
+| `hydrodynamic_advection.png` | Surface current speed with vector overlay |
+| `hydrodynamic_tracers.png` | Temperature and salinity fields |
+| `hydrodynamic_stratification.png` | Buoyancy frequency $N^2$ and salinity gradient |
+| `hydrodynamic_diffusion.png` | Eddy diffusivity $\kappa_v$ and viscosity $\nu_v$ |
+| `hydrodynamic_section.png` | Vertical cross-section with bathymetry masking |
+| `multi_panel_dashboard.png` | 6-panel combined hydrodynamic + Lagrangian dashboard |
+| `voronoi_tessellation.png` | Voronoi units by stratum with settlement density |
+| `particle_fate_summary.png` | Stage progression, fate distribution, thermal exposure |
+
+### 3D Visualizations (GLMakie, GPU-accelerated)
+
+Exported through `ParticleTracking.GLVisualization`:
+
+| Function | Content |
+| :--- | :--- |
+| `plot_3d_hydrodynamic_field` | Volume rendering with isosurfaces, bathymetry terrain mesh, optional particle overlay |
+| `plot_3d_particle_trajectories` | 3D trajectory tubes with stage colour gradients and fading tails |
+| `plot_3d_connectivity` | 3D connectivity network between management strata with arc weighting |
+
+### Animation Diagnostic Variables
+
+| Key | Aliases | Physical metric | Colormap |
+| :--- | :--- | :--- | :--- |
+| `temperature` | `T`, `temp`, `theta` | Potential temperature (°C) | `:thermal` |
+| `advection` | `speed`, `velocity`, `u_h` | Horizontal current speed $\sqrt{u^2+v^2}$ (cm s⁻¹) | `:viridis` |
+| `diffusion` | `diffusivity`, `kappa` | Vertical eddy diffusivity $\kappa_v$ ($10^{-4}$ m² s⁻¹) | `:turbid` |
+| `salinity` | `S`, `sal` | Practical salinity (PSU) | `:haline` |
+| `viscosity` | `nu`, `eddy_viscosity` | Vertical eddy viscosity $\nu_v$ ($10^{-4}$ m² s⁻¹) | `:deep` |
+| `stratification` | `N2` | Buoyancy frequency squared $N^2$ ($10^{-4}$ s⁻²) | `:ice` |
+| `density` | `rho` | Potential density (kg m⁻³) | `:dense` |
+| `vorticity` | `zeta` | Relative vorticity $\zeta$ ($10^{-5}$ s⁻¹) | `:balance` |
+| `elevation` | `eta`, `ssh` | Free surface height $\eta$ (cm) | `:delta` |
+| `w` | `vertical_velocity` | Vertical velocity $w$ (mm s⁻¹) | `:curl` |
+| `richardson` | `Ri` | Gradient Richardson number (dimensionless) | `:spectral` |
+| `dashboard` | — | Synchronized multi-diagnostic dashboard | Multiple |
+
+Depth targeting is continuous via nearest-vertical-coordinate matching
+($k = \arg\min_k |z_k - z_{\text{target}}|$), so `--anim-depth=-50.0` targets the cold
+intermediate layer and `--anim-depth=0.0` the surface mixed layer.
+
+```bash
+# 4-panel dashboard with larval drift overlay
+julia --project=. ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml \
+    --animate-hydro --anim-variable=dashboard --anim-depth=-2.5 --anim-fps=12 \
+    --anim-output=work/snowcrab/dashboard.mp4
+
+# CIL temperature evolution
+julia --project=. ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml \
+    --animate-hydro --anim-variable=temperature --anim-depth=-50.0 \
+    --anim-output=work/snowcrab/cil_temperature.mp4
+
+# Surface advection with particle overlay
+julia --project=. ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml \
+    --animate-hydro --anim-variable=advection --anim-depth=0.0 --anim-particles
+```
+
+---
+
+## Programmatic API
+
+```julia
+using ParticleTracking
+
+# Load and validate a TOML configuration
+cfg = load_configuration("work/snowcrab/snowcrab.toml")
+
+# Resolve the runtime options struct
+opts = configuration_to_options(cfg)
+
+# Inspect or override individual options
+opts.domain_lon, opts.grid_size, opts.n_particles
+
+# Run individual segments
+run_segment_data(; opts = opts)
+run_segment_sim(; opts = opts)
+run_segment_track(; opts = opts, trajectories = nothing)
+```
+
+The configuration layer is split into two coordinated representations:
+
+- **`configuration.jl`** — nested `Dict` parsing, `HydrodynamicOptions` construction, and
+  `HydrodynamicConfig` / `LarvalDispersalConfig` / `CoupledSimulationConfig` decoupled views.
+- **`config_schema.jl`** — `Configurations.jl` `@option` structs providing typed,
+  validated schema defaults; `load_config` / `save_config` / `schema_to_options` bridge
+  the schema to runtime options.
+
+---
+
+## Common Workflows
 
 ```bash
 # 1. Fast end-to-end debug verification
 julia --project=. ParticleTrackingRun.jl --all --quick
 
-# 2. Production run under CMIP6 SSP5-8.5 warming (2050) with 500 larvae
-julia --project=. ParticleTrackingRun.jl --all --scenario=ssp585 --year=2050 --particles=500
+# 2. Production climatological run (all output under work/snowcrab/)
+julia --project=. ParticleTrackingRun.jl --all --config=work/snowcrab/snowcrab.toml
 
-# 3. Production run with custom configuration file
-julia --project=. ParticleTrackingRun.jl --all --config=inputs/ParticleTracking.config
+# 3. Marine heat wave scenario
+julia --project=. ParticleTrackingRun.jl --all --config=inputs/hydrodynamics_mhw_2yr.toml
 
-# 4. GPU-accelerated run with automatic CPU fallback
-julia --project=. ParticleTrackingRun.jl --all --gpu --fallback-cpu
+# 4. Real 2020–2022 hindcast
+julia --project=. ParticleTrackingRun.jl --all --config=inputs/hydrodynamics_2020_2yr.toml
 
-# 5. Query and list all archived simulation runs in DuckDB
+# 5. GPU-accelerated with automatic CPU fallback
+julia --project=. ParticleTrackingRun.jl --all --gpu --fallback-cpu \
+    --config=work/snowcrab/snowcrab.toml
+
+# 6. Query archived runs and comparative analytics
 julia --project=. ParticleTrackingRun.jl --list-runs
-
-# 6. Multi-scenario comparative analytics across climate projections
 julia --project=. ParticleTrackingRun.jl --compare-scenarios
-
-# 7. Compute ensemble model-averaged connectivity matrix (P_ij ± σ)
 julia --project=. ParticleTrackingRun.jl --model-average
 
-# 8. Modify parameters and export new configuration file
-julia --project=. ParticleTrackingRun.jl --particles=1000 --min-depth=120.0 --save-config=inputs/deep_shelf.config
-```
-
-
----
-
-## Decoupled Multi-Cohort Operational Workflow via CLI
-
-Because Lagrangian tracking is thousands of times faster than solving 3D Navier-Stokes
-equations, `ParticleTrackingRun.jl` allows decoupling the Eulerian hydrodynamic model
-from larval transport. You can compute regional circulation once, archive the flow field
-to `outputs/baseline/simulation_flow.jld2`, and then execute multiple Lagrangian cohorts
-with different biological parameters, hatch dates, release modes, or random seeds.
-
-### 1. Execute Hydrodynamics Once (--hydro-only)
-Compute the 3D physical ocean state (velocity $\boldsymbol{u}$, temperature $T$, and
-bathymetry) and write the checkpoint directly to `--hydro-model`:
-
-```bash
-julia --project=. ParticleTrackingRun.jl \
-    --hydro-only \
-    --hydro-model=outputs/baseline/hydrodynamics_ssp245_2050.jld2 \
-    --duration=120.0 \
-    --grid=50,50,10 \
-    --scenario=ssp245 \
-    --year=2050 \
-    --output-dir=outputs/baseline
-```
-
-### 2. Track Cohort A: Spring Benthic Release with Active Ascent (--track-only)
-Using the pre-computed flow field, track 500 larvae released from
-the seabed that actively swim upward toward the surface:
-
-```bash
-julia --project=. ParticleTrackingRun.jl \
-    --track-only \
-    --hydro-model=outputs/baseline/hydrodynamics_ssp245_2050.jld2 \
-    --run-id=cohort_spring_ascent \
-    --output-dir=outputs/baseline \
-    --particles=500 \
-    --track-duration=10.0 \
-    --release-mode=bottom \
-    --ascent \
-    --ascent-speed=0.010 \
-    --ascent-target=-10.0 \
-    --seed=101 \
-    --duckdb \
-    --db-path=outputs/particle_tracking.duckdb
-```
-
-### 3. Track Cohort B: Alternate Ascent Speed (15 mm/s)
-Simulate larvae with a faster vertical ascent velocity ($w_{\text{ascent}} = 15\text{ mm/s}$):
-
-```bash
-julia --project=. ParticleTrackingRun.jl \
-    --track-only \
-    --hydro-model=outputs/baseline/hydrodynamics_ssp245_2050.jld2 \
-    --run-id=cohort_fast_ascent \
-    --output-dir=outputs/baseline \
-    --particles=500 \
-    --track-duration=10.0 \
-    --release-mode=bottom \
-    --ascent \
-    --ascent-speed=0.015 \
-    --ascent-target=-10.0 \
-    --seed=102 \
-    --duckdb \
-    --db-path=outputs/particle_tracking.duckdb
-```
-
-### 4. Track Cohort C: Surface Release Control
-Simulate a control cohort released directly into the surface mixed layer without initial
-vertical ascent:
-
-```bash
-julia --project=. ParticleTrackingRun.jl \
-    --track-only \
-    --hydro-model=outputs/baseline/hydrodynamics_ssp245_2050.jld2 \
-    --run-id=cohort_surface_control \
-    --output-dir=outputs/baseline \
-    --particles=500 \
-    --track-duration=10.0 \
-    --release-mode=surface \
-    --no-ascent \
-    --seed=201 \
-    --duckdb \
-    --db-path=outputs/particle_tracking.duckdb
-```
-
-### 5. Cross-Cohort Analysis & DuckDB Querying
-All runs automatically log their trajectories, demographic connectivity matrices ($P_{ij}$),
-recruitment metrics, and empirical movement fields into `outputs/particle_tracking.duckdb`.
-Inspect and compare cohorts directly from the command line:
-
-```bash
-# List all completed runs in DuckDB
-julia --project=. ParticleTrackingRun.jl --list-runs --db-path=outputs/particle_tracking.duckdb
-
-# Multi-cohort comparative metrics (retention, PLD, degree-days, displacement)
-julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=outputs/particle_tracking.duckdb
-
-# Bayesian / ensemble model-averaged demographic connectivity (P_ij ± σ)
-julia --project=. ParticleTrackingRun.jl --model-average --db-path=outputs/particle_tracking.duckdb
-```
-
-### 6. Spatiotemporal Hydrodynamic Field & Dashboard Video Animation
-
-Hydrodynamic animations can be generated either alongside a complete simulation or decoupled in `--hydro-only` mode:
-
-```bash
-# 1. 4-Panel Synchronized Dashboard with Larval Drift Overlays
-julia --project=. ParticleTrackingRun.jl \
-    --hydro-only \
-    --animate-hydro \
-    --anim-variable=dashboard \
-    --anim-depth=-2.5 \
-    --anim-fps=12 \
-    --anim-format=mp4 \
-    --anim-output=outputs/scotian_shelf_dashboard.mp4
-
-# 2. Potential Temperature Evolution at Cold Intermediate Layer (depth = -50 m)
-julia --project=. ParticleTrackingRun.jl \
-    --hydro-only \
-    --animate-hydro \
-    --anim-variable=temperature \
-    --anim-depth=-50.0 \
-    --anim-output=outputs/cil_temperature_evolution.mp4
-
-# 3. Turbulent Vertical Eddy Diffusivity (κ_v) at Mid-Depth (-50 m)
-julia --project=. ParticleTrackingRun.jl \
-    --hydro-only \
-    --animate-hydro \
-    --anim-variable=diffusion \
-    --anim-depth=-50.0 \
-    --anim-format=mp4 \
-    --anim-output=outputs/vertical_eddy_diffusivity_50m.mp4
-
-# 4. Surface Advection Current Speed (|u_h|) with Animated Particles
-julia --project=. ParticleTrackingRun.jl \
-    --animate-hydro \
-    --anim-variable=advection \
-    --anim-depth=0.0 \
-    --anim-particles \
-    --anim-format=mp4 \
-    --anim-output=outputs/surface_advection_cohort.mp4
-```
-
-#### Diagnostic Field Variables
-
-| Variable Key | Aliases | Physical Metric | Colormap |
-| :--- | :--- | :--- | :--- |
-| `temperature` | `T`, `temp`, `theta` | Seawater potential temperature ($^\circ\text{C}$) | `:thermal` |
-| `advection` | `speed`, `velocity`, `u_h` | Horizontal current speed $\sqrt{u^2 + v^2}$ ($\text{cm s}^{-1}$) | `:viridis` |
-| `diffusion` | `diffusivity`, `kappa` | Turbulent vertical eddy diffusivity $\kappa_v$ ($10^{-4}\text{ m}^2\text{ s}^{-1}$) | `:turbid` |
-| `salinity` | `S`, `sal` | Practical salinity ($\text{PSU}$) | `:haline` |
-| `viscosity` | `nu`, `eddy_viscosity` | Turbulent vertical eddy viscosity $\nu_v$ ($10^{-4}\text{ m}^2\text{ s}^{-1}$) | `:deep` |
-| `stratification` | `N2` | Buoyancy frequency squared $N^2$ ($10^{-4}\text{ s}^{-2}$) | `:ice` |
-| `density` | `rho` | Potential density $\rho$ ($\text{kg m}^{-3}$) | `:dense` |
-| `vorticity` | `zeta` | Relative vertical vorticity $\zeta$ ($10^{-5}\text{ s}^{-1}$) | `:balance` |
-| `elevation` | `eta`, `ssh` | Free sea surface height $\eta$ ($\text{cm}$) | `:delta` |
-| `w` | `vertical_velocity` | Vertical velocity $w$ ($\text{mm s}^{-1}$) | `:curl` |
-| `richardson` | `Ri` | Gradient Richardson number $Ri$ (dimensionless) | `:spectral` |
-| `dashboard` | — | Synchronized 4-panel multi-diagnostic dashboard | Multiple |
-
-#### Continuous Depth Targeting
-
-Depth selection is continuous via nearest vertical coordinate matching ($k = \arg\min_k |z_k - z_{\text{target}}|$):
-- Surface mixed layer: `--anim-depth=0.0` or `--anim-depth=-2.5`.
-- Cold Intermediate Layer (CIL): `--anim-depth=-50.0`.
-- Deep shelf / continental slope: `--anim-depth=-150.0` or `-300.0`.
-
-#### Custom Output File Designation
-
-Designate custom output paths via `--anim-output=<path>` or `--anim-file=<path>`:
-- The parent directory is created automatically if absent.
-- Both `.mp4` and `.gif` formats are supported via `--anim-format=<mp4|gif>`.
-- If omitted, files default to `<output-dir>/hydrodynamic_<variable>_animation.<format>`.
-
----
-
-## Centralized Configuration Management
-
-All physical, numerical, and biological parameters can be saved or loaded from centralized
-TOML configuration files:
-
-```bash
-# Execute run using settings from custom configuration file
-julia --project=. ParticleTrackingRun.jl --all --config=inputs/ParticleTracking.config
-
-# Modify parameters on CLI and export new validated configuration file
-julia --project=. ParticleTrackingRun.jl \
-    --particles=1000 \
-    --min-depth=120.0 \
-    --ascent-speed=0.012 \
-    --save-config=inputs/deep_shelf.config
+# 7. Export a modified configuration
+julia --project=. ParticleTrackingRun.jl --particles=1000 --min-depth=120.0 \
+    --save-config=inputs/deep_shelf.toml
 ```
 
 ---
 
-## Hardware Acceleration
+## License
 
-Oceananigans automatically targets NVIDIA CUDA GPUs when available, falling back
-gracefully to multi-threaded CPU architectures:
-
-```bash
-# GPU execution with automatic CPU fallback
-julia --project=. ParticleTrackingRun.jl --all --gpu --fallback-cpu
-
-# Explicit CPU execution
-julia --project=. ParticleTrackingRun.jl --all --cpu
-```
-
----
-
-## Unified Multi-Year Snow Crab Dispersal Platform
-
-The snow crab modeling platform is integrated directly into [`ParticleTrackingRun.jl`](file:///c:/home/jae/projects/ParticleTracking/ParticleTrackingRun.jl) via the `--snowcrab-settings` flag (or shorthand `--snowcrab`). Passing this flag loads all calibrated physical and biological parameters for snow crab (*Chionoecetes opilio*):
-- **Cohort Scale**: 500 larvae (quick: 50).
-- **Pelagic Duration**: 60.0 days (quick: 5 days).
-- **Seabed Placement & Depth**: Commercial nursery grounds ($\ge 100\text{ m}$) within $100\text{ km}$ CFA buffer.
-- **Vertical Behavior**: Active post-hatch ascent ($10\text{ mm/s}$ to $-10\text{ m}$), stage-dependent DVM, and BBL shear attenuation.
-- **Thermal Biology**: Molting base $T_{\text{base}} = -1.5^\circ\text{C}$ with degree-day thresholds (65, 130, 200 DD).
-- **Domain & Grid**: High-resolution $100\times 100\times 20$ grid across Scotian Shelf and continental slope ($z \in [-3500, 0]\text{ m}$).
-- **Analytical Database**: Persists cohorts to `outputs/snowcrab_tracking.duckdb`.
-
-Any additional CLI flags passed alongside `--snowcrab-settings` directly **override** those defaults (e.g. `--particles=200`, `--ascent-speed=0.015`, `--hydro-model=custom_hydro.jld2`).
-
-For programmatic Julia scripting, the exported function `SnowCrabRunOptions(; kwargs...)` generates the identical runtime configuration struct.
-
-### Invocation Examples
-
-```bash
-# Production Snow Crab run with 5-year hydrodynamic simulation:
-julia --project=. ParticleTrackingRun.jl --snowcrab-settings --real-5yr --hydro-only --hydro-model=hydrodynamics1.jld2
-
-# Quick test run:
-julia --project=. ParticleTrackingRun.jl --snowcrab --all --quick
-```
-
-| Flag / Option | Argument Type | Default Value | Description |
-| :--- | :--- | :--- | :--- |
-| `--all` | Flag | — | Run both Real 5-Year and 2-Year Climatological models + comparison. |
-| `--real-5yr` | Flag | — | Run only the high-resolution 5-year real physical cycle. |
-| `--climatology-2yr` | Flag | — | Run only the 2-year recent climatological average model. |
-| `--compare` | Flag | — | Query DuckDB database and print comparative analytics across runs. |
-| `--quick`, `-q` | Flag | — | Rapid testing mode with reduced domain resolution and duration. |
-| `--hydro-model=<path>` | String | `outputs/hydrodynamics_...` | Hydrodynamic JLD2 snapshot file to save into or load from. |
-| `--hydro-only` | Flag | — | Run hydrodynamics only and save snapshot to `--hydro-model`. |
-| `--track-only` | Flag | — | Skip hydrodynamics and track larvae using flow fields from `--hydro-model`. |
-| `--reuse-hydro` | Flag | — | Reuse `--hydro-model` if file exists on disk; otherwise run simulation. |
-| `--run-id=<string>` | String | Auto-generated | Custom run identifier for DuckDB persistence and figure filenames. |
-| `--particles=<int>` | Int | `500` (`50` quick) | Number of larvae per released cohort. |
-| `--grid=<nx,ny,nz>` | Int,Int,Int | `100,100,20` | Spatial grid cell dimensions. |
-| `--sim-dt=<sec>` | Float | `120.0` | Hydrodynamic integration time step. |
-| `--heat-flux=<val>` | Float | `50.0` | Summer atmospheric downward heat flux ($W/m^2$). |
-| `--release-mode=<mode>`| Symbol | `bottom` | Larval release depth mode (`bottom`, `range`, `surface`). |
-| `--ascent` | Flag | `true` | Enable post-hatch active vertical ascent toward the surface. |
-| `--no-ascent` | Flag | — | Disable post-hatch vertical ascent. |
-| `--ascent-speed=<val>` | Float (m/s) | `0.010` | Vertical swimming speed during post-hatch ascent. |
-| `--ascent-target=<val>`| Float (m) | `-10.0` | Target depth in meters for ascent completion. |
-| `--db-path=<path>` | String | `outputs/snowcrab_tracking.duckdb` | Custom DuckDB analytical database path. |
-| `--output-dir=<dir>` | String | `outputs` | Target directory for outputs and figures. |
-| `--animate-hydro` | Flag | — | Render spatiotemporal hydrodynamic animation video (MP4/GIF). |
-| `--anim-variable=<name>` | String | `dashboard` | Diagnostic field (`dashboard`, `temperature`, `advection`, `diffusion`, `salinity`, etc.). |
-| `--anim-depth=<meters>` | Float (m) | `-2.5` | Continuous target depth in meters (e.g. `0.0`, `-2.5`, `-50.0`, `-150.0`). |
-| `--anim-output=<path>` | String | `""` | Designate custom output video path (e.g. `outputs/flow.mp4`). |
-| `--anim-overlay-particles` | Flag | — | Synchronously overlay Lagrangian larvae drifting with currents. |
-| `--gpu`, `--cuda` | Flag | — | Enable GPU acceleration. |
-| `--fallback-cpu` | Flag | `true` | Fallback to CPU if CUDA GPU is not detected. |
-
-### Decoupled Hydrodynamics & Multi-Cohort Larval Tracking Workflow
-
-Lagrangian particle tracking runs significantly faster than 3D Navier-Stokes integration.
-Using `--hydro-only` and `--track-only` allows generating a hydrodynamic solution once and
-reusing it across multiple larval dispersal cohorts:
-
-```bash
-# Step 1: Run 5-year hydrodynamic simulation only and save to a chosen file:
-julia --project=. ParticleTrackingRun.jl --snowcrab --real-5yr --hydro-only --hydro-model=hydrodynamics1.jld2
-
-# Step 2: Track Cohort 1 (Spring benthic release with active ascent):
-julia --project=. ParticleTrackingRun.jl --snowcrab --track-only --hydro-model=hydrodynamics1.jld2 \
-    --run-id=cohort_spring_baseline --particles=500 --release-mode=bottom --ascent
-
-# Step 3: Track Cohort 2 (Fast vertical ascent at 15 mm/s):
-julia --project=. ParticleTrackingRun.jl --snowcrab --track-only --hydro-model=hydrodynamics1.jld2 \
-    --run-id=cohort_spring_fast_ascent --particles=500 --ascent-speed=0.015
-
-# Step 4: Track Cohort 3 (Surface release control, no initial ascent):
-julia --project=. ParticleTrackingRun.jl --snowcrab --track-only --hydro-model=hydrodynamics1.jld2 \
-    --run-id=cohort_spring_surface_ctrl --particles=500 --release-mode=surface --no-ascent
-
-# Step 5: Compare recruitment and connectivity across cohorts in DuckDB:
-julia --project=. ParticleTrackingRun.jl --compare
-```
-
----
-
-## Checkpointing and Graceful Restart Architecture
-
-Hydrodynamic integrations across regional domains can take hours to days depending on resolution.
-`ParticleTracking.jl` provides an integrated, robust state serialization and resumption subsystem:
-
-1. **Automatic Periodic Checkpointing**:
-   - Oceananigans `Checkpointer` serializes complete prognostic state variables ($u, v, w, T, S, \eta$, tendencies, and clock) to `outputs/checkpoints/checkpoint_iteration<N>.jld2`.
-   - By default, `cleanup = true` retains only the most recent checkpoint file on disk, preventing storage exhaustion during long integrations.
-
-2. **Graceful Emergency Checkpointing on Interruption**:
-   - If an interactive run or SLURM batch job is interrupted (`SIGINT` or `Ctrl+C`), `run_hydrodynamic_simulation!` intercepts the `InterruptException`.
-   - It immediately triggers an emergency serialization of the current model state into `checkpoint_iteration<N>.jld2` before exiting gracefully with a clean informational log.
-
-3. **Seamless Resumption & Output Preservation**:
-   - When restarting with `--restart` (the default), `ParticleTrackingRun.jl` inspects both the diagnostic timeseries (`outputs/hydrodynamics.jld2`) and the checkpoint directory.
-   - If an existing run was incomplete ($t_{\text{last}} < t_{\text{stop}}$), it automatically picks up from the latest checkpoint.
-   - Diagnostic output writers are configured with `overwrite_existing = false`, ensuring existing diagnostic records are preserved and new time slices are appended without corruption.
-   - Once the simulation reaches $t_{\text{stop}}$, subsequent runs with `--reuse-hydro` recognize the file as complete and proceed directly to downstream particle tracking.
-
-### CLI Checkpoint & Restart Usage
-
-```bash
-# 1. Start a long simulation with checkpointing enabled (default)
-julia --project=. ParticleTrackingRun.jl --snowcrab --real-5yr --hydro-only \
-    --hydro-model=outputs/snowcrab_5yr.jld2 --checkpoint-interval=3600
-
-# 2. If interrupted (e.g. walltime limit reached or Ctrl+C), resume seamlessly:
-julia --project=. ParticleTrackingRun.jl --snowcrab --real-5yr --hydro-only \
-    --hydro-model=outputs/snowcrab_5yr.jld2 --restart
-
-# 3. Discard prior checkpoints and force a fresh integration from t = 0:
-julia --project=. ParticleTrackingRun.jl --snowcrab --real-5yr --hydro-only \
-    --hydro-model=outputs/snowcrab_5yr.jld2 --force-new
-```
-
----
-
-## Depth-Stratified Multi-Resolution Voronoi Tessellation
-
-To dramatically enhance spatial resolution in core snow crab nursery habitats without incurring prohibitive CFL time-stepping penalties in the Eulerian hydrodynamic solver, `ParticleTracking.jl` implements a depth-stratified Voronoi tessellation:
-
-### Stratum Sampling Strategy
-- **Core Stratum ($50\text{--}350\text{ m}$ depth)**: Probability $P = 0.8$, minimum Poisson separation $1.5\text{ km}$.
-- **Shallow / Inshore Stratum ($0\text{--}50\text{ m}$ depth)**: Probability $P = 0.1$, minimum separation $5.0\text{ km}$.
-- **Deep Slope Stratum ($> 350\text{ m}$ depth)**: Probability $P = 0.1$, minimum separation $10.0\text{ km}$.
-
-A total of $N = 5000$ points are sampled across the regional bathymetry. Each Voronoi cell defines an adaptive areal demographic unit.
-
-### CLI Usage & Workflow
-
-```bash
-# 1. Run Snow Crab tracking pipeline with depth-stratified Voronoi tessellation:
-julia --project=. ParticleTrackingRun.jl --config=inputs/snowcrab_tesselated.config
-
-# 2. Run with CLI overrides:
-julia --project=. ParticleTrackingRun.jl --snowcrab --tesselated --quick
-
-# 3. Custom Voronoi unit configuration:
-julia --project=. ParticleTrackingRun.jl --snowcrab --tesselated \
-    --voronoi-units=5000 --voronoi-prob-core=0.85 --voronoi-min-res-core=1.5
-```
-
-### Outputs & Analytics
-- **$N \times N$ Connectivity Matrix**: High-resolution transition probability matrix $P_{ij}$ across Voronoi units.
-- **$3 \times 3$ Macro-Strata Matrix**: Connectivity between `:shallow`, `:core`, and `:deep` strata.
-- **DuckDB Table `voronoi_units`**: Unit coordinates, stratum, depth, area, and settlement density.
-- **Diagnostic Distribution Plot**: `outputs/voronoi_units_distribution.png` visualizing cell density and boundaries across the shelf.
-
-
-
+Released under the [MIT License](LICENSE).

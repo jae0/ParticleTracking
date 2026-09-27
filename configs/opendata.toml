@@ -1,0 +1,278 @@
+# ==============================================================================
+# opendata.toml - Keyless / Open-Access Data Configuration
+#
+# Purpose
+#   A production-shaped run that ingests *observed* environmental data while requiring
+#   **no login, API key, or CDS credentials anywhere**. Every dataset below is served from
+#   an open endpoint that works anonymously, so this config runs on a fresh machine with
+#   nothing but network access.
+#
+#   Use this config when `copernicusmarine` / GLORYS / ERA5-via-CDS is unavailable or
+#   unauthenticated. Use configs/snowcrab.toml when CDS credentials *are* available and
+#   you want the higher-resolution reanalysis.
+#
+# Data sources (all keyless)
+#   Bathymetry   ETOPO 2022 (15 arc-second)  NOAA NCEI CoastWatch ERDDAP
+#   Winds        ERA5 via the Open-Meteo archive API (keyless), falling back to
+#                NOAA PSL NCEP reanalysis, then to an analytical drag law
+#   Hydrography  World Ocean Atlas 2023 climatology, NOAA NCEI THREDDS
+#                (0.25 deg preferred, 1.00 deg fallback; no login)
+#   Tides        TPXO9-Atlas (open, no registration)
+#
+# Trade-off versus snowcrab.toml
+#   WOA23 is a *climatology* on standard depth levels at 0.25 deg, not a 1/12 deg
+#   reanalysis. It is smooth and lacks interannual and mesoscale structure, so this config
+#   is appropriate for climatology-scale and larval-dispersal work but is not a substitute
+#   for GLORYS12V1 when resolving eddies or event-scale variability.
+#
+# Run
+#   julia --project=. ParticleTrackingRun.jl --all --config=configs/opendata.toml
+#
+# The fully-resolved configuration (this file after any CLI overrides) is copied to
+# work/opendata/resolved_config.toml as provenance for the outputs.
+# ==============================================================================
+
+[metadata]
+name = "Snow Crab Larval Dispersal - Keyless Open Data"
+description = "Species-calibrated Scotian Shelf larval tracking driven entirely by open-access datasets (ETOPO 2022, Open-Meteo ERA5 winds, WOA23 climatology) that require no login or API credentials"
+author = "ParticleTracking contributors"
+version = "1.0.0"
+
+[data]
+# "real" means: download real bathymetry and real winds, rather than generating them
+# analytically. Combined with hydrography_source = "woa23" below, every forcing and
+# initial-condition field in this run comes from an observed product.
+data_mode = "real"
+bathy_dataset_id = "etopo2022"   # ETOPO 2022 15-arcsec global relief, NOAA ERDDAP (open)
+wind_dataset_id = "open_meteo"   # ERA5 via the keyless Open-Meteo archive API
+wind_time_iso = "2020-06-01T00:00:00Z"  # Representative spring transition period
+inshore_depth = -20.0            # Coastal boundary depth for the shelf (meters)
+shelf_slope = 500.0              # Bathymetric continental slope scale (meters)
+
+# Source of the initial 3-D water column (temperature and salinity).
+#   "woa23"     World Ocean Atlas 2023 climatology, NOAA NCEI THREDDS. Keyless.
+#   "synthetic" Analytic stratification profile, no download.
+#   "glorys12v1" GLORYS reanalysis; requires copernicusmarine credentials and is NOT
+#                available in this config's keyless setup.
+hydrography_source = "woa23"
+# 0 selects the annual climatology (the full 12-month mean), which is the right choice for
+# a climatology-scenario run. Set 1-12 for a specific calendar month's climatology.
+hydrography_month = 0
+
+[climate]
+# Climatological baseline. Switch to ssp126 / ssp245 / ssp585 / mhw to apply a scenario
+# anomaly via climate_scenarios.jl.
+scenario = "climatology"
+projection_year = 2022   # Target year for CMIP6-style scenarios
+baseline_year = 2020     # Reference year for the anomaly calculation
+horizon_year = 2050      # Benchmark projection horizon for the delta scaling
+
+[domain]
+# Study domain (Scotian Shelf): the computational grid and analysis region.
+# WOA23 is requested for exactly this box, so no regridding extrapolation is needed
+# horizontally. Vertically the model domain is deeper than some WOA request, so queries
+# are clamped to the deepest available WOA level rather than extrapolated.
+lon_min = -68.0
+lon_max = -57.0
+lat_min = 42.0
+lat_max = 47.5
+z_min = -3000.0
+z_max = 0.0
+buffer_km = 50.0        # Spatial buffer for particle seeding (km)
+
+# Embedding domain: the larger region boundary/forcing data would be drawn from.
+embedding_lon_min = -71.0
+embedding_lon_max = -53.0
+embedding_lat_min = 40.0
+embedding_lat_max = 48.5
+
+[grid]
+# Moderate resolution (~2.5 km class) so a keyless run stays tractable on CPU. This is
+# coarser than snowcrab.toml's 345 x 245 x 20 because keyless runs are typically done on
+# shared or laptop hardware.
+nx = 145
+ny = 105
+nz = 15
+resolution_scale = 1.0
+vertical_stretching_mode = "tanh"  # Surface- and seabed-refined layers
+vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"  # Only read when mode = "csv"
+
+[bathymetry]
+# ETOPO 2022 is served from the NOAA CoastWatch ERDDAP, which needs no credentials.
+# ETOPO 180-arcsec is the automatic fallback if the 15-arcsec request fails.
+source = "numerical_earth"
+provider = "etopo2022"
+resolution_arcsec = 15          # 15 arc-second (~500 m at mid-latitudes)
+fallback_dataset_id = "etopo180"
+inshore_depth = -20.0
+shelf_slope = 500.0
+
+[atmosphere]
+# Winds come from the keyless Open-Meteo ERA5 archive API. `fetch_open_surface_winds`
+# tries Open-Meteo first, then NOAA PSL NCEP reanalysis, and only then falls back to an
+# analytical drag law, so this configuration degrades gracefully rather than failing.
+source = "open_meteo"
+climatology = true
+variables = ["u10", "v10"]
+drag_formulation = "garratt_1977"   # Dynamic Cd = (0.75 + 0.067*U10)*1e-3
+bulk_heat_flux = true
+
+[boundaries]
+# Lateral sponge. The relaxation forcing is bitstype-safe and enabled; inflow values are
+# the upstream Scotian Shelf reference velocities.
+method = "relaxation"
+# No GLORYS download: the lateral boundary is driven by prescribed upstream inflow rather
+# than a parent reanalysis, keeping this config keyless end to end.
+parent_ocean = "synthetic"
+ocean_boundary_source = "synthetic"
+climatology = true
+obc_type = "flather_chapman"
+active_boundaries = ["east", "south", "west"]
+sponge_layer_width = 0.25
+sponge_timescale_seconds = 3600.0
+u_inflow = -0.15                   # Along-shelf inflow (m/s)
+v_inflow = 0.05                    # Cross-shelf inflow (m/s)
+
+embedding_lon_min = -71.0
+embedding_lon_max = -53.0
+embedding_lat_min = 40.0
+embedding_lat_max = 48.5
+
+[tides]
+# TPXO9-Atlas is open access (no registration), unlike many tidal products.
+tides_source = "tpxo9_atlas"
+constituents = ["M2", "S2"]
+tidal_u_amp = 0.25      # M2 semi-major amplitude (m/s)
+tidal_v_amp = 0.12      # M2 semi-minor amplitude (m/s)
+s2_u_amp = 0.11         # S2 semi-major amplitude (m/s)
+s2_v_amp = 0.05         # S2 semi-minor amplitude (m/s)
+tidal_period = 44712.0  # M2 period (s)
+tidal_phase = 0.0
+
+[bottom_boundary_layer]
+cd_drag = 0.0025                # Quadratic bottom drag coefficient
+bottom_drag = 0.0001            # Background linear friction (1/s)
+bbl_mixing_closure = "tke"      # Vertical mixing closure family
+
+[hydrodynamics]
+# One simulated year of climatology. WOA23 is itself a climatology, so a multi-year
+# integration would only spin up the circulation; extend this if you want the flow to
+# adjust to the imposed atmospheric forcing.
+sim_duration_hours = 8760.0
+sim_dt_seconds = 180.0
+adaptive_cfl = true
+target_cfl = 0.2
+target_wave_cfl = 0.2
+max_dt_seconds = 300.0
+min_dt_seconds = 2.0
+coriolis_latitude = 44.5        # ocean_simulation uses a spherical Coriolis
+divergence_velocity_limit = 20.0
+surface_heat_flux = 50.0        # Net surface heat flux (W/m2)
+turbulence_closure = "nemotke"  # NEMO-TKE vertical mixing
+enable_sea_ice = true           # Freezing / frazil diagnostics
+enable_oxygen = true            # Dissolved oxygen prognostic tracer
+output_schedule_seconds = 21600.0
+hydro_model_file = "hydrodynamics_opendata.jld2"
+enable_checkpoint = true
+
+[tessellation]
+# Depth-stratified Voronoi units for release and connectivity analysis.
+enable_voronoi = true
+n_units = 2000
+bathymetry_source = "numerical_earth"
+core_depth_min = 50.0
+core_depth_max = 350.0
+core_prob = 0.8
+prob_core = 0.8
+core_min_res_km = 1.5
+min_res_core_km = 1.5
+shallow_depth_min = 0.0
+shallow_depth_max = 50.0
+shallow_prob = 0.1
+prob_shallow = 0.1
+shallow_min_res_km = 5.0
+min_res_shallow_km = 5.0
+deep_depth_min = 350.0
+deep_depth_max = 6000.0
+deep_prob = 0.1
+prob_deep = 0.1
+deep_min_res_km = 10.0
+min_res_deep_km = 10.0
+slope_weighting = true
+slope_factor = 15.0
+
+[biology]
+# Snow crab (Chionoecetes opilio) larval parameters, as in configs/snowcrab.toml.
+# References: Sainte-Marie & Sainte-Marie (1999) J. Crustacean Biol. 19(4):743-754;
+# Lovrich & Sainte-Marie (1997) MEPS 148:85-99; Kuhn & Choi (2011) ICES J. Mar. Sci.
+n_particles = 500
+track_duration_days = 60.0          # Pelagic larval duration (PLD)
+track_dt_seconds = 300.0            # 5-minute Lagrangian integration step
+min_seabed_depth = 50.0             # Minimum water depth for release (m)
+diffusivity_h = 10.0                # Horizontal turbulent diffusivity (m2/s)
+diffusivity_v = 1e-4                # Vertical turbulent diffusivity (m2/s)
+release_depth_mode = "bottom"       # Benthic release mode
+bottom_release_offset = [0.5, 3.0]  # Height above seabed (m)
+enable_initial_ascent = true        # Post-hatch negative geotaxis ascent
+ascent_speed = 0.010                # Ascent swimming speed (~10 mm/s)
+ascent_target_depth = -10.0         # Target epipelagic depth (m)
+buffer_km = 50.0
+
+[dvm]
+# Diel vertical migration: larvae rise at night to feed, descend by day to avoid predators.
+enable_dvm = true
+zoea1_day_depth = -50.0
+zoea1_night_depth = -10.0
+zoea2_day_depth = -55.0
+zoea2_night_depth = -8.0
+megalopa_day_depth = -120.0
+megalopa_night_depth = -60.0
+zoea2_depth_factor = 1.0
+megalopa_swim_factor = 1.0
+
+[molting_and_settlement]
+# Degree-day phenology for snow crab. T_base = -1.5 degC.
+enable_molting = true
+t_base = -1.5
+dd_zoea1_to_zoea2 = 65.0
+dd_zoea2_to_megalopa = 130.0
+dd_megalopa_to_settle = 200.0
+settlement_min_depth = -350.0
+settlement_max_depth = -50.0
+settlement_max_temp = 6.0
+mortality_base = 0.01
+mortality_thermal_threshold = 15.0
+mortality_thermal_sensitivity = 0.02
+mortality_cold_threshold = 0.0
+mortality_cold_sensitivity = 0.01
+
+[storage]
+output_filename = "opendata.jld2"
+output_schedule_seconds = 21600.0
+checkpoint_fields = ["u", "v", "w", "T", "S", "η"]
+enable_duckdb = true
+duckdb_path = "work/opendata/opendata.duckdb"
+enable_checkpoint = true
+checkpoint_prefix = "opendata_checkpoint"
+checkpoint_schedule = 21600.0
+checkpoint_schedule_seconds = 21600.0
+checkpoint_dir = "work/opendata/checkpoints"
+cleanup_checkpoints = true
+auto_restart = true
+
+[hardware]
+# CPU by default: a keyless run is usually done on shared or laptop hardware, and this
+# grid is modest. Set use_gpu = true to exercise the CUDA path.
+use_gpu = false
+fallback_to_cpu = true
+
+[visualization]
+interactive_map = true
+title = "Snow Crab Larval Dispersal - Keyless Open Data"
+
+[paths]
+# All output lands under work/opendata/, and the realized configuration is copied there
+# as resolved_config.toml for provenance.
+output_dir = "work/opendata"
+input_dir = "inputs"
+seed = 42

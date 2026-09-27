@@ -1258,12 +1258,18 @@ Retrieve 3D/2D hydrodynamic velocity and tracer field from DuckDB as structured 
 
 # Inputs
 - `db::DuckDB.DB`: DuckDB database connection.
-- `run_id::AbstractString`: Target simulation run ID.
+- `run_id`: Target simulation run ID.
 - `time_seconds`: Optional timestamp in seconds.
 - `depth_level`: Optional vertical level index.
 
 # Outputs
 - `NamedTuple`: `(lons, lats, depths, u, v, w, temperature, salinity, elevation)`.
+
+# Notes
+Reconstructed coordinates are validated to be geographic degrees in `[-180, 180]` and
+`[-90, 90]` respectively. This guards against archival of metric distances (e.g. Oceananigans
+`xnode`/`ynode` Cartesian components in metres), which would otherwise silently corrupt
+map axes and transect selection downstream.
 """
 function load_hydrodynamic_field(
     db::DuckDB.DB,
@@ -1322,6 +1328,8 @@ function load_hydrodynamic_field(
         end
     end
 
+    _validate_geographic_coordinates!(lons, lats, run_id)
+
     return (
         lons = lons,
         lats = lats,
@@ -1333,6 +1341,35 @@ function load_hydrodynamic_field(
         salinity = s_mat,
         elevation = elev_mat
     )
+end
+
+"""
+    _validate_geographic_coordinates!(lons, lats, run_id) -> Nothing
+
+Assert that archived horizontal coordinates are geographic degrees rather than metric
+distances, raising an `ArgumentError` describing the corruption if not.
+
+# Inputs
+- `lons`: Reconstructed longitude vector.
+- `lats`: Reconstructed latitude vector.
+- `run_id`: Run identifier, included in the error message for traceability.
+"""
+function _validate_geographic_coordinates!(lons::AbstractVector, lats::AbstractVector, run_id)
+    for (name, vals, limit) in (("longitude", lons, 180.0), ("latitude", lats, 90.0))
+        lo, hi = extrema(vals)
+        if !all(isfinite, vals)
+            error("Non-finite $(name) values archived for run '$(run_id)'; cannot reconstruct grid.")
+        end
+        if abs(lo) > limit || abs(hi) > limit
+            error(
+                "Archived $(name) for run '$(run_id)' spans [$(lo), $(hi)], which is outside " *
+                "the valid geographic range ±$(limit)°. This indicates metric distances " *
+                "(metres) were archived instead of degrees — check that grid coordinates are " *
+                "extracted via extract_grid_coordinates (λ/φ accessors), not xnode/ynode."
+            )
+        end
+    end
+    return nothing
 end
 
 """

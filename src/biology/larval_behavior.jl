@@ -385,7 +385,9 @@ end
         degree_days::Real;
         dd_zoea1_to_zoea2::Real = 65.0,
         dd_zoea2_to_megalopa::Real = 130.0,
-        dd_megalopa_to_settle::Real = 200.0
+        dd_megalopa_to_settle::Real = 200.0,
+        cv_molt::Real = 0.0,
+        rng::AbstractRNG = Random.default_rng()
     )
 
 Determine the current ontogenetic development stage based on cumulative thermal degree-days.
@@ -399,9 +401,18 @@ at stage-specific thermal thresholds calibrated from rearing experiments at 2°C
 - \$130 \\le DD < 200\$: **Megalopa** (~100 days cumulative)
 - \$DD \\ge 200\$: **Instar I (Settled)** (~130 days cumulative)
 
+When `cv_molt > 0`, each particle's molt thresholds are drawn from a normal distribution
+with mean = base threshold and sd = cv_molt * base threshold. This introduces individual
+variability in developmental timing.
+
 # Inputs
 - `current_stage::Symbol`: Present developmental stage.
 - `degree_days::Real`: Accumulated degree-days (°C · days).
+- `dd_zoea1_to_zoea2::Real`: Base degree-day threshold for Zoea I -> Zoea II.
+- `dd_zoea2_to_megalopa::Real`: Base degree-day threshold for Zoea II -> Megalopa.
+- `dd_megalopa_to_settle::Real`: Base degree-day threshold for Megalopa -> Instar I.
+- `cv_molt::Real`: Coefficient of variation for molt thresholds (default 0.0 = deterministic).
+- `rng::AbstractRNG`: Random number generator for stochastic thresholds.
 
 # Outputs
 - `Symbol`: Updated stage (`:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`).
@@ -411,17 +422,24 @@ function update_larval_stage(
     degree_days::Real;
     dd_zoea1_to_zoea2::Real = 65.0,
     dd_zoea2_to_megalopa::Real = 130.0,
-    dd_megalopa_to_settle::Real = 200.0
+    dd_megalopa_to_settle::Real = 200.0,
+    cv_molt::Real = 0.0,
+    rng::AbstractRNG = Random.default_rng()
 )
     if current_stage == :dead || current_stage == :instar1_settled
         return current_stage
     end
 
-    if degree_days < dd_zoea1_to_zoea2
+    # Stochastic thresholds: draw from N(mean, cv * mean) if cv > 0
+    t1 = cv_molt > 0 ? max(1.0, rand(rng, Normal(dd_zoea1_to_zoea2, dd_zoea1_to_zoea2 * cv_molt))) : dd_zoea1_to_zoea2
+    t2 = cv_molt > 0 ? max(t1 + 1.0, rand(rng, Normal(dd_zoea2_to_megalopa, dd_zoea2_to_megalopa * cv_molt))) : dd_zoea2_to_megalopa
+    t3 = cv_molt > 0 ? max(t2 + 1.0, rand(rng, Normal(dd_megalopa_to_settle, dd_megalopa_to_settle * cv_molt))) : dd_megalopa_to_settle
+
+    if degree_days < t1
         return :zoea1
-    elseif degree_days < dd_zoea2_to_megalopa
+    elseif degree_days < t2
         return :zoea2
-    elseif degree_days < dd_megalopa_to_settle
+    elseif degree_days < t3
         return :megalopa
     else
         return :instar1_settled
@@ -494,6 +512,7 @@ function evaluate_settlement_suitability(
     optimal_max_temp::Real = 3.5,
     max_bottom_temp::Real = 6.0,
     stochastic::Bool = false,
+    cv_settlement::Real = 0.0,
     rng::AbstractRNG = Random.default_rng()
 )
     z = Float64(bed_elevation)
@@ -523,10 +542,26 @@ function evaluate_settlement_suitability(
 
     hsi = clamp(s_z * s_t, 0.0, 1.0)
 
-    suitable = if stochastic
-        rand(rng) <= hsi
+    # Stochastic settlement: minimum HSI gate + normal draw for acceptance probability
+    # If hsi == 0, immediately unsuitable (hard gate)
+    # If hsi > 0, acceptance probability ~ Normal(hsi, cv_settlement * hsi) clipped to [0,1]
+    # Then draw U(0,1) and accept if U <= p_accept
+    if hsi == 0.0
+        suitable = false
+        p_accept = 0.0
+    elseif stochastic && cv_settlement > 0.0
+        # Draw acceptance probability from N(hsi, cv * hsi), clipped
+        sd = hsi * cv_settlement
+        p_accept = clamp(rand(rng, Normal(hsi, sd)), 0.0, 1.0)
+        suitable = rand(rng) <= p_accept
+    elseif stochastic
+        # Traditional Bernoulli with HSI as probability
+        p_accept = hsi
+        suitable = rand(rng) <= hsi
     else
-        hsi > 0.0
+        # Deterministic: any positive HSI succeeds
+        p_accept = hsi
+        suitable = hsi > 0.0
     end
 
     reason = if hsi == 0.0
@@ -539,13 +574,13 @@ function evaluate_settlement_suitability(
         else
             "Sub-zero thermal stress (T < $(min_temp)°C)"
         end
-    elseif suitable
-        "Suitable cold-water shelf nursery ground (HSI = $(round(hsi, digits=3)))"
-    else
-        "Stochastic settlement search failed on marginal ground (HSI = $(round(hsi, digits=3)))"
-    end
+    elseif !suitable && stochastic
+        "HSI=$(round(hsi, digits=3)) but random draw exceeded acceptance probability p=$(round(p_accept, digits=3))"
+else
+            "Suitable (HSI=$(round(hsi, digits=3))"
+        end
 
-    return (suitable = suitable, probability = Float64(hsi), hsi = Float64(hsi), reason = reason)
+    return (suitable = suitable, probability = Float64(p_accept), hsi = Float64(hsi), reason = reason)
 end
 
 """
@@ -1058,6 +1093,9 @@ function track_larval_cohort(
     ascent_speed::Real = 0.010,
     ascent_target_depth::Real = -10.0,
     max_ascent_duration::Real = 86400.0,
+    cv_molt::Real = 0.0,
+    cv_mortality::Real = 0.0,
+    cv_settlement::Real = 0.0,
     rng::AbstractRNG = Random.default_rng()
 )
     n_particles = length(larvae.lon)
@@ -1166,7 +1204,21 @@ function track_larval_cohort(
                 cold_threshold       = mortality_cold_threshold,
                 cold_sensitivity     = mortality_cold_sensitivity
             )
+            # Deterministic survival fraction
             traj_surv[p, s + 1] = max(0.0, traj_surv[p, s] * exp(-mort_rate * dt_days))
+
+            # Stochastic mortality: if cv_mortality > 0, draw individual mortality rate from
+            # Normal(mort_rate, cv_mortality * mort_rate) and apply Bernoulli death
+            if cv_mortality > 0.0 && current_alive[p]
+                individual_mort_rate = max(0.0, rand(rng, Normal(mort_rate, mort_rate * cv_mortality)))
+                p_survive = exp(-individual_mort_rate * dt_days)
+                if rand(rng) > p_survive
+                    current_alive[p] = false
+                    cur_stage = :dead
+                    traj_surv[p, s + 1] = 0.0
+                end
+            end
+
             traj_temp[p, s + 1] = cur_T
 
             if enable_molting && cur_stage != :instar1_settled
@@ -1176,7 +1228,9 @@ function track_larval_cohort(
                     current_degree_days[p],
                     dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
                     dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
-                    dd_megalopa_to_settle = dd_megalopa_to_settle
+                    dd_megalopa_to_settle = dd_megalopa_to_settle,
+                    cv_molt = cv_molt,
+                    rng = rng
                 )
 
                 if new_stage != cur_stage
@@ -1202,6 +1256,7 @@ function track_larval_cohort(
                         max_depth = settlement_max_depth,
                         max_bottom_temp = settlement_max_temp,
                         stochastic = settlement_stochastic,
+                        cv_settlement = cv_settlement,
                         rng = rng
                     )
 
@@ -1549,3 +1604,125 @@ status and stage symbols across Lagrangian trajectory records.
 canonicalize_status(trajectories::NamedTuple) = canonicalize_trajectories(trajectories)
 canonicalize_status!(trajectories::NamedTuple) = canonicalize_trajectories(trajectories)
 
+
+
+# ==========================================================================
+# Stage Thermal Physiology
+#
+# Species-level responses to ambient temperature: temperature-dependent
+# pelagic larval duration and instantaneous thermal mortality. These live with
+# the rest of the larval behaviour model because they are stage biology, not
+# climate forcing; `climate_scenarios.jl` supplies the temperature field that
+# they respond to.
+# ==========================================================================
+
+"""
+    temperature_dependent_pld(
+        temperature_celsius::Real;
+        a::Real = 135.0,
+        b::Real = 0.75,
+        t_ref::Real = 1.0
+    )
+
+Calculate total Pelagic Larval Duration (PLD in days) for snow crab (*Chionoecetes opilio*)
+from egg hatch to benthic settlement as a function of ambient water temperature.
+
+# Mathematical Formulation
+Following empirical rearing models (Sainte-Marie & Sainte-Marie, 1999; Kuhn & Choi, 2011):
+```math
+\\text{PLD}(T) = a \\cdot (T + t_{\\text{ref}})^{-b}
+```
+
+# Inputs
+- `temperature_celsius::Real`: Mean ambient water temperature in °C.
+- `a::Real`: Empirical scaling constant (default 135.0).
+- `b::Real`: Empirical power coefficient (default 0.75).
+- `t_ref::Real`: Temperature offset parameter (default 1.0 °C).
+
+# Outputs
+- `Float64`: Estimated larval drift duration in days.
+
+# References
+- Kuhn, P. S., & Choi, J. S. (2011). Influence of temperature on embryo incubation
+  and larval development in snow crab (*Chionoecetes opilio*).
+  *Fisheries Research*, 107(1-3), 81-87. DOI: 10.1016/j.fishres.2010.10.011
+- Sainte-Marie, G., & Sainte-Marie, B. (1999). Growth, developmental stages, and
+  vertical distribution of snow crab larvae (*Chionoecetes opilio*).
+  *Can. J. Fish. Aquat. Sci.*, 56(11), 2181-2193. DOI: 10.1139/f99-151
+"""
+function temperature_dependent_pld(
+    temperature_celsius::Real;
+    a::Real = 135.0,
+    b::Real = 0.75,
+    t_ref::Real = 1.0,
+    t_base::Real = -1.5
+)
+    # Effective temperature relative to the developmental physiological threshold
+    # (C. opilio larvae develop in the Cold Intermediate Layer down to -1.5°C;
+    # Kuhn & Choi 2011). Preserves physiological slowing without artificial clipping at 0°C.
+    T = Float64(temperature_celsius)
+    t_effective = max(0.05, T - t_base)
+    t_norm = max(0.05, Float64(t_ref) - Float64(t_base))
+    pld_days = a * (t_effective / t_norm)^(-b)
+    return Float64(pld_days)
+end
+
+"""
+    larval_thermal_mortality_rate(
+        temperature_celsius::Real;
+        base_mortality::Real = 0.02,
+        thermal_threshold::Real = 7.0,
+        thermal_sensitivity::Real = 0.35,
+        cold_threshold::Real = -1.5,
+        cold_sensitivity::Real = 0.02
+    )
+
+Compute the instantaneous daily mortality rate \$\\mu(T)\$ (day⁻¹) for snow crab larvae
+accounting for exponential upper warm-water stress and lower cold-water mortality.
+
+# Mathematical Formulation
+```math
+\\mu(T) = \\mu_{\\text{base}} \\exp\\left( \\beta_{\\text{warm}} \\max(0, T - T_{\\text{warm,crit}}) \\right)
+        + \\mu_{\\text{cold}} \\max(0, T_{\\text{cold,crit}} - T)
+```
+
+# Calibration Notes
+- **Warm stress threshold** \$T_{\\text{warm,crit}} = 7.0^\\circ\\text{C}\$: sub-lethal
+  warm-water stress initiates at ≥7°C in *C. opilio* larvae
+  (Kuhn & Choi, 2011; Epifanio & Cohen, 2016). Lethal limit ≈9°C.
+  The exponential form accurately captures rapid thermal mortality during warm anomalies.
+- **Cold stress threshold** \$T_{\\text{cold,crit}} = -1.5^\\circ\\text{C}\$: larvae
+  enter dormancy / diapause below ~-1.5°C (Kuhn & Choi, 2011). Linear
+  penalty applied to avoid discontinuity at the threshold.
+
+# Inputs
+- `temperature_celsius::Real`: Water temperature in °C.
+- `base_mortality::Real`: Baseline natural daily mortality rate (default 0.02 day⁻¹).
+- `thermal_threshold::Real`: Upper warm-stress onset threshold \$T_{\\text{warm,crit}}\$ (default 7.0 °C).
+- `thermal_sensitivity::Real`: Warm-stress exponential coefficient (default 0.35 °C⁻¹).
+- `cold_threshold::Real`: Lower cold-stress onset threshold \$T_{\\text{cold,crit}}\$ (default -1.5 °C).
+- `cold_sensitivity::Real`: Cold-stress linear coefficient (default 0.02 day⁻¹ °C⁻¹).
+
+# Outputs
+- `Float64`: Instantaneous daily mortality rate in \$\\text{day}^{-1}\$.
+
+# References
+- Kuhn, P. S., & Choi, J. S. (2011). *Fisheries Research*, 107(1-3), 81-87.
+  DOI: 10.1016/j.fishres.2010.10.011
+- Epifanio, C. E., & Cohen, J. H. (2016). *JEMBE*, 482, 85-105.
+"""
+function larval_thermal_mortality_rate(
+    temperature_celsius::Real;
+    base_mortality::Real = 0.02,
+    thermal_threshold::Real = 7.0,
+    thermal_sensitivity::Real = 0.35,
+    cold_threshold::Real = -1.5,
+    cold_sensitivity::Real = 0.02
+)
+    T = Float64(temperature_celsius)
+    excess_warm = max(0.0, T - thermal_threshold)
+    excess_cold = max(0.0, cold_threshold - T)
+    mortality = base_mortality * exp(thermal_sensitivity * excess_warm) +
+                cold_sensitivity * excess_cold
+    return Float64(mortality)
+end

@@ -6,6 +6,13 @@ and output writing for regional hydrodynamic modeling.
 """
 
 using Oceananigans
+using Oceananigans.AbstractOperations: ∂z
+using Oceananigans.Fields: indices
+using SeawaterPolynomials
+using SeawaterPolynomials: TEOS10EquationOfState
+import SeawaterPolynomials.ρ
+using SpecialFunctions: erf
+using Oceanostics: KineticEnergyDissipationRate
 using Oceananigans.Units
 using Oceananigans.Utils: prettytime
 using Oceananigans.OutputWriters: JLD2Writer, Checkpointer, checkpoint
@@ -13,7 +20,6 @@ import Oceananigans.OutputWriters: cleanup_checkpoints
 using JLD2
 
 # Import domain constants for fallback coordinate generation
-import ..NumericalEarth: STUDY_DOMAIN_LON_RANGE, STUDY_DOMAIN_LAT_RANGE
 
 """
     compute_advective_cfl(
@@ -473,6 +479,443 @@ function inspect_hydrodynamic_file(
 end
 
 """
+    fill_field_const(grid, value) -> Field
+
+A centre-point `Field` on `grid` filled with the constant `value` (m² s⁻¹), halo filled.
+
+Used to publish constant closure diffusivity/viscosity as an ordinary gridded output so
+consumers can treat it exactly like any other diagnostic field.
+"""
+function fill_field_const(grid, value::Real)
+    f = Field{Center, Center, Center}(grid)
+    f .= value
+    return f
+end
+
+"""
+    closure_diffusivity_constants(model) -> Tuple{Union{Nothing, Real}, Union{Nothing, Real}}
+
+Extract the scalar vertical diffusivity `κ` and viscosity `ν` actually used by the model's
+closure, if they are constants.
+
+Handles `ScalarDiffusivity` (scalar `κ`/`ν`); returns `(nothing, nothing)` for closures whose
+mixing is a prognostic `Field`, which is handled by [`native_mixing_diagnostics`](@ref).
+"""
+function closure_diffusivity_constants(model)
+    hasproperty(model, :closure) || return (nothing, nothing)
+
+    κ, ν = nothing, nothing
+    # `model.closure` is a Tuple when several closures are supplied, but a single closure
+    # object when the model normalises one (which is what `ocean_simulation` produces).
+    closures = model.closure isa Tuple ? model.closure : (model.closure,)
+    for c in closures
+        (c isa Tuple || c isa NamedTuple) && continue
+        hasproperty(c, :κ) || continue
+        hasproperty(c, :ν) || continue
+        k_raw = getproperty(c, :κ)
+        n_raw = getproperty(c, :ν)
+        κ_cand = scalar_or_constant(k_raw)
+        ν_cand = scalar_or_constant(n_raw)
+        κ_cand === nothing && continue
+        ν_cand === nothing && continue
+        κ = κ_cand
+        ν = ν_cand
+    end
+    return (κ, ν)
+end
+
+"""
+    scalar_or_constant(x) -> Union{Nothing, Real}
+
+Return `x` as a `Real` when it is a constant diffusivity/viscosity, or when it is a
+`NamedTuple` (as `ClimateDataWrangler`/`ScalarDiffusivity` closures present mixing
+coefficients) whose entries are all constants. Returns `nothing` when the coefficient is a
+grid `Field`, i.e. genuinely spatially varying, since that case is published as a field
+rather than a constant.
+"""
+function scalar_or_constant(x)
+    x isa Real && return Float64(x)
+    if x isa NamedTuple
+        vals = collect(values(x))
+        isempty(vals) && return nothing
+        all(v -> v isa Real, vals) || return nothing
+        return Float64(first(vals))
+    end
+    return nothing
+end
+
+"""
+    closure_field_smagarinsky_ν(model) -> Union{Nothing, Any}
+
+Return the Smagorinsky grid eddy-viscosity field `νₑ` from `model.closure_fields` if the
+closure carries one, otherwise `nothing`.
+"""
+function closure_field_smagarinsky_ν(model)
+    hasproperty(model, :closure_fields) || return nothing
+    cfs = model.closure_fields isa Tuple ? model.closure_fields : (model.closure_fields,)
+    for cf in cfs
+        isnothing(cf) && continue
+        cf isa NamedTuple || continue
+        haskey(cf, :νₑ) || continue
+        return cf.νₑ
+    end
+    return nothing
+end
+
+"""
+    native_mixing_diagnostics(model) -> Dict{Symbol, Any}
+
+Model-native vertical mixing fields (`κ`, `ν`) promoted to `Field`s on the model's grid.
+
+The hydrodynamics uses `ScalarDiffusivity` closures, so the vertical eddy diffusivity `κ`
+and eddy viscosity `ν` that actually enter the tracer/velocity equations are *constants*.
+Reporting those constants is the only way for downstream figures to reflect the mixing the
+model really applied; re-deriving a spatially varying Richardson-number proxy in the
+visualization layer produces values that contradict the integrated physics.
+
+If the closure exposes a prognostic grid `Field` (e.g. `NEMOTKE`, or the Smagorinsky `νₑ`
+in `closure_fields`), that `Field` is preferred, since it is then the genuinely spatially
+varying quantity the model used.
+
+# Inputs
+- `model`: Oceananigans `AbstractModel` (e.g. `HydrostaticFreeSurfaceModel`).
+
+# Outputs
+- `Dict{Symbol, Any}`: `:κ` and/or `:ν` mapped to grid `Field`s, restricted to whatever the
+  closure can supply. Empty when the closure exposes nothing usable.
+"""
+function native_mixing_diagnostics(model)
+    out = Dict{Symbol, Any}()
+    grid = model.grid
+
+    κ_val, ν_val = closure_diffusivity_constants(model)
+    isnothing(κ_val) || (out[:κ] = fill_field_const(grid, κ_val))
+    isnothing(ν_val) || (out[:ν] = fill_field_const(grid, ν_val))
+
+    # A Smagorinsky closure carries a prognostic eddy viscosity `νₑ` in `closure_fields`.
+    # It is published under its own key rather than overwriting the constant background `ν`,
+    # so downstream consumers can see both the prescribed and the turbulent contribution
+    # instead of having one silently replace the other.
+    νₑ = closure_field_smagarinsky_ν(model)
+    if !isnothing(νₑ) && occursin("Field", string(typeof(νₑ).name.wrapper))
+        out[:νₑ] = νₑ
+    end
+
+    return out
+end
+
+# Reference seawater density and gravitational acceleration used to convert the
+# potential-density gradient into buoyancy frequency: N² = ∂z b.
+# (Buoyancy is defined as b = g * (ρ₀ - ρ) / ρ₀, so N² = ∂z b = -(g/ρ₀) ∂ρ/∂z.)
+const g_ref = 9.80665  # m s⁻²
+
+"""
+    model_equation_of_state(model) -> Union{Nothing, BoussinesqEquationOfState}
+
+Recover the Boussinesq equation of state the model is actually integrating with.
+
+`HydrostaticFreeSurfaceModel` stores it at `model.buoyancy.formulation.equation_of_state`, where
+the formulation is a `SeawaterBuoyancy`. Every model field that needs a density — `:ρ` and the
+`:N2` derived from it — is therefore evaluated with exactly the EOS the physics used, rather
+than a hard-coded polynomial that could drift away from it.
+
+Returns `nothing` when the model carries no such formulation (e.g. a `ConstantBuoyancy`
+diagnostic model), so callers can skip density diagnostics instead of guessing.
+"""
+function model_equation_of_state(model)
+    hasproperty(model, :buoyancy) || return nothing
+    buoyancy = model.buoyancy
+    hasproperty(buoyancy, :formulation) || return nothing
+    formulation = buoyancy.formulation
+    hasproperty(formulation, :equation_of_state) || return nothing
+    return formulation.equation_of_state
+end
+
+"""
+    model_gravitational_acceleration(model) -> Float64
+
+Gravitational acceleration the model is integrating with, taken from its buoyancy formulation
+so the published N² is consistent with the dynamics. Falls back to [`g_ref`](@ref) only when
+the model does not advertise one.
+"""
+function model_gravitational_acceleration(model)
+    candidates = if hasproperty(model, :buoyancy)
+        buoyancy = model.buoyancy
+        (hasproperty(buoyancy, :gravitational_acceleration) ? buoyancy.gravitational_acceleration : nothing,
+         hasproperty(buoyancy, :formulation) && hasproperty(buoyancy.formulation, :gravitational_acceleration) ?
+             buoyancy.formulation.gravitational_acceleration : nothing,
+         hasproperty(buoyancy, :formulation) && hasproperty(buoyancy.formulation, :g) ?
+             buoyancy.formulation.g : nothing)
+    else
+        (nothing, nothing, nothing)
+    end
+
+    for candidate in candidates
+        candidate isa Real && return Float64(candidate)
+    end
+
+    return g_ref
+end
+
+"""
+    reference_density(model) -> Float64
+
+Reference density ρ₀ used to scale the potential-density gradient into buoyancy frequency.
+Prefers the equation of state's own `reference_density`; falls back to `1025.0` kg m⁻³.
+"""
+function reference_density(model)
+    eos = model_equation_of_state(model)
+    if !isnothing(eos) && hasproperty(eos, :reference_density)
+        ρ₀ = eos.reference_density
+        ρ₀ isa Real && return Float64(ρ₀)
+    end
+    return 1025.0
+end
+
+"""
+    fill_seawater_density!(ρ_field, model)
+
+Fill `ρ_field` with the in-situ seawater density (kg m⁻³) implied by the model's own `T`/`S`
+tracers and its equation of state, evaluated on `ρ_field`'s own grid.
+
+The polynomial is `SeawaterPolynomials.ρ(Θ, Sᴬ, Z, eos)` — the real implementation behind
+NumericalEarth's `total_density` alias, which is declared without methods in this build and
+therefore cannot be called. Note the argument order: conservative temperature `Θ` first, absolute
+salinity `Sᴬ` second. Swapping them yields a plausible-looking but physically wrong density
+(≈ 1004 kg m⁻³ for shelf conditions that should read ≈ 1027 kg m⁻³), so the order is fixed here
+rather than inferred at each call site. Depth `Z` is taken from the grid's own vertical coordinate
+nodes, consistent with the convention used by [`write_grid_coordinates`](@ref).
+
+Halos are filled alongside the interior because `:N2` differentiates vertically and so reads one
+column beyond the interior at the top and bottom. Two details matter here:
+
+* The loop runs over the *data* axes, not `axes(ρ_field, k)`. `axes` on a `Field` reports the
+  interior (`1:Nz`), so iterating it leaves the halo columns holding whatever `new_data`
+  initialised them to; the vertical difference at the first and last interior cells then reads
+  uninitialised memory and reports N² off by ~1000×.
+* The depth index is *clamped* into `1:Nz` when sampling the vertical coordinate. `znode` is
+  undefined outside the grid, and extrapolating there produced density values orders of magnitude
+  off. Clamping makes the halo a constant extension of the nearest interior cell, so the boundary
+  gradient collapses to zero instead of being garbage.
+
+The fill is always performed on the **host** and copied to the destination array, including on a
+GPU run. Two reasons: the TEOS-10 polynomial carries a coefficient vector, so `eos` is not `isbits`
+and cannot be captured inside a GPU kernel; and calling `ρ` elementwise over `T`/`S` scalar-indexes
+device arrays, which CUDA disallows outright ("Scalar indexing is disallowed"). Since ρ is only
+refreshed on the output schedule, the host round-trip is negligible next to a time step.
+"""
+function fill_seawater_density!(ρ_field, model)
+    eos = model_equation_of_state(model)
+    isnothing(eos) && return nothing
+
+    T = model.tracers.T
+    S = model.tracers.S
+
+    grid = ρ_field.grid
+    base_grid = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    cpu_grid = architecture(base_grid) isa GPU ? on_architecture(CPU(), base_grid) : base_grid
+    Nz = base_grid.Nz
+
+    data = ρ_field.data
+    size(data) == size(T.data) == size(S.data) || error(
+        "Seawater density field $(size(data)) does not align with the model tracers " *
+        "(T=$(size(T.data)), S=$(size(S.data))).")
+
+    # Transfer unconditionally: `on_architecture(CPU(), …)` is a no-op for host arrays,
+    # and testing the destination with `isa CuArray` is not reliable because a `Field`'s
+    # `.data` can be an OffsetArray *wrapping* the device buffer rather than a CuArray.
+    T_in = on_architecture(CPU(), T.data)
+    S_in = on_architecture(CPU(), S.data)
+
+    # Halo cells of a freshly assembled model hold *uninitialised* memory, which is not
+    # merely garbage: reading it and feeding it to the TEOS-10 polynomial can overflow to
+    # Inf/NaN and then throw a `DomainError` from a `sqrt` of a huge negative discriminant,
+    # or corrupt the interpreter outright. Neither is recoverable, and the halo is not
+    # something the diagnostics need — they are read from the interior and the halo is
+    # masked by the immersed boundary. So the buffer starts life filled with the equation
+    # of state's reference density and only the interior is ever evaluated.
+    host = fill(Float64(eos.reference_density), size(data))
+
+    # Interior index range per dimension. `indices(field, k)` reports a Colon, so the
+    # halo width is derived from the data axes against the underlying grid's interior
+    # size; the halo is symmetric, so half the excess is the halo on each side.
+    ax1, ax2, ax3 = axes(data, 1), axes(data, 2), axes(data, 3)
+    Nx, Ny = base_grid.Nx, base_grid.Ny
+    ix = (first(ax1) + (length(ax1) - Nx) ÷ 2) : (first(ax1) + (length(ax1) - Nx) ÷ 2 + Nx - 1)
+    iy = (first(ax2) + (length(ax2) - Ny) ÷ 2) : (first(ax2) + (length(ax2) - Ny) ÷ 2 + Ny - 1)
+    iz = (first(ax3) + (length(ax3) - Nz) ÷ 2) : (first(ax3) + (length(ax3) - Nz) ÷ 2 + Nz - 1)
+
+    # A halo column is still at a real depth, so the interior index is clamped into 1:Nz
+    # when the vertical coordinate is sampled.
+    k_phys(k) = clamp(k - first(iz) + 1, 1, Nz)
+
+    @inbounds for k in iz, j in iy, i in ix
+        z = Float64(Oceananigans.Grids.znode(k_phys(k), cpu_grid, Center()))
+        Ti = Float64(T_in[i, j, k])
+        Si = Float64(S_in[i, j, k])
+
+        # Clamp into the polynomial's validity box; land cells legitimately hold T = S = 0,
+        # and any residual uninitialised memory is caught by the isfinite guard.
+        value = (isfinite(Ti) && isfinite(Si)) ?
+                ρ(clamp(Ti, -2.0, 40.0), clamp(Si, 0.0, 42.0), z, eos) :
+                Float64(eos.reference_density)
+
+        host[i, j, k] = isfinite(value) ? value : Float64(eos.reference_density)
+    end
+
+    # Copy back in place so the caller's field object is updated, on CPU or device alike.
+    copyto!(data, host)
+
+    return ρ_field
+end
+
+"""
+    native_stratification_diagnostics(model) -> Dict{Symbol, Any}
+
+Model-native stratification and vorticity fields, ready to be written by a JLD2 writer.
+
+* `:ρ` — in-situ seawater density (kg m⁻³) on the centre grid, from the model's own EOS.
+* `:N2` — buoyancy frequency squared N² = −(g/ρ₀) ∂ρ/∂z (s⁻²), the scaled `∂z` operation
+  on `:ρ`, using the model's own gravitational acceleration and reference density.
+* `:ζ` — relative vertical vorticity ζ = ∂v/∂x − ∂u/∂y (s⁻¹), likewise on the centre grid.
+
+These are `Field`/`AbstractOperation` objects that Oceananigans evaluates with the model's own
+grid, stencils and stencilling, replacing the post-hoc finite-difference re-derivation
+previously performed in the visualization layer.
+
+`:ρ` is state derived from the prognostic tracers rather than a static field, so it must be
+refreshed as the simulation advances. Call [`refresh_stratification_diagnostics!`](@ref) on each
+tick of the output schedule; `setup_hydrodynamic_simulation` registers that as a callback, which
+Oceananigans runs before the output writers on the same tick.
+
+# Inputs
+- `model`: Oceananigans `AbstractModel` carrying `T` and `S` tracers and `u`/`v` velocities.
+
+# Outputs
+- `Dict{Symbol, Any}`: keys `:ρ`, `:N2`, `:ζ` mapped to fields/operations. `:ρ` and `:N2` are
+  omitted when the model carries no `T`/`S` tracers or no Boussinesq equation of state; `:ζ` is
+  omitted when the model has no horizontal velocities.
+"""
+function native_stratification_diagnostics(model)
+    out = Dict{Symbol, Any}()
+
+    # Relative vertical vorticity ζ = ∂v/∂x − ∂u/∂y on the centre grid.
+    # ∂x/∂y are the abstract operations exported by Oceananigans; the writer calls
+    # `compute!` on them at each output time.
+    if hasproperty(model, :velocities)
+        u = model.velocities.u
+        v = model.velocities.v
+        out[:ζ] = ∂x(v) - ∂y(u)
+    end
+
+    # Seawater density and the stratification it implies. Both need the `T` and `S`
+    # tracers plus the model's Boussinesq equation of state; without them there is no
+    # physically meaningful density to publish, so the keys are omitted rather than
+    # filled with a placeholder.
+    #
+    # NOTE: Native ρ/N² diagnostics are currently CPU-only because the TEOS-10 equation
+    # of state is not isbits and cannot be called from GPU kernels. On GPU we skip these
+    # diagnostics entirely (the GPU path has deeper stability issues in any case).
+    if hasproperty(model, :tracers) && haskey(model.tracers, :T) && haskey(model.tracers, :S) &&
+       !isnothing(model_equation_of_state(model)) &&
+       !(architecture(model) isa GPU)
+        cpu_model = on_architecture(CPU(), model)
+        ρ_field_cpu = CenterField(cpu_model.grid)
+        fill_seawater_density!(ρ_field_cpu, cpu_model)
+        
+        ρ_field = on_architecture(architecture(model), ρ_field_cpu)
+        out[:ρ] = ρ_field
+
+        # N² = ∂z b with buoyancy b = g (ρ₀ − ρ) / ρ₀, so N² = −(g/ρ₀) ∂ρ/∂z.
+        # `∂z(ρ_field)` alone carries units of kg m⁻⁴, so the constant is applied here to
+        # publish genuine buoyancy frequency in s⁻². Keeping it as a scalar-multiply
+        # operation (rather than a pre-scaled Field) means the writer re-evaluates the whole
+        # expression against the current ρ at every write.
+        scale = -(model_gravitational_acceleration(model) / reference_density(model))
+        out[:N2] = scale * ∂z(ρ_field)
+    end
+
+    return out
+end
+
+"""
+    refresh_stratification_diagnostics!(out::Dict{Symbol, Any}, model)
+
+Recompute the state-derived entries of [`native_stratification_diagnostics`](@ref) from the
+model's current tracers, in place.
+
+Only `:ρ` needs refreshing: `:N2` and `:ζ` are `∂z`/`∂x`/`∂y` operations over it or over the
+velocities, and the output writer re-evaluates those with `compute!` at every write. A missing
+`:ρ` (model without `T`/`S` or without an equation of state) is a no-op.
+"""
+function refresh_stratification_diagnostics!(out::Dict{Symbol, Any}, model)
+    ρ_field = get(out, :ρ, nothing)
+    isnothing(ρ_field) && return out
+
+    # Native ρ/N² diagnostics are CPU-only (TEOS-10 not isbits). On GPU this callback
+    # is a no-op since the keys were never added in native_stratification_diagnostics.
+    architecture(model) isa GPU && return out
+
+    cpu_model = on_architecture(CPU(), model)
+    cpu_ρ = on_architecture(CPU(), ρ_field)
+    fill_seawater_density!(cpu_ρ, cpu_model)
+    
+    copyto!(ρ_field.data, cpu_ρ.data)
+    return out
+end
+
+"""
+    write_grid_coordinates
+
+Write the model's cell-centre geographic coordinates to a sidecar JLD2 file next to the
+simulation output.
+
+`write_grid_coordinates(model, output_path) -> String`
+
+The main simulation file carries a `serialized/grid` entry, but deserialising it yields an
+opaque `JLD2.ReconstructedStatic` rather than a usable `LatitudeLongitudeGrid`, because the
+grid's type parameters cannot be resolved in the reading session. Anything that needs the
+domain geometry — most importantly the Lagrangian flow interpolator — therefore reads these
+plain vectors instead of attempting type reconstruction.
+
+# Inputs
+- `model`: Model whose grid coordinates are persisted.
+- `output_path`: Path of the main simulation JLD2 file; the sidecar is derived from it.
+
+# Outputs
+- `String`: Path of the sidecar file written.
+
+# Notes
+Coordinates are geographic degrees for `lons`/`lats` and metres (negative down) for
+`depths`, matching the conventions used throughout the package.
+"""
+function write_grid_coordinates(model, output_path::AbstractString)
+    base, _ = splitext(output_path)
+    sidecar = string(base, "_grid.jld2")
+
+    base_g = model.grid isa ImmersedBoundaryGrid ? model.grid.underlying_grid : model.grid
+    cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
+
+    lons = collect(Float64, cpu_g.λᶜᵃᵃ)[cpu_g.Hx+1 : cpu_g.Hx+cpu_g.Nx]
+    lats = collect(Float64, cpu_g.φᵃᶜᵃ)[cpu_g.Hy+1 : cpu_g.Hy+cpu_g.Ny]
+    depths = [Float64(Oceananigans.Grids.znode(k, cpu_g, Center())) for k in 1:cpu_g.Nz]
+    halo = (Int(cpu_g.Hx), Int(cpu_g.Hy), Int(cpu_g.Hz))
+    grid_size = (Int(cpu_g.Nx), Int(cpu_g.Ny), Int(cpu_g.Nz))
+
+    jldopen(sidecar, "w") do file
+        file["lons"] = lons
+        file["lats"] = lats
+        file["depths"] = depths
+        file["halo"] = halo
+        file["size"] = grid_size
+    end
+
+    return sidecar
+end
+
+
+
+"""
     setup_hydrodynamic_simulation(
         model;
         Δt::Real = 2minutes,
@@ -689,10 +1132,31 @@ function setup_hydrodynamic_simulation(
             outputs_dict[:η] = model.free_surface.η
         end
 
+        # Model-native vertical mixing, written on the tracer (centre) grid so the
+        # consumer never has to de-stagger or guess at halos for these fields.
+        merge!(outputs_dict, native_mixing_diagnostics(model))
+
+        # Model-native stratification (ρ, N²) and vorticity (ζ), evaluated by
+        # Oceananigans on the model's own grid rather than re-derived downstream.
+        strat_dict = native_stratification_diagnostics(model)
+        merge!(outputs_dict, strat_dict)
+
         out_sched = if output_schedule isa Int
             IterationInterval(output_schedule)
         else
             TimeInterval(output_schedule)
+        end
+
+        # ρ is derived from the prognostic `T`/`S` tracers, so it has to be recomputed as
+        # the simulation advances; `∂z(ρ)` is an operation and is recomputed by the writer
+        # itself. Oceananigans runs `TimeStepCallsite` callbacks before the output writers on
+        # each tick (see `Simulations/run.jl`), so sharing the writer's schedule guarantees ρ
+        # is current at the moment it is written rather than one interval behind.
+        if haskey(strat_dict, :ρ)
+            sim.callbacks[:stratification] = Callback(
+                s -> refresh_stratification_diagnostics!(strat_dict, s.model),
+                out_sched
+            )
         end
 
         writer = JLD2Writer(
@@ -703,6 +1167,16 @@ function setup_hydrodynamic_simulation(
             overwrite_existing = resolved_overwrite
         )
         sim.output_writers[:fields] = writer
+
+        # Persist the grid coordinate vectors as plain numeric arrays.
+        #
+        # The writer also stores a `serialized/grid` entry, but deserialising it yields an
+        # opaque `JLD2.ReconstructedStatic` rather than a usable grid (the grid's type
+        # parameters cannot be resolved in the reading session), so consumers such as
+        # `create_flow_interpolator_from_jld2` cannot read coordinates off it. Writing the
+        # vectors explicitly is version-independent and removes the dependency on JLD2 type
+        # reconstruction entirely.
+        write_grid_coordinates(model, full_output_path)
     end
 
     # 5. Prognostic state checkpointing
@@ -869,7 +1343,9 @@ where \$\\theta = (t - t_m) / (t_{m+1} - t_m)\$.
 """
 function create_flow_interpolator_from_jld2(
     jld2_filepath::AbstractString;
-    variables::Tuple = (:u, :v, :w, :T)
+    variables::Tuple = (:u, :v, :w, :T),
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
 )
     if !isfile(jld2_filepath)
         error("Simulation output file not found at: $(jld2_filepath)")
@@ -913,30 +1389,34 @@ function create_flow_interpolator_from_jld2(
             [something(tryparse(Float64, k), Float64(idx)) for (idx, k) in enumerate(sorted_keys)]
         end
 
-        # Extract grid coordinate vectors from stored metadata or infer from sample
-        grid_obj = if haskey(file, "grid")
-            file["grid"]
-        elseif haskey(file, "serialized/grid")
-            file["serialized/grid"]
+        # Grid coordinates come from the sidecar written alongside the simulation
+        # (`<output>_grid.jld2`), which holds plain numeric vectors. We deliberately do not
+        # read `serialized/grid`: deserialising it yields an opaque
+        # `JLD2.ReconstructedStatic` rather than a usable grid, because the grid's type
+        # parameters cannot be resolved in the reading session.
+        sidecar = string(first(splitext(jld2_filepath)), "_grid.jld2")
+        coords = if isfile(sidecar)
+            JLD2.jldopen(sidecar, "r") do cf
+                (lons = collect(Float64, cf["lons"]),
+                 lats = collect(Float64, cf["lats"]),
+                 depths = collect(Float64, cf["depths"]),
+                 halo = Int.(collect(cf["halo"])),
+                 size = Int.(collect(cf["size"])))
+            end
         else
             nothing
         end
 
-        ug = if !isnothing(grid_obj)
-            hasproperty(grid_obj, :underlying_grid) ? grid_obj.underlying_grid :
-                (hasproperty(grid_obj, :grid) ? grid_obj.grid : grid_obj)
-        else
-            nothing
-        end
+        ug = nothing   # grid type reconstruction is not used; see `coords` above
 
         sample_u = file["timeseries/u/$(first(sorted_keys))"]
-        Nx = (!isnothing(ug) && hasproperty(ug, :Nx)) ? Int(ug.Nx) : size(sample_u, 1)
-        Ny = (!isnothing(ug) && hasproperty(ug, :Ny)) ? Int(ug.Ny) : size(sample_u, 2)
-        Nz = (!isnothing(ug) && hasproperty(ug, :Nz)) ? Int(ug.Nz) : size(sample_u, 3)
+        Nx = (!isnothing(coords)) ? coords.size[1] : size(sample_u, 1)
+        Ny = (!isnothing(coords)) ? coords.size[2] : size(sample_u, 2)
+        Nz = (!isnothing(coords)) ? coords.size[3] : size(sample_u, 3)
 
-        Hx = (!isnothing(ug) && hasproperty(ug, :Hx)) ? Int(ug.Hx) : 0
-        Hy = (!isnothing(ug) && hasproperty(ug, :Hy)) ? Int(ug.Hy) : 0
-        Hz = (!isnothing(ug) && hasproperty(ug, :Hz)) ? Int(ug.Hz) : 0
+        Hx = (!isnothing(coords)) ? coords.halo[1] : 0
+        Hy = (!isnothing(coords)) ? coords.halo[2] : 0
+        Hz = (!isnothing(coords)) ? coords.halo[3] : 0
 
         i_c = (1 + Hx):(Nx + Hx)
         j_c = (1 + Hy):(Ny + Hy)
@@ -952,29 +1432,45 @@ function create_flow_interpolator_from_jld2(
             nothing
         end
 
-        lon_raw = if !isnothing(ug) && hasproperty(ug, :λᶜᵃᵃ)
-            something(extract_coords(ug.λᶜᵃᵃ), collect(range(STUDY_DOMAIN_LON_RANGE[1], STUDY_DOMAIN_LON_RANGE[2], length = Nx)))
-        elseif !isnothing(ug) && hasproperty(ug, :xᶜᵃᵃ)
-            something(extract_coords(ug.xᶜᵃᵃ), collect(range(STUDY_DOMAIN_LON_RANGE[1], STUDY_DOMAIN_LON_RANGE[2], length = Nx)))
+        # Horizontal coordinates come from the sidecar when present. Otherwise fall back to a
+        # caller-supplied domain, which originates from the TOML `[domain]` section.
+        #
+        # The fallback is resolved lazily: `domain_lon`/`domain_lat` are only consulted when
+        # `coords === nothing`, so a missing argument is an error only when there is genuinely
+        # no sidecar to read. Resolving it eagerly made a perfectly valid sidecar appear to
+        # fail whenever the caller passed no explicit domain.
+        missing_sidecar_hint(key) =
+            "Simulation file $(jld2_filepath) has no sidecar grid coordinates " *
+            "($(first(splitext(jld2_filepath)))_grid.jld2, written by " *
+            "write_grid_coordinates) and no `$(key)` was supplied. Pass the configured " *
+            "study-domain range (e.g. opts.$(key) from the TOML `[domain]` section)."
+
+        lon_raw = if isnothing(coords)
+            isnothing(domain_lon) && error(missing_sidecar_hint("domain_lon"))
+            collect(range(Float64(domain_lon[1]), Float64(domain_lon[2]), length = Nx))
         else
-            collect(range(STUDY_DOMAIN_LON_RANGE[1], STUDY_DOMAIN_LON_RANGE[2], length = Nx))
+            coords.lons
         end
+
+        lats_vec_raw = if isnothing(coords)
+            isnothing(domain_lat) && error(missing_sidecar_hint("domain_lat"))
+            collect(range(Float64(domain_lat[1]), Float64(domain_lat[2]), length = Ny))
+        else
+            coords.lats
+        end
+
         lons_vec = length(lon_raw) >= (Nx + 2 * Hx) ? lon_raw[i_c] :
                    (length(lon_raw) >= Nx ? lon_raw[1:Nx] :
                     collect(range(first(lon_raw), last(lon_raw), length = Nx)))
 
-        lat_raw = if !isnothing(ug) && hasproperty(ug, :φᵃᶜᵃ)
-            something(extract_coords(ug.φᵃᶜᵃ), collect(range(STUDY_DOMAIN_LAT_RANGE[1], STUDY_DOMAIN_LAT_RANGE[2], length = Ny)))
-        elseif !isnothing(ug) && hasproperty(ug, :yᵃᶜᵃ)
-            something(extract_coords(ug.yᵃᶜᵃ), collect(range(STUDY_DOMAIN_LAT_RANGE[1], STUDY_DOMAIN_LAT_RANGE[2], length = Ny)))
-        else
-            collect(range(STUDY_DOMAIN_LAT_RANGE[1], STUDY_DOMAIN_LAT_RANGE[2], length = Ny))
-        end
+        lat_raw = lats_vec_raw
         lats_vec = length(lat_raw) >= (Ny + 2 * Hy) ? lat_raw[j_c] :
                    (length(lat_raw) >= Ny ? lat_raw[1:Ny] :
                     collect(range(first(lat_raw), last(lat_raw), length = Ny)))
 
-        dep_raw = if !isnothing(ug) && hasproperty(ug, :zᵃᵃᶜ)
+        dep_raw = if !isnothing(coords)
+            coords.depths
+        elseif !isnothing(ug) && hasproperty(ug, :zᵃᵃᶜ)
             something(extract_coords(ug.zᵃᵃᶜ), collect(range(-1000.0, 0.0, length = Nz)))
         elseif !isnothing(ug) && hasproperty(ug, :z) && hasproperty(ug.z, :cᵃᵃᶜ)
             something(extract_coords(ug.z.cᵃᵃᶜ), collect(range(-1000.0, 0.0, length = Nz)))

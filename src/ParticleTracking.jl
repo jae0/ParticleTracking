@@ -7,11 +7,11 @@ and semiplanktonic snow crab (*Chionoecetes opilio*) larvae on coastal shelves.
 
 # Mathematical & Architectural Foundation
 The module provides:
-1. Data generation, ingestion, and inspection of bathymetry and surface forcing (`synthetic_data.jl`).
-2. Discretization of coastal shelf geometry with immersed boundary topography (`grid_bathymetry.jl`).
-3. Hydrostatic Boussinesq primitive equation modeling with Coriolis, buoyancy, and wind stress (`hydrodynamic_model.jl`).
-4. Simulation orchestration, time-stepping diagnostics, and field output writers (`simulation.jl`).
-5. Larval stage parameterizations, Diel Vertical Migration (DVM), and stochastic transport (`larval_behavior.jl`).
+1. Data generation, ingestion, and inspection of bathymetry and surface forcing.
+2. Discretization of coastal shelf geometry with immersed boundary topography.
+3. Hydrostatic Boussinesq primitive equation modeling with Coriolis, buoyancy, and wind stress.
+4. Simulation orchestration, time-stepping diagnostics, and field output writers.
+5. Larval stage parameterizations, Diel Vertical Migration (DVM), and stochastic transport.
 
 # References
 - Ramadhan, A., Marshall, J., Hill, C., Campin, J. M., Bischoff, T., & Wagner, G. L. (2020).
@@ -28,7 +28,7 @@ The module provides:
   *Canadian Journal of Fisheries and Aquatic Sciences*, 56(11), 2181-2193.
 """
 module ParticleTracking
- 
+
 using
   Random,
   CairoMakie,
@@ -43,38 +43,50 @@ using
   LinearAlgebra,
   TOML,
   JLD2,
-  TaylorSeries 
+  TaylorSeries,
+  Interpolations,
+  NumericalEarth,
+  ClimaOcean,
+  Distributions
 
 using Oceananigans.Units
 using Oceananigans.Utils: prettytime
 using Oceananigans
 
-# Sub-components (in src/)
-include("numerical_earth.jl")
-include("config_schema.jl")
-include("configuration.jl")
-include("cli_parser.jl")
-include("open_data.jl")
-include("synthetic_data.jl")
-include("architecture.jl")
-include("grid_bathymetry.jl")
-include("hydrodynamic_model.jl")
-include("tides.jl")
-include("climate_scenarios.jl")
-include("simulation.jl")
-include("larval_behavior.jl")
-include("empirical_analysis.jl")
-include("voronoi_tessellation.jl")
-include("storage_duckdb.jl")
-include("visualization.jl")
-include("visualization_additions.jl")
-include("gl_visualization.jl")
+# ============================================================================
+# Source layout
+#
+# The package is a single flat namespace, so these are plain `include`s in
+# dependency order rather than submodules — the files share one scope and
+# redefine each other's helpers freely.
+#
+#   utils/    architecture, tides, synthetic data generators
+#   data/     open-data downloads, grid construction, bathymetry, coastline
+#   model/    forcing + boundary crafts, model build, climate scenarios,
+#             simulation drivers, native diagnostics
+#   config/   TOML → options → provenance
+#   biology/  larval transport, DVM, molting, mortality, settlement
+#   analysis/ Voronoi units, empirical metrics, DuckDB storage
+#   output/   plots, animations, interactive maps
+# ============================================================================
+include("model/numerical_earth.jl")
+include("config/configuration.jl")
+include("data/open_data.jl")
+include("utils/synthetic_data.jl")
+include("utils/architecture.jl")
+include("data/grid_bathymetry.jl")
+include("model/hydrodynamic_model.jl")
+include("utils/tides.jl")
+include("model/climate_scenarios.jl")
+include("model/simulation.jl")
+include("biology/larval_behavior.jl")
+include("analysis/empirical_analysis.jl")
+include("analysis/voronoi_tessellation.jl")
+include("analysis/storage_duckdb.jl")
+include("output/visualization.jl")
 
 # Exported APIs
 export
-    # NumericalEarth and DataWrangling subsystem
-    NumericalEarth,
-
     # Centralized and decoupled configuration management
     HydrodynamicOptions,
     HydrodynamicConfig,
@@ -90,19 +102,8 @@ export
     find_default_config_path,
     resolve_config_name,
 
-    # Schema-based configuration (Configurations.jl)
-    ConfigSchema,
-    ParticleTrackingConfig,
-    load_config,
-    save_config,
-    schema_to_options,
-    load_configuration_schema,
-
     # Architecture and device resolution
     resolve_architecture,
-
-    # CLI Parser (ArgParse-based)
-    CLIParser,
 
     # Open real-world data and regridding
     fetch_open_bathymetry,
@@ -113,6 +114,11 @@ export
     fetch_open_woa_climatology,
     fetch_woa23_hydrography,
     fetch_copernicus_surface_winds,
+    fetch_copernicus_physics_subset,
+    fetch_copernicus_hydrography_with_fallback,
+    project_python,
+    copernicusmarine_executable,
+    copernicus_login_reminder,
     wind_speed_to_kinematic_stress,
     regrid_2d_field,
 
@@ -128,6 +134,8 @@ export
     load_vertical_grid_csv,
     load_bathymetry_from_netcdf,
     get_bathymetry_interpolator,
+    regrid_bathymetry_from_etopo,
+    write_bathymetry_netcdf,
     load_coastline_polygons,
     save_coastline_polygons,
     is_point_on_land,
@@ -144,6 +152,10 @@ export
 
     # Hydrodynamic model
     build_hydrodynamic_model,
+    apply_reanalysis_initial_conditions!,
+    woa23_regridded_tracers,
+    read_woa_variable,
+    build_woa_interpolator,
     WENOVectorInvariant,
     set_initial_stratification!,
     set_initial_conditions!,
@@ -159,6 +171,9 @@ export
     # Climate scenarios and thermal biology
     get_climate_scenario_deltas,
     apply_climate_scenario!,
+    apply_prescribed_surface_state!,
+    prescribed_ocean_component,
+    surface_values,
     temperature_dependent_pld,
     larval_thermal_mortality_rate,
 
@@ -171,6 +186,9 @@ export
     inspect_hydrodynamic_checkpoint,
     inspect_hydrodynamic_file,
     verify_checkpoint_compatibility,
+    native_stratification_diagnostics,
+    refresh_stratification_diagnostics!,
+    native_mixing_diagnostics,
 
     # Larval behavior and particle tracking
     larval_ascent_velocity,
@@ -247,14 +265,6 @@ export
     animate_hydrodynamic_dashboard,
     export_interactive_tracks_html,
     plot_interactive_trajectories_map,
-    plot_multi_panel_dashboard,
-    plot_voronoi_tessellation,
-    plot_particle_fate_summary,
-
-    # GLMakie 3D Visualizations
-    GLVisualization,
-    plot_3d_hydrodynamic_field,
-    plot_3d_particle_trajectories,
-    plot_3d_connectivity
+    plot_multi_panel_dashboard
 
 end # module ParticleTracking

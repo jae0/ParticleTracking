@@ -11,7 +11,47 @@ using Statistics
 using Interpolations
 
 # Import domain constants
-import ..NumericalEarth: STUDY_DOMAIN_LON_RANGE, STUDY_DOMAIN_LAT_RANGE, EMBEDDING_DOMAIN_LON_RANGE, EMBEDDING_DOMAIN_LAT_RANGE
+
+"""
+    resolve_domain_bounds(lon_range, lat_range; embedding = false) -> NamedTuple
+
+Resolve geographic bounds for a data-retrieval function, reading them from the active TOML
+configuration when not supplied explicitly.
+
+No geographic domain is compiled into this package: the `[domain]` section defines the study
+region and the `[boundaries]` section defines the larger embedding region used for boundary
+and forcing downloads. Passing `nothing` for either range therefore defers to the
+configuration file, which is the single source of truth.
+
+# Inputs
+- `lon_range`: `nothing` or `(lon_min, lon_max)` in degrees East.
+- `lat_range`: `nothing` or `(lat_min, lat_max)` in degrees North.
+- `embedding`: When `true`, resolve from `[boundaries]` (the embedding region) instead of
+  `[domain]`.
+
+# Outputs
+- `NamedTuple`: `(lon = (min, max), lat = (min, max))` in degrees.
+
+# Throws
+- `ArgumentError` if the configuration file cannot be read.
+"""
+function resolve_domain_bounds(lon_range, lat_range; embedding::Bool = false)
+    rngs = if isnothing(lon_range) || isnothing(lat_range)
+        cfg = try
+            load_configuration(find_default_config_path())
+        catch err
+            error(
+                "No lon_range/lat_range supplied and the active configuration could not be " *
+                "read ($(err)). Supply the bounds explicitly, or fix the TOML file."
+            )
+        end
+        embedding ? embedding_domain_ranges(cfg) : study_domain_ranges(cfg)
+    else
+        (lon = (Float64(lon_range[1]), Float64(lon_range[2])),
+         lat = (Float64(lat_range[1]), Float64(lat_range[2])))
+    end
+    return rngs
+end
 
 """
     wind_speed_to_kinematic_stress(
@@ -155,8 +195,8 @@ end
 
 """
     fetch_open_bathymetry(;
-        lon_range = STUDY_DOMAIN_LON_RANGE,
-        lat_range = STUDY_DOMAIN_LAT_RANGE,
+        lon_range = nothing,
+        lat_range = nothing,
         output_path = joinpath("inputs", "real_bathymetry.nc"),
         dataset_id = "etopo180",
         stride = 1,
@@ -504,8 +544,8 @@ end
 
 """
     fetch_global_wind_atlas_raster(;
-        lon_range = STUDY_DOMAIN_LON_RANGE,
-        lat_range = STUDY_DOMAIN_LAT_RANGE,
+        lon_range = nothing,
+        lat_range = nothing,
         height = 50,
         output_path = joinpath("inputs", "gwa_wind_speed.nc"),
         verbose = true
@@ -515,12 +555,16 @@ Download a regional GeoTIFF wind speed map from the Global Wind Atlas open GIS i
 and convert/export it into a standardized NetCDF file for hydrodynamic modeling.
 """
 function fetch_global_wind_atlas_raster(; 
-    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE, 
-    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE, 
+    lon_range::Union{Nothing, Tuple{Real, Real}} = nothing, 
+    lat_range::Union{Nothing, Tuple{Real, Real}} = nothing, 
     height::Int = 50, # Options: 10, 50, 100, 150, 200 meters
     output_path::AbstractString = joinpath("inputs", "gwa_wind_speed.nc"), 
     verbose::Bool = true
 )
+    # Geographic bounds default to the active TOML configuration ([domain] section);
+    # nothing is hard-coded here. Pass explicit ranges to override.
+    rngs = resolve_domain_bounds(lon_range, lat_range)
+    lon_range, lat_range = rngs.lon, rngs.lat
     mkpath(dirname(output_path))
     
     min_lon, max_lon = lon_range
@@ -575,8 +619,8 @@ end
 
 """
     fetch_open_meteo_surface_winds(;
-        lon_range = STUDY_DOMAIN_LON_RANGE,
-        lat_range = STUDY_DOMAIN_LAT_RANGE,
+        lon_range = nothing,
+        lat_range = nothing,
         time_iso = "2023-06-01T00:00:00Z",
         output_path = joinpath("inputs", "wind_active.nc"),
         verbose = true
@@ -612,12 +656,16 @@ Large & Pond (1981) and Wu (1982) and written into a standardized NetCDF file.
 - Large, W. G., & Pond, S. (1981). JPO, 11(3), 324-336.
 """
 function fetch_open_meteo_surface_winds(;
-    lon_range = STUDY_DOMAIN_LON_RANGE,
-    lat_range = STUDY_DOMAIN_LAT_RANGE,
+    lon_range = nothing,
+    lat_range = nothing,
     time_iso = "2023-06-01T00:00:00Z",
     output_path = joinpath("inputs", "wind_active.nc"),
     verbose = true
 )
+    # Geographic bounds default to the active TOML configuration ([domain] section);
+    # nothing is hard-coded here. Pass explicit ranges to override.
+    rngs = resolve_domain_bounds(lon_range, lat_range)
+    lon_range, lat_range = rngs.lon, rngs.lat
     mkpath(dirname(output_path))
     date_str = split(time_iso, "T")[1]
     clat = 0.5 * (lat_range[1] + lat_range[2])
@@ -729,12 +777,16 @@ Retrieve real observed/reanalyzed surface winds from open scientific data reposi
 - Large, W. G., & Pond, S. (1981). JPO, 11(3), 324-336.
 """
 function fetch_open_surface_winds(;
-    lon_range = STUDY_DOMAIN_LON_RANGE,
-    lat_range = STUDY_DOMAIN_LAT_RANGE,
+    lon_range = nothing,
+    lat_range = nothing,
     time_iso = "2023-06-01T00:00:00Z",
     output_path = joinpath("inputs", "wind_active.nc"),
     verbose = true
 )
+    # Geographic bounds default to the active TOML configuration ([domain] section);
+    # nothing is hard-coded here. Pass explicit ranges to override.
+    rngs = resolve_domain_bounds(lon_range, lat_range)
+    lon_range, lat_range = rngs.lon, rngs.lat
     mkpath(dirname(output_path))
     year_str = split(split(time_iso, "T")[1], "-")[1]
 
@@ -803,37 +855,194 @@ function fetch_open_surface_winds(;
 end
 
 """
-    fetch_copernicus_physics_subset(; lon_range = STUDY_DOMAIN_LON_RANGE, 
-                                    lat_range = STUDY_DOMAIN_LAT_RANGE, 
-                                    start_date = "2023-06-01", 
-                                    end_date = "2023-06-30", 
-                                    output_path = joinpath("inputs", "copernicus_ts.nc"),
-                                    verbose = true)
+    project_python() -> String
 
-Download a regional subset of 3D temperature and salinity fields from the Copernicus 
-Marine Service Global Ocean Physics Reanalysis product.
+Resolve the Python interpreter used to run the Copernicus helper scripts and CLI.
+
+Resolution order (first match wins):
+
+1. `PARTICLETRACKING_PYTHON` or `PYTHON_EXECUTABLE` in the environment.
+2. The interpreter inside a virtual environment next to the package, i.e.
+   `<package_root>/.venv/Scripts/python.exe` (Windows) or `<package_root>/.venv/bin/python`
+   (POSIX). This is why a project-local `.venv` works without being activated.
+3. The interpreter of the currently activated environment (`VIRTUAL_ENV`).
+4. Whatever `python` resolves to on `PATH`.
+
+Returning the *venv* interpreter matters: the helper scripts import `cdsapi` and the
+console script imports `copernicusmarine`, both of which live in that environment, so
+invoking a system `python` against them would fail even though the packages are installed.
+
+# Outputs
+- `String`: Absolute path to an interpreter, or the bare name `python` as a last resort.
 """
-function fetch_copernicus_physics_subset(; 
-    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE, 
-    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE, 
-    start_date::AbstractString = "2023-06-01", 
-    end_date::AbstractString = "2023-06-30", 
+function project_python()::String
+    for var in ("PARTICLETRACKING_PYTHON", "PYTHON_EXECUTABLE")
+        override = get(ENV, var, "")
+        isempty(strip(override)) || return normpath(override)
+    end
+
+    exe = Sys.iswindows() ? "python.exe" : "python"
+    rel = Sys.iswindows() ? joinpath("Scripts", exe) : joinpath("bin", exe)
+
+    # `<package_root>/.venv` — the interpreter the project was set up with.
+    package_root = normpath(joinpath(@__DIR__, "..", ".."))
+    candidates = String[joinpath(package_root, ".venv", rel)]
+
+    # The active environment, if the shell happens to have one activated.
+    active = get(ENV, "VIRTUAL_ENV", "")
+    isempty(strip(active)) || push!(candidates, joinpath(active, rel))
+
+    for candidate in candidates
+        isfile(candidate) && return normpath(candidate)
+    end
+
+    return something(Sys.which("python"), "python")
+end
+
+"""
+    copernicusmarine_executable() -> String
+
+Resolve the `copernicusmarine` console script, preferring the one that belongs to the
+interpreter returned by [`project_python`](@ref).
+
+The console script is installed *into the environment's script directory* (`Scripts` on
+Windows, `bin` on POSIX), so deriving it from the resolved interpreter finds the
+project-local install without requiring the environment to be activated or added to
+`PATH`.
+
+# Outputs
+- `String`: Absolute path to the console script.
+
+# Throws
+- `error` if the script cannot be found anywhere, with instructions for fixing it.
+"""
+function copernicusmarine_executable()::String
+    override = get(ENV, "COPERNICUSMARINE_EXE", "")
+    isempty(strip(override)) || return normpath(override)
+
+    suffix = Sys.iswindows() ? ".exe" : ""
+    beside_python = joinpath(dirname(project_python()), "copernicusmarine$(suffix)")
+    isfile(beside_python) && return normpath(beside_python)
+
+    on_path = Sys.which("copernicusmarine")
+    isnothing(on_path) || return on_path
+
+    error(
+        "Could not find the `copernicusmarine` console script. It is a Python package, " *
+        "so it is installed into a Python environment rather than the Julia depot. Tried, " *
+        "in order: the COPERNICUSMARINE_EXE environment variable, the script directory " *
+        "beside $(project_python()), and PATH. To fix, install it into the project " *
+        "environment and re-run:\n" *
+        "    <package_root>/.venv/Scripts/python.exe -m pip install copernicusmarine\n" *
+        "then authenticate with:\n" *
+        "    <package_root>/.venv/Scripts/copernicusmarine.exe login"
+    )
+end
+
+"""
+    copernicus_login_reminder() -> String
+
+Build the reminder appended to Copernicus download failures.
+
+Most Copernicus download failures are not data problems, they are authentication
+problems: no credentials file, or credentials present but the dataset's terms and
+conditions not yet accepted in the Copernicus Marine portal. Surfacing the exact
+command to re-authenticate — and the fact that the resolved script path is available —
+saves the reader from having to rediscover it.
+"""
+function copernicus_login_reminder()::String
+    reminder = "\n\nIf this is the first time using Copernicus Marine, or the " *
+               "credentials have expired, log in first:\n" *
+               "    .\\.venv\\Scripts\\copernicusmarine.exe login\n" *
+               "Login prompts for a Copernicus Marine account (free to register) and writes " *
+               "~/.copernicusmarine/credentials.toml. It is interactive, so it must be run " *
+               "in a terminal, not from Julia.\n" *
+               "Check existing credentials at any time with:\n" *
+               "    .\\.venv\\Scripts\\copernicusmarine.exe login --check-credentials-valid\n" *
+               "Note that valid credentials are necessary but not sufficient: each dataset " *
+               "also needs its own terms and conditions accepted in the Copernicus Marine " *
+               "portal before the API will return data."
+
+    cli = try
+        copernicusmarine_executable()
+    catch
+        nothing
+    end
+    isnothing(cli) || (reminder *= "\nResolved script used for this request: $(cli)")
+
+    return reminder
+end
+
+"""
+    fetch_copernicus_physics_subset(;
+        lon_range = nothing,
+        lat_range = nothing,
+        start_date = "2023-06-01",
+        end_date = "2023-06-30",
+        output_path = joinpath("inputs", "copernicus_ts.nc"),
+        dataset_id = "GLOBAL_MULTIYEAR_PHY_001_030",
+        service_url = nothing,
+        verbose = true)
+
+Download a regional subset of 3D temperature (`thetao`) and salinity (`so`) from a
+Copernicus Marine global ocean physics product.
+
+The `copernicusmarine` console script is located by
+[`copernicusmarine_executable`](@ref), so a project-local virtual environment is used
+without needing to be activated or added to `PATH`. Authentication is whatever
+`copernicusmarine login` stored, i.e. `~/.copernicusmarine/credentials.toml`.
+
+Thresholds note: each dataset additionally requires its own terms-and-conditions
+acceptance in the Copernicus Marine portal; valid credentials alone are not sufficient.
+"""
+function fetch_copernicus_physics_subset(;
+    lon_range::Union{Nothing, Tuple{Real, Real}} = nothing,
+    lat_range::Union{Nothing, Tuple{Real, Real}} = nothing,
+    start_date::AbstractString = "2023-06-01",
+    end_date::AbstractString = "2023-06-30",
     output_path::AbstractString = joinpath("inputs", "copernicus_ts.nc"),
+    dataset_id::AbstractString = "GLOBAL_MULTIYEAR_PHY_001_030",
+    service_url::Union{Nothing, AbstractString} = nothing,
     verbose::Bool = true
 )
+    # Geographic bounds default to the active TOML configuration ([domain] section);
+    # nothing is hard-coded here. Pass explicit ranges to override.
+    rngs = resolve_domain_bounds(lon_range, lat_range)
+    lon_range, lat_range = rngs.lon, rngs.lat
     mkpath(dirname(output_path))
     min_lon, max_lon = lon_range
     min_lat, max_lat = lat_range
 
+    # Resolve the console script up front so a missing install is reported as a clear
+    # message rather than as a bare "executable not found" from `run`.
+    cli = copernicusmarine_executable()
+
     if verbose
-        println("Requesting Copernicus Marine subset (GLOBAL_MULTIYEAR_PHY_001_030)...")
+        println("Requesting Copernicus Marine subset ($dataset_id)...")
         println("Bounding box: Lon [$min_lon, $max_lon], Lat [$min_lat, $max_lat]")
+        println("Using CLI: $cli")
     end
 
-    # Construct the command line or API call using the official 'copernicusmarine' python package
-    # (Requires: pip install copernicusmarine and active Copernicus credentials via copernicusmarine login)
-    cmd = `copernicusmarine subset \
-            --dataset-id GLOBAL_MULTIYEAR_PHY_001_030 \
+    # Alternative dataset IDs (newer GLOPHY products with improved physics):
+    # - GLOBAL_MULTIYEAR_PHY_001_030 (legacy GLORYS12V1, 1993–present)
+    # - GLOBAL_MULTIYEAR_PHY_001_033 (GLOPHY-2, 1993–present, improved)
+    # - GLOBAL_ANALYSISFORECAST_PHY_001_024 (near-real-time, 2020–present)
+    # - GLOBAL_REANALYSIS_PHY_001_031 (CMEMS GLO12, 1993–present)
+    valid_datasets = [
+        "GLOBAL_MULTIYEAR_PHY_001_030",
+        "GLOBAL_MULTIYEAR_PHY_001_033",
+        "GLOBAL_REANALYSIS_PHY_001_031",
+        "GLOBAL_ANALYSISFORECAST_PHY_001_024",
+    ]
+    if !(dataset_id in valid_datasets)
+        @warn "Dataset $dataset_id not in known list; proceeding anyway. " *
+              "Known: $(join(valid_datasets, ", "))"
+    end
+
+    # Invoke the resolved absolute path. The CLI takes no custom service URL, so
+    # `service_url` is accepted for forward compatibility but not forwarded.
+    cmd = `$cli subset \
+            --dataset-id $dataset_id \
             --variable thetao \
             --variable so \
             --minimum-longitude $min_lon \
@@ -851,16 +1060,78 @@ function fetch_copernicus_physics_subset(;
             println("Copernicus subset successfully saved to: $(output_path)")
         end
     catch err
-        @warn "Automatic Copernicus download failed. Ensure python 'copernicusmarine' package is installed and credentials are configured."
+        @warn "Automatic Copernicus download failed for dataset $dataset_id. " *
+              "Ensure `copernicusmarine login` has been run for the environment at " *
+              "$(dirname(cli)), and that this dataset's terms and conditions have been " *
+              "accepted in the Copernicus Marine portal. " *
+              "Alternative datasets to try: $(join(filter(d -> d != dataset_id, valid_datasets), ", "))." *
+              copernicus_login_reminder()
         rethrow(err)
+        end
+
+        return output_path
     end
 
-    return output_path
+"""
+    fetch_copernicus_hydrography_with_fallback(; kwargs...) -> String
+
+Fetch 3D temperature/salinity from Copernicus Marine, trying multiple datasets in sequence
+until one succeeds. This provides "mirror-like" behavior for GLORYS/CMEMS products.
+
+Datasets tried (in order):
+  1. GLOBAL_MULTIYEAR_PHY_001_033 (GLOPHY-2, improved physics, 1993–present)
+  2. GLOBAL_REANALYSIS_PHY_001_031 (CMEMS GLO12, 1993–present)  
+  3. GLOBAL_MULTIYEAR_PHY_001_030 (legacy GLORYS12V1, 1993–present)
+  4. GLOBAL_ANALYSISFORECAST_PHY_001_024 (near-real-time, 2020–present)
+
+Requires: `pip install copernicusmarine` and `copernicusmarine login`.
+"""
+function fetch_copernicus_hydrography_with_fallback(; 
+    lon_range::Union{Nothing, Tuple{Real, Real}} = nothing, 
+    lat_range::Union{Nothing, Tuple{Real, Real}} = nothing, 
+    start_date::AbstractString = "2023-06-01", 
+    end_date::AbstractString = "2023-06-30", 
+    output_path::AbstractString = joinpath("inputs", "copernicus_ts.nc"),
+    verbose::Bool = true
+)
+    datasets = [
+        "GLOBAL_MULTIYEAR_PHY_001_033",  # GLOPHY-2 (preferred)
+        "GLOBAL_REANALYSIS_PHY_001_031", # CMEMS GLO12
+        "GLOBAL_MULTIYEAR_PHY_001_030",  # GLORYS12V1 (legacy)
+        "GLOBAL_ANALYSISFORECAST_PHY_001_024", # Near-real-time
+    ]
+
+    last_err = nothing
+    for ds in datasets
+        try
+            if verbose
+                println("Attempting Copernicus dataset: $ds")
+            end
+            return fetch_copernicus_physics_subset(
+                lon_range = lon_range,
+                lat_range = lat_range,
+                start_date = start_date,
+                end_date = end_date,
+                output_path = output_path,
+                dataset_id = ds,
+                verbose = verbose
+            )
+        catch err
+            last_err = err
+            if verbose
+                println("  -> Failed: $(typeof(err))")
+            end
+        end
+    end
+
+    error("All Copernicus Marine datasets failed. Last error: $last_err. " *
+          "Ensure 'copernicusmarine' is installed and credentials configured." *
+          copernicus_login_reminder())
 end
 
 """
-    fetch_copernicus_surface_winds(; lon_range = STUDY_DOMAIN_LON_RANGE, 
-                                   lat_range = STUDY_DOMAIN_LAT_RANGE, 
+    fetch_copernicus_surface_winds(; lon_range = nothing, 
+                                   lat_range = nothing, 
                                    time_iso = "2023-06-01T00:00:00Z", 
                                    output_path = joinpath("inputs", "copernicus_surface_winds.nc"), 
                                    verbose = true)
@@ -870,12 +1141,16 @@ Retrieve 10-meter surface wind components (\$u_{10}, v_{10}\$) from Copernicus C
 Supports both the new Copernicus CDS-Beta infrastructure and legacy CDS API endpoints.
 """
 function fetch_copernicus_surface_winds(; 
-    lon_range::Tuple{Real, Real} = STUDY_DOMAIN_LON_RANGE, 
-    lat_range::Tuple{Real, Real} = STUDY_DOMAIN_LAT_RANGE, 
+    lon_range::Union{Nothing, Tuple{Real, Real}} = nothing, 
+    lat_range::Union{Nothing, Tuple{Real, Real}} = nothing, 
     time_iso::AbstractString = "2023-06-01T00:00:00Z", 
     output_path::AbstractString = joinpath("inputs", "copernicus_surface_winds.nc"), 
     verbose::Bool = true
 )
+    # Geographic bounds default to the active TOML configuration ([domain] section);
+    # nothing is hard-coded here. Pass explicit ranges to override.
+    rngs = resolve_domain_bounds(lon_range, lat_range)
+    lon_range, lat_range = rngs.lon, rngs.lat
     mkpath(dirname(output_path))
     min_lat, max_lat = lat_range[1], lat_range[2]
     min_lon, max_lon = lon_range[1], lon_range[2]
@@ -943,12 +1218,22 @@ except Exception:
     end
 
     try
-        run(`python $(cds_script_path)`)
+        # Resolve the interpreter explicitly so the helper script's `cdsapi` import
+        # resolves against the environment that actually has it installed.
+        run(`$(project_python()) $(cds_script_path)`)
         if verbose
             println("Copernicus surface winds successfully downloaded to: $(output_path)")
         end
     catch err
-        @warn "Automated execution via python cdsapi failed ($(err)). Ensure your CDS API credentials (~/.cdsapi) are configured."
+        # NB: the CDS wind path authenticates through `cdsapi` and `~/.cdsapirc`, which is a
+        # *different* mechanism from the Copernicus Marine Service, so the
+        # `copernicusmarine login` reminder would be misleading here. Give the CDS-specific
+        # instruction instead, while naming the interpreter that was actually used.
+        @warn "Automated execution via python cdsapi failed ($(err)). " *
+              "Ensure your CDS API credentials (~/.cdsapirc) are configured, and that " *
+              "`cdsapi` is installed in $(dirname(project_python())). " *
+              "Note: this ERA5 wind path uses the CDS API and is a separate service from " *
+              "Copernicus Marine — `copernicusmarine login` does not authenticate here."
         rethrow(err)
     end
 
@@ -1059,16 +1344,36 @@ function fetch_open_woa_climatology(;
         end
         path_25 = "$(sub_dir)/A5B7/0.25"
         path_1  = "$(sub_dir)/A5B7/1.00"
-        [
-            # OPeNDAP subset — downloads only the regional box (~10–50 MB)
-            "$(thredds_base)/$(path_25)/$(base_fn_25)?$(varname)$(opendap_subset(varname))," *
-            "lon$(opendap_subset("lon")),lat$(opendap_subset("lat"))," *
-            "depth[0:1:$(i_dep_hi)],time[0:1:0]",
-            # Full 0.25° file (~550 MB each) — global download
-            "$(thredds_base)/$(path_25)/$(base_fn_25)",
-            # 1° fallback (~30 MB each)
-            "$(thredds_base)/$(path_1)/$(base_fn_1)",
+        subset_str = "$(varname)$(opendap_subset(varname))," *
+                     "lon$(opendap_subset("lon")),lat$(opendap_subset("lat"))," *
+                     "depth[0:1:$(i_dep_hi)],time[0:1:0]"
+
+        # Mirror list — tried in order. Each entry is a (base_url, description) pair.
+        mirrors = [
+            # Primary: NOAA NCEI THREDDS (OPeNDAP subset + full file)
+            ("https://www.ncei.noaa.gov/thredds/dodsC/ncei/woa", "NOAA NCEI THREDDS (OPeNDAP)"),
+            # Mirrors: institutional THREDDS catalogs
+            ("https://thredds.ucar.edu/thredds/dodsC/ncei/woa", "UCAR/Unidata THREDDS mirror"),
+            ("https://tds.marine.rutgers.edu/thredds/dodsC/ncei/woa", "Rutgers THREDDS mirror"),
+            ("https://data.nodc.noaa.gov/thredds/dodsC/ncei/woa", "NODC THREDDS mirror"),
+            # AWS S3 Open Data mirror (if available for WOA23)
+            ("https://noaa-woa23.s3.amazonaws.com", "AWS S3 Open Data (WOA23)"),
+            # Direct fileServer (full files only, no subsetting)
+            ("https://www.ncei.noaa.gov/thredds/fileServer/ncei/woa", "NOAA NCEI fileServer"),
         ]
+
+        urls = String[]
+        for (base, desc) in mirrors
+            # OPeNDAP subset URL
+            if occursin("dodsC", base)
+                push!(urls, "$(base)/$(path_25)/$(base_fn_25)?$(subset_str)")
+            end
+            # Full 0.25° file
+            push!(urls, "$(base)/$(path_25)/$(base_fn_25)")
+            # 1° fallback
+            push!(urls, "$(base)/$(path_1)/$(base_fn_1)")
+        end
+        urls
     end
 
     t_file = joinpath(output_dir, "woa23_temperature_$(month_str)_0.25deg.nc")

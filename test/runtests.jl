@@ -747,7 +747,7 @@ using ParticleTracking
     end
 
     @testset "15. Centralized Configuration File Management & Scenario Metadata" begin
-        config_path = "inputs/ParticleTracking.toml"
+        config_path = "configs/default.toml"
         @test isfile(config_path)
 
         # 1. Load centralized configuration and verify sections
@@ -1327,12 +1327,13 @@ using ParticleTracking
         rm(woa_path, force = true)
 
         # 6. Hydrodynamic Model with Oxygen and ClimaOcean / NEMO-TKE closure
-        test_grid = build_shelf_grid(
-            lon_range = (-63.0, -62.0),
-            lat_range = (43.0, 44.0),
-            z_range = (-200.0, 0.0),
-            grid_size = (6, 6, 4)
-        )
+test_grid = build_shelf_grid(
+              lon_range = (-65.0, -60.0),
+              lat_range = (43.0, 44.0),
+              z_range = (-200.0, 0.0),
+              grid_size = (10, 10, 5),
+              halo = (6, 6, 3)
+          )
         test_model = build_hydrodynamic_model(
             test_grid;
             coriolis_latitude = 43.5,

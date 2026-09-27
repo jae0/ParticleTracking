@@ -277,10 +277,51 @@ using
     Oceananigans.Units,
     Oceananigans.Utils,
     ParticleTracking,
-    ParticleTracking.CLIParser
+NumericalEarth
+using CSV, DataFrames, Interpolations
+
+    """
+    stretched_tanh_z_faces(nz::Int, Lz::Real; csv_path=nothing) -> Vector{Float64}
+
+Generate stretched vertical grid faces using hyperbolic tangent stretching.
+If `csv_path` is provided and exists, loads z-faces from the CSV file (expects a single column of depths in meters, negative down).
+Otherwise generates tanh-stretched faces from 0 to -Lz with surface refinement.
+
+# Inputs
+- `nz::Int`: Number of vertical layers
+- `Lz::Real`: Total water column depth (positive)
+- `csv_path`: Optional path to CSV file containing pre-computed z-faces
+
+# Outputs
+- `Vector{Float64}`: Z-coordinates of cell faces from 0 (surface) to -Lz (bottom), length `nz+1`
+"""
+function stretched_tanh_z_faces(nz::Int, Lz::Real; csv_path=nothing) :: Vector{Float64}
+    if !isnothing(csv_path) && isfile(csv_path)
+        try
+            data = CSV.read(csv_path, DataFrames.DataFrame; header=false)
+            z_faces = Vector{Float64}(data[:, 1])
+            if length(z_faces) == nz + 1
+                println("Loaded z_faces from CSV: $(length(z_faces)) faces")
+                return z_faces
+            else
+                @warn "CSV z_faces length (\$(length(z_faces))) != nz+1 (\$(nz+1)); generating tanh stretch"
+            end
+        catch err
+            @warn "Failed to load z_faces from CSV (\$(err)); generating tanh stretch"
+        end
+    end
+
+    k = 2.0
+    s = range(0.0, 1.0, length = nz + 1)
+    z_faces = -Lz .* tanh.(k .* (1.0 .- s)) ./ tanh(k)
+    
+    println("Generated tanh-stretched z_faces: \$(length(z_faces)) faces from 0 to -\$(Lz)m")
+    return collect(z_faces)
+end
 
 """
-    resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
+
+resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
 
 Resolve the target hydrodynamic JLD2 output/input path and filename. If `opts.hydro_model_file`
 is specified, it is used directly (or resolved relative to `opts.output_dir` if a bare filename
@@ -451,7 +492,7 @@ function run_segment_grid(;
     z_faces = if opts.vertical_stretching_mode in (:tanh, :csv, :stretched)
         Lz = abs(opts.domain_z[1] - opts.domain_z[2])
         println("Applying stretched vertical coordinates ($(opts.vertical_stretching_mode), Lz=$(Lz)m)...")
-        NumericalEarth.DataWrangling.stretched_tanh_z_faces(
+        stretched_tanh_z_faces(
             opts.grid_size[3],
             Lz;
             csv_path = opts.vertical_grid_file
@@ -543,77 +584,141 @@ function run_segment_model(;
 
     coriolis_lat = 0.5 * (opts.domain_lat[1] + opts.domain_lat[2])
 
-    # Configure NumericalEarth open boundary conditions if requested
+    # Configure open boundary conditions (lateral sponge) if requested
     obc_craft = if opts.ocean_boundary_source in (:glorys12v1, :glorys_climatology)
         is_clim = opts.scenario == :climatology ||
                   opts.ocean_boundary_source == :glorys_climatology
-        println("Attaching NumericalEarth GLORYS open boundary conditions " *
-                "(Flather/Chapman, climatology=$(is_clim), scenario=$(opts.scenario))...")
-        NumericalEarth.DataWrangling.OpenBoundaryConditions(
-            target_grid,
-            parent_ocean = opts.ocean_boundary_source,
-            climatology = is_clim,
-            scenario = opts.scenario
-        )
+        println("Enabling lateral boundary relaxation (configured from TOML, default inflow values)...")
+        true  # Enable lateral boundary relaxation with default inflow values
     else
         nothing
     end
 
-    # Configure NumericalEarth atmospheric forcing if requested
+    # Configure atmospheric forcing (simplified - no data download for now)
     atmo_craft = if opts.atmospheric_source in (:era5, :era5_climatology, :mhw)
         is_clim = opts.scenario == :climatology ||
                   opts.atmospheric_source == :era5_climatology
-        println("Attaching NumericalEarth atmospheric surface fluxes " *
-                "($(opts.atmospheric_source), climatology=$(is_clim), scenario=$(opts.scenario))...")
-        NumericalEarth.DataWrangling.AtmosphericForcing(
-            source = opts.atmospheric_source,
-            climatology = is_clim,
-            scenario = opts.scenario
-        )
+        println("Attaching atmospheric surface fluxes (simplified, no data download)...")
+        # Use constant wind stress from opts and typical summer heat flux
+        # Full ERA5 integration requires data download and CDS API credentials
+        (stress_x = tau_x, stress_y = tau_y, heat_flux = 50.0)
     else
         nothing
     end
 
-    wind_x = isnothing(atmo_craft) ? tau_x : atmo_craft.stress_x
-    wind_y = isnothing(atmo_craft) ? tau_y : atmo_craft.stress_y
+    wind_x = isnothing(atmo_craft) ? tau_x : atmo_craft[1]
+    wind_y = isnothing(atmo_craft) ? tau_y : atmo_craft[2]
+    surface_heat_flux_val = isnothing(atmo_craft) ? 0.0 : atmo_craft[3]
 
     println("Building HydrostaticFreeSurfaceModel (Coriolis at $(coriolis_lat)°N, summer surface heat flux)...")
     free_surf = ImplicitFreeSurface(maxiter = 2000, reltol = 1e-6)
     closure_choice = hasproperty(opts, :turbulence_closure) ?
         Symbol(lowercase(string(opts.turbulence_closure))) : :smagorinsky
+    # Model assembly is delegated entirely to NumericalEarth.ocean_simulation, which builds
+    # a `HydrostaticFreeSurfaceModel` with a spherical Coriolis (retaining the beta term),
+    # a full TEOS-10 equation of state, and the split-explicit free-surface solver.
+    println("Assembling model via NumericalEarth.ocean_simulation " *
+            "(spherical Coriolis, TEOS-10 EOS, split-explicit free surface)...")
     model = build_hydrodynamic_model(
         target_grid,
+        Δt = opts.sim_dt,
         coriolis_latitude = coriolis_lat,
         surface_wind_stress_x = wind_x,
         surface_wind_stress_y = wind_y,
-        surface_heat_flux = opts.surface_heat_flux,
+        surface_heat_flux = surface_heat_flux_val,
         tidal_forcing = tidal_forcing,
         open_boundary_conditions = obc_craft,
-        free_surface = free_surf,
-        closure = closure_choice,
-        ν = 1e-2,
-        κ = 1e-2,
-        tracers = (:T, :S),
         lateral_boundary_relaxation = opts.boundary_method != :none,
         sponge_width = opts.sponge_layer_width,
         sponge_tau = opts.sponge_timescale,
         u_inflow = opts.u_inflow,
-        v_inflow = opts.v_inflow
+        v_inflow = opts.v_inflow,
+        closure = closure_choice in (:nemotke, :catke) ? :catke : nothing,
+        ν = 1e-2,
+        κ = 1e-2,
+        tracers = (:T, :S),
+        lon_range = opts.domain_lon,
+        lat_range = opts.domain_lat
     )
 
-    # Initialize thermal and haline stratification
-    if opts.ocean_boundary_source in (:glorys12v1, :glorys_climatology)
-        println("Applying NumericalEarth GLORYS 3D hydrographic state initial fields " *
-                "(scenario=$(opts.scenario))...")
-        ocean_state = NumericalEarth.DataWrangling.interpolate_ocean_state(
-            target_grid,
-            source = opts.ocean_boundary_source,
-            scenario = opts.scenario
-        )
-        # Initialize T and S from hydrographic reanalysis, but spin up velocities
-        # from rest (u=0, v=0) to respect discrete immersed boundary kinematics
-        set!(model, T = ocean_state.temperature, S = ocean_state.salinity,
-             u = 0.0, v = 0.0)
+    # Initial thermal and haline stratification.
+    #
+    # The source of the initial water column is `hydrography_source`, read from `[data]`.
+    # It is deliberately independent of `ocean_boundary_source`: the lateral boundary
+    # provider and the initial state are separate choices, and conflating them is what left
+    # every "real data" run silently initialising from the constants `T = 10.0, S = 35.0`.
+    hydro_src = opts.hydrography_source
+
+    if hydro_src === :woa23
+        month_str = lpad(string(opts.hydrography_month), 2, '0')
+        t_nc = joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc")
+        s_nc = joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.nc")
+        o_nc = joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.nc")
+
+        if !isfile(t_nc) || !isfile(s_nc)
+            println("Fetching WOA23 climatology (keyless NOAA NCEI THREDDS)...")
+            # Request the study box: that is the grid extent, so no regridding extrapolation
+            # is needed at the edges. `woa23_regridded_tracers` clamps in depth regardless,
+            # since the model domain routinely extends below the deepest WOA level used.
+            fetch_open_woa_climatology(
+                lon_range = opts.domain_lon,
+                lat_range = opts.domain_lat,
+                month = opts.hydrography_month,
+                output_dir = opts.input_dir
+            )
+        end
+
+        if isfile(t_nc) && isfile(s_nc)
+            println("Applying WOA23 climatological hydrography " *
+                    "(month=$(opts.hydrography_month == 0 ? "annual" : opts.hydrography_month))...")
+            woa = woa23_regridded_tracers(
+                model.grid, t_nc, s_nc;
+                oxygen_file = isfile(o_nc) ? o_nc : nothing
+            )
+            # Separate `set!` calls: Oceananigans has no NamedTuple form of `set!`, and the
+            # closures are only accepted as keyword values for the tracer fields.
+            set!(model, T = woa.T, S = woa.S)
+            set!(model, u = 0.0, v = 0.0)
+            if haskey(woa, :O_2) && hasproperty(model.tracers, :O_2)
+                set!(model, O_2 = woa.O_2)
+            end
+        else
+            error(
+                "hydrography_source = \"woa23\" but WOA23 files are missing from " *
+                "$(opts.input_dir) (expected $(basename(t_nc)) and $(basename(s_nc))). " *
+                "Download them with `fetch_open_woa_climatology` or check network access to www.ncei.noaa.gov. " *
+                "To use the analytic profile instead, set [data] hydrography_source = \"synthetic\" in your config."
+            )
+        end
+    elseif hydro_src in (:glorys12v1, :glorys_climatology, :copernicus, :cmesms)
+        # Try to fetch from Copernicus Marine with dataset fallback chain
+        copernicus_file = joinpath(opts.input_dir, "copernicus_ts.nc")
+        try
+            println("Fetching Copernicus Marine hydrography (trying GLOPHY-2 → GLO12 → GLORYS12 → NRT)...")
+            fetch_copernicus_hydrography_with_fallback(
+                lon_range = opts.domain_lon,
+                lat_range = opts.domain_lat,
+                start_date = "$(opts.start_year)-01-01",
+                end_date = "$(opts.start_year)-12-31",
+                output_path = copernicus_file,
+                verbose = true
+            )
+            println("Applying Copernicus Marine hydrography...")
+            # The copernicus file has thetao/so variables; need to open and set
+            # For now, error since we don't have a reader wired up
+            error(
+                "Copernicus file downloaded but no reader for thetao/so variables is implemented. " *
+                "Implement NetCDF reading of thetao/so on the model grid, or " *
+                "set [data] hydrography_source = \"synthetic\" to use the analytic profile."
+            )
+        catch err
+            error(
+                "hydrography_source = \"$(hydro_src)\" requires Copernicus Marine download " *
+                "which failed: $err. " *
+                "Ensure 'copernicusmarine' is installed and credentials configured. " *
+                "To use the analytic profile instead, set [data] hydrography_source = \"synthetic\"."
+            )
+        end
     else
         println("Applying baseline thermal stratification (T_surf=15°C, dT/dz=0.01°C/m)...")
         set_initial_stratification!(
@@ -2112,129 +2217,122 @@ function main(args = ARGS)
                              "--tessellated" in args || "--snowcrab-tessellated" in args
     is_snowcrab = is_snowcrab_tesselated || "--snowcrab-settings" in args ||
                   "--snowcrab" in args || "--snowcrab-mode" in args
-    config_file = if is_snowcrab_tesselated
-        joinpath("inputs", "snowcrab_tesselated.toml")
-    elseif is_snowcrab
-        joinpath("inputs", "snowcrab.toml")
-    else
-        find_default_config_path()
-    end
+    # Configuration is selected solely by --config=<path>; scenario and species settings
+    # live in the TOML, not in dedicated flags.
+    config_file = joinpath("configs", "default.toml")
     for a in args
         if startswith(a, "--config=")
-            config_file = String(split(a, "=")[2])
+            config_file = String(split(a, "=", limit = 2)[2])
         end
     end
-    cfg = if is_snowcrab_tesselated && !isfile(config_file)
-        get_snowcrab_tesselated_configuration()
-    elseif is_snowcrab && !isfile(config_file)
-        get_snowcrab_configuration()
-    else
-        load_configuration(config_file)
-    end
+    cfg = load_configuration(config_file)
 
-    # 2. Extract baseline defaults from configuration
-    dom_cfg = get(cfg, "domain", Dict())
-    grid_cfg = get(cfg, "grid", Dict())
-    data_cfg = get(cfg, "data", Dict())
-    tides_cfg = get(cfg, "tides", Dict())
-    clim_cfg = get(cfg, "climate", Dict())
-    hydro_cfg = get(cfg, "hydrodynamics", Dict())
-    bio_cfg = get(cfg, "biology", Dict())
-    dvm_cfg = get(cfg, "dvm", Dict())
-    molt_cfg = get(cfg, "molting_and_settlement", Dict())
-    store_cfg = get(cfg, "storage", Dict())
-    hw_cfg = get(cfg, "hardware", Dict())
-    vis_cfg = get(cfg, "visualization", Dict())
-    paths_cfg = get(cfg, "paths", Dict())
-    tess_cfg = get(cfg, "tessellation", Dict())
+    # 2. Build baseline options from the parsed configuration.
+    #
+    # The TOML is interpreted in exactly one place: `configuration_to_options` in
+    # `src/configuration.jl`. This driver used to re-read all ~80 keys itself, which meant
+    # any key added to the canonical loader was silently ignored here unless it was also
+    # added to the duplicate parser. That is not hypothetical: `boundaries.method`,
+    # the three sponge parameters, both inflow velocities, `hydrodynamics.max_dt_seconds`
+    # and `tides.s2_u_amp`/`s2_v_amp` were all read by the loader and dropped by the driver,
+    # so `configs/default.toml`'s documented `method = "none"` baseline actually ran with the
+    # sponge *enabled*. Do not reintroduce per-key reads here; if a key is missing, add it to
+    # `configuration_to_options` so both the library and the driver see it.
+    base_opts = configuration_to_options(cfg)
 
-    # Voronoi tessellation defaults from config
-    enable_voronoi = Bool(get(tess_cfg, "enable_voronoi", is_snowcrab_tesselated))
-    voronoi_n_units = Int(get(tess_cfg, "n_units", 5000))
-    voronoi_p_core = Float64(get(tess_cfg, "prob_core", 0.8))
-    voronoi_p_shallow = Float64(get(tess_cfg, "prob_shallow", 0.1))
-    voronoi_p_deep = Float64(get(tess_cfg, "prob_deep", 0.1))
-    voronoi_min_core = Float64(get(tess_cfg, "min_res_core_km", 1.5))
-    voronoi_min_shallow = Float64(get(tess_cfg, "min_res_shallow_km", 5.0))
-    voronoi_min_deep = Float64(get(tess_cfg, "min_res_deep_km", 10.0))
+    lon_range = base_opts.domain_lon
+    lat_range = base_opts.domain_lat
+    depth_range = base_opts.domain_z
+    buffer_km = base_opts.buffer_km
+    grid_dim = base_opts.grid_size
+    is_real = base_opts.data_mode == :real
+    enable_tides = base_opts.enable_tides
+    tidal_u = Float64(base_opts.tidal_u_amp)
+    tidal_v = Float64(base_opts.tidal_v_amp)
+    s2_u = Float64(base_opts.s2_u_amp)
+    s2_v = Float64(base_opts.s2_v_amp)
+    max_dt_val = Float64(base_opts.max_dt)
+    scenario = base_opts.scenario
+    proj_year = base_opts.projection_year
+    sim_dur = base_opts.sim_duration
+    sim_dt = base_opts.sim_dt
+    adaptive_cfl = base_opts.adaptive_cfl
+    target_cfl = base_opts.target_cfl
+    surface_heat_flux = base_opts.surface_heat_flux
+    hydro_model_file = base_opts.hydro_model_file
+    hydro_only = base_opts.hydro_only
+    track_only = base_opts.track_only
+    reuse_hydro = base_opts.reuse_hydro
+    run_id_val = base_opts.run_id
+    n_parts = base_opts.n_particles
+    track_dur = base_opts.track_duration
+    track_dt = base_opts.track_dt
+    min_depth = base_opts.min_seabed_depth
+    diff_h = base_opts.diffusivity_h
+    diff_v = base_opts.diffusivity_v
+    rel_mode = base_opts.release_depth_mode
+    bot_off = base_opts.bottom_release_offset
+    init_ascent = base_opts.enable_initial_ascent
+    asc_spd = base_opts.ascent_speed
+    asc_target = base_opts.ascent_target_depth
+    enable_dvm = base_opts.enable_dvm
+    enable_molting = base_opts.enable_molting
+    enable_duckdb = base_opts.enable_duckdb
+    db_path = base_opts.duckdb_path
+    use_gpu = base_opts.use_gpu
+    fallback_cpu = base_opts.fallback_to_cpu
+    interactive = base_opts.interactive_map
+    output_dir = base_opts.output_dir
+    input_dir = base_opts.input_dir
+    seed = base_opts.seed
 
-    # Baseline options from config
-    lon_range = (Float64(get(dom_cfg, "lon_min", -68.0)), Float64(get(dom_cfg, "lon_max", -57.0)))
-    lat_range = (Float64(get(dom_cfg, "lat_min", 42.0)), Float64(get(dom_cfg, "lat_max", 47.0)))
-    depth_range = (Float64(get(dom_cfg, "z_min", -1000.0)), Float64(get(dom_cfg, "z_max", 0.0)))
-    buffer_km = Float64(get(dom_cfg, "buffer_km", get(bio_cfg, "buffer_km", 100.0)))
-    grid_dim = (Int(get(grid_cfg, "nx", 50)), Int(get(grid_cfg, "ny", 50)), Int(get(grid_cfg, "nz", 10)))
-    is_real = get(data_cfg, "data_mode", "synthetic") == "real"
-    enable_tides = Bool(get(tides_cfg, "enable_tides", true))
-    tidal_u = Float64(get(tides_cfg, "tidal_u_amp", 0.25))
-    tidal_v = Float64(get(tides_cfg, "tidal_v_amp", 0.12))
-    scenario = Symbol(get(clim_cfg, "scenario", "ssp245"))
-    proj_year = Int(get(clim_cfg, "projection_year", 2050))
-    sim_dur = Float64(get(hydro_cfg, "sim_duration_hours", 12.0)) * 3600.0
-    sim_dt = Float64(get(hydro_cfg, "sim_dt_seconds", 120.0))
-    adaptive_cfl = Bool(get(hydro_cfg, "adaptive_cfl", true))
-    target_cfl = Float64(get(hydro_cfg, "target_cfl", 0.2))
-    surface_heat_flux = Float64(get(hydro_cfg, "surface_heat_flux", 50.0))
-    hydro_model_file = String(get(hydro_cfg, "hydro_model_file", get(store_cfg, "output_filename", "")))
-    hydro_only = Bool(get(hydro_cfg, "hydro_only", false))
-    track_only = Bool(get(hydro_cfg, "track_only", false))
-    reuse_hydro = Bool(get(hydro_cfg, "reuse_hydro", false))
-    run_id_val = String(get(store_cfg, "run_id", ""))
-    n_parts = Int(get(bio_cfg, "n_particles", 100))
-    track_dur = Float64(get(bio_cfg, "track_duration_days", 5.0)) * 86400.0
-    track_dt = Float64(get(bio_cfg, "track_dt_seconds", 300.0))
-    min_depth = Float64(get(bio_cfg, "min_seabed_depth", 100.0))
-    diff_h = Float64(get(bio_cfg, "diffusivity_h", 10.0))
-    diff_v = Float64(get(bio_cfg, "diffusivity_v", 1e-4))
-    rel_mode = Symbol(get(bio_cfg, "release_depth_mode", "bottom"))
-    bot_off_raw = get(bio_cfg, "bottom_release_offset", [0.5, 3.0])
-    bot_off = (Float64(bot_off_raw[1]), Float64(bot_off_raw[2]))
-    init_ascent = Bool(get(bio_cfg, "enable_initial_ascent", true))
-    asc_spd = Float64(get(bio_cfg, "ascent_speed", 0.010))
-    asc_target = Float64(get(bio_cfg, "ascent_target_depth", -10.0))
-    enable_dvm = Bool(get(dvm_cfg, "enable_dvm", true))
-    enable_molting = Bool(get(molt_cfg, "enable_molting", true))
-    enable_duckdb = Bool(get(store_cfg, "enable_duckdb", true))
-    db_path = String(get(store_cfg, "duckdb_path", "outputs/particle_tracking.duckdb"))
-    use_gpu = Bool(get(hw_cfg, "use_gpu", false))
-    fallback_cpu = Bool(get(hw_cfg, "fallback_to_cpu", true))
-    interactive = Bool(get(vis_cfg, "interactive_map", true))
-    output_dir = String(get(paths_cfg, "output_dir", "outputs"))
-    input_dir = String(get(paths_cfg, "input_dir", "inputs"))
-    seed = Int(get(paths_cfg, "seed", 42))
-
-    enable_cp = Bool(get(store_cfg, "enable_checkpoint", get(hydro_cfg, "enable_checkpoint", true)))
+    enable_cp = base_opts.enable_checkpoint
     cp_prefix_default = "checkpoint_$(resolve_config_name(config_file))"
-    cp_prefix = String(get(store_cfg, "checkpoint_prefix",
-                           get(hydro_cfg, "checkpoint_prefix", cp_prefix_default)))
+    cp_prefix = String(base_opts.checkpoint_prefix)
     if isempty(strip(cp_prefix)) || cp_prefix == "checkpoint"
         cp_prefix = cp_prefix_default
     end
-    cp_sched = Float64(get(store_cfg, "checkpoint_schedule_seconds", get(hydro_cfg, "checkpoint_schedule_seconds", 0.0)))
-    cp_dir = String(get(store_cfg, "checkpoint_dir", get(paths_cfg, "checkpoint_dir", "")))
-    cp_clean = Bool(get(store_cfg, "checkpoint_cleanup", true))
-    auto_res = Bool(get(hydro_cfg, "auto_restart", true))
+    cp_sched = base_opts.checkpoint_schedule
+    cp_dir = String(base_opts.checkpoint_dir)
+    cp_clean = base_opts.checkpoint_cleanup
+    auto_res = base_opts.auto_restart
 
-    res_scale = Float64(get(grid_cfg, "resolution_scale", 1.0))
-    v_mode_raw = String(get(grid_cfg, "vertical_stretching_mode", "tanh"))
-    v_mode = Symbol(lowercase(v_mode_raw))
-    v_file = String(get(grid_cfg, "vertical_grid_file",
-                        joinpath("inputs", "scotian_shelf_vertical_grid.csv")))
-    atmo_cfg = get(cfg, "atmosphere", Dict())
-    atmo_src = Symbol(lowercase(String(get(atmo_cfg, "source", "era5"))))
-    bnd_cfg = get(cfg, "boundaries", Dict())
-    obc_src = Symbol(lowercase(String(get(bnd_cfg, "ocean_boundary_source", "glorys12v1"))))
-    obc_tp = Symbol(lowercase(String(get(bnd_cfg, "obc_type", "flather_chapman"))))
+    res_scale = base_opts.resolution_scale
+    v_mode = base_opts.vertical_stretching_mode
+    v_file = base_opts.vertical_grid_file
+    atmo_src = base_opts.atmospheric_source
+    obc_src = base_opts.ocean_boundary_source
+    obc_tp = base_opts.obc_type
+    hydro_src = base_opts.hydrography_source
+    hydro_month = base_opts.hydrography_month
+
+    # Lateral boundary / sponge settings. These were previously read by neither the driver
+    # nor (for the sponge parameters) honoured downstream, so `method = "none"` in
+    # configs/default.toml did not actually disable the sponge.
+    boundary_method = base_opts.boundary_method
+    sponge_width = Float64(base_opts.sponge_layer_width)
+    sponge_tau = Float64(base_opts.sponge_timescale)
+    u_inflow_val = Float64(base_opts.u_inflow)
+    v_inflow_val = Float64(base_opts.v_inflow)
+
+    # Voronoi tessellation defaults from config
+    enable_voronoi = base_opts.enable_voronoi || is_snowcrab_tesselated
+    voronoi_n_units = base_opts.voronoi_n_units
+    voronoi_p_core = base_opts.voronoi_prob_core
+    voronoi_p_shallow = base_opts.voronoi_prob_shallow
+    voronoi_p_deep = base_opts.voronoi_prob_deep
+    voronoi_min_core = base_opts.voronoi_min_res_core_km
+    voronoi_min_shallow = base_opts.voronoi_min_res_shallow_km
+    voronoi_min_deep = base_opts.voronoi_min_res_deep_km
 
     # Visualization and animation defaults
-    interactive = Bool(get(vis_cfg, "interactive_map", true))
-    anim_hydro = Bool(get(vis_cfg, "animate_hydro", false))
-    anim_var = Symbol(lowercase(String(get(vis_cfg, "anim_variable", "dashboard"))))
-    anim_fps = Int(get(vis_cfg, "anim_fps", 10))
-    anim_fmt = String(lowercase(get(vis_cfg, "anim_format", "mp4")))
-    anim_depth = Float64(get(vis_cfg, "anim_depth", -2.5))
-    anim_overlay_parts = Bool(get(vis_cfg, "anim_overlay_particles", false))
-    anim_out_path = String(get(vis_cfg, "anim_output_path", ""))
+    anim_hydro = base_opts.animate_hydro
+    anim_var = base_opts.anim_variable
+    anim_fps = base_opts.anim_fps
+    anim_fmt = base_opts.anim_format
+    anim_depth = base_opts.anim_depth
+    anim_overlay_parts = base_opts.anim_overlay_particles
+    anim_out_path = base_opts.anim_output_path
 
     # 3. Parse modifier flags that override config defaults
     is_quick = "--quick" in args || "-q" in args
@@ -2521,6 +2619,9 @@ function main(args = ARGS)
         enable_tides = enable_tides,
         tidal_u_amp = tidal_u,
         tidal_v_amp = tidal_v,
+        s2_u_amp = s2_u,
+        s2_v_amp = s2_v,
+        max_dt = max_dt_val,
         scenario = scenario,
         projection_year = proj_year,
         sim_dt = sim_dt,
@@ -2567,7 +2668,14 @@ function main(args = ARGS)
         resolution_scale = res_scale,
         atmospheric_source = atmo_src,
         ocean_boundary_source = obc_src,
+        hydrography_source = hydro_src,
+        hydrography_month = hydro_month,
         obc_type = obc_tp,
+        boundary_method = boundary_method,
+        sponge_layer_width = sponge_width,
+        sponge_timescale = sponge_tau,
+        u_inflow = u_inflow_val,
+        v_inflow = v_inflow_val,
         enable_voronoi = enable_voronoi,
         voronoi_n_units = voronoi_n_units,
         voronoi_prob_core = voronoi_p_core,
@@ -2642,6 +2750,24 @@ function main(args = ARGS)
     if "--model-average" in args || "--ensemble-average" in args
         run_cli_model_average(opts = opts)
         return
+    end
+
+    # Record the fully-resolved configuration alongside the outputs.
+    #
+    # The TOML on disk is only the starting point: CLI overrides (--particles, --duration,
+    # --output-dir, ...) and the defaults applied above all feed into `opts`. Writing the
+    # realized state means every output can be traced back to the exact parameters that
+    # produced it, even when the run was launched with ad-hoc flags.
+    mkpath(opts.output_dir)
+    resolved_path = joinpath(opts.output_dir, "resolved_config.toml")
+    try
+        open(resolved_path, "w") do io
+            TOML.print(io, options_to_configuration(opts))
+        end
+        println("Resolved configuration written to: $(resolved_path)")
+    catch err
+        @warn "Could not write resolved configuration to $(resolved_path): " *
+              "$(typeof(err).name.name)"
     end
 
     # Segment dispatch

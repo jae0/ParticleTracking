@@ -725,9 +725,16 @@ Compute derived physical oceanographic diagnostics:
 - Potential Density \$\\\\\\\\\\\\\\rho(S, T)\$ (Boussinesq linear approximation).
 - Brunt-Väisälä buoyancy frequency squared \$N^2 = -(g/\\\\\\\\\\\\\\rho_0) \\\\\\\\\\\\\\partial \\\\\\\\\\\\\\rho / \\\\\\\\\\\\\\partial z\$.
 - Vertical salinity stratification gradient \$\\\\\\\\\\\\\\partial S / \\\\\\\\\\\\\\partial z\$.
-- Turbulent vertical eddy diffusivity \$\\\\\\\\\\\\\\kappa_v\$ and eddy viscosity \$\\\\\\\\\\\\\\nu_v\$ via
-  shear-stratification gradient Richardson number \$Ri = N^2 / [(\\\\\\\\\\\\\\partial u/\\\\\\\\\\\\\\partial z)^2 + (\\\\\\\\\\\\\\partial v/\\\\\\\\\\\\\\partial z)^2]\$.
+- Turbulent vertical eddy diffusivity \$\\\\\\\\\\\\\\kappa_v\$ and eddy viscosity \$\\\\\\\\\\\\\\nu_v\$.
 - Relative vertical vorticity \$\\\\\\\\\\\\\\zeta = \\\\\\\\\\\\\\partial v / \\\\\\\\\\\\\\partial x - \\\\\\\\\\\\\\partial u / \\\\\\\\\\\\\\partial y\$.
+
+# Mixing provenance
+When `native_κ` / `native_ν` are supplied they are the model-published mixing fields and are
+returned verbatim — with a `ScalarDiffusivity` closure these are the exact constants the
+hydrodynamics advected with. Only when both are absent is a shear-stratification gradient
+Richardson number `Ri = N^2 / [(∂u/∂z)^2 + (∂v/∂z)^2]` used to synthesize a diffusivity/viscosity
+*proxy*. That proxy is not a model output and will generally disagree with the integrated
+physics; it exists only so legacy records lacking native mixing fields remain plottable.
 """
 function compute_hydrodynamic_diagnostics(
     lons::AbstractVector{<:Real},
@@ -739,7 +746,9 @@ function compute_hydrodynamic_diagnostics(
     temp::AbstractArray{<:Real, 3},
     sal::AbstractArray{<:Real, 3};
     ν_closure::Real = 1e-2,
-    κ_closure::Real = 1e-2
+    κ_closure::Real = 1e-2,
+    native_κ::Union{Nothing, AbstractArray{<:Real, 3}} = nothing,
+    native_ν::Union{Nothing, AbstractArray{<:Real, 3}} = nothing
 )::NamedTuple
     nx = length(lons)
     ny = length(lats)
@@ -796,10 +805,19 @@ function compute_hydrodynamic_diagnostics(
         end
     end
 
-    # 3. Turbulent eddy diffusivity & viscosity (Richardson number parameterization)
+    # 3. Turbulent eddy diffusivity & viscosity.
+    #
+    # When the model published its own mixing fields (`native_κ` / `native_ν`) those are
+    # authoritative and are used verbatim: with a `ScalarDiffusivity` closure they are the
+    # exact constants the hydrodynamics advected with.
+    #
+    # Only when they are absent do we fall back to a Richardson-number parameterization.
+    # That fallback is a *proxy*, not a model output, and is kept solely so legacy records
+    # without native mixing remain plottable.
     diff = zeros(Float64, nx, ny, nz)
     visc = zeros(Float64, nx, ny, nz)
     ri_arr = zeros(Float64, nx, ny, nz)
+    using_native_mixing = !isnothing(native_κ) || !isnothing(native_ν)
 
     for k in 1:nz
         z_m = Float64(depths[k])
@@ -811,16 +829,25 @@ function compute_hydrodynamic_diagnostics(
             if !isnan(n2_val) && !isnan(s2_val)
                 ri = max(0.0, n2_val / max(s2_val, 1e-7))
                 ri_arr[i, j, k] = ri
-
-                k_eddy = 1e-5 + 1e-2 / ((1.0 + 5.0 * ri)^2) + surf_mix
-                nu_eddy = 1e-4 + 1e-2 / ((1.0 + 5.0 * ri)^3) + surf_mix
-
-                diff[i, j, k] = clamp(k_eddy, 1e-6, 0.05)
-                visc[i, j, k] = clamp(nu_eddy, 1e-5, 0.05)
             else
                 ri_arr[i, j, k] = NaN
-                diff[i, j, k] = NaN
-                visc[i, j, k] = NaN
+            end
+
+            if using_native_mixing
+                k_native = isnothing(native_κ) ? nothing : native_κ[i, j, k]
+                v_native = isnothing(native_ν) ? nothing : native_ν[i, j, k]
+                diff[i, j, k] = isnothing(k_native) || isnan(k_native) ? NaN : Float64(k_native)
+                visc[i, j, k] = isnothing(v_native) || isnan(v_native) ? NaN : Float64(v_native)
+            else
+                if !isnan(n2_val) && !isnan(s2_val)
+                    k_eddy = 1e-5 + 1e-2 / ((1.0 + 5.0 * ri)^2) + surf_mix
+                    nu_eddy = 1e-4 + 1e-2 / ((1.0 + 5.0 * ri)^3) + surf_mix
+                    diff[i, j, k] = clamp(k_eddy, 1e-6, 0.05)
+                    visc[i, j, k] = clamp(nu_eddy, 1e-5, 0.05)
+                else
+                    diff[i, j, k] = NaN
+                    visc[i, j, k] = NaN
+                end
             end
         end
     end
@@ -851,6 +878,94 @@ function compute_hydrodynamic_diagnostics(
         richardson = ri_arr,
         vorticity = vort
     )
+end
+
+"""
+    read_immersed_bathymetry(jld2_path::AbstractString) -> Union{Matrix{Float64}, Nothing}
+
+Read the authoritative seafored bathymetry (metres, negative in the ocean) from the
+`ImmersedBoundaryGrid` serialized inside a simulation JLD2 file.
+
+The immersed grid's `bottom_height` is the *actual* seabed the simulation ran on, so it is
+the correct reference for masking below-seafloor cells in cross-sections and profiles.
+Falling back to a synthetic flat seabed would silently mask (or fabricate) water column.
+
+# Inputs
+- `jld2_path`: Path to the simulation JLD2 output file.
+
+# Outputs
+- `Matrix{Float64}`: Bottom height on the horizontal grid, indexed `[i_lon, j_lat]`;
+  or `nothing` when the file does not contain a serialized immersed grid.
+"""
+function read_immersed_bathymetry(jld2_path::AbstractString)
+    isfile(jld2_path) || return nothing
+
+    bottom = try
+        JLD2.jldopen(jld2_path, "r") do file
+            if !haskey(file, "serialized") || !haskey(file["serialized"], "grid")
+                return nothing
+            end
+            grid = file["serialized"]["grid"]
+            ib = hasproperty(grid, :immersed_boundary) ? grid.immersed_boundary : nothing
+            if isnothing(ib) || !hasproperty(ib, :bottom_height)
+                return nothing
+            end
+            bh = ib.bottom_height
+            # bottom_height is stored on the underlying grid with halos; strip them.
+            base = hasproperty(grid, :underlying_grid) ? grid.underlying_grid : grid
+            Hx = hasproperty(base, :Hx) ? base.Hx : 0
+            Hy = hasproperty(base, :Hy) ? base.Hy : 0
+            Nx = hasproperty(base, :Nx) ? base.Nx : size(bh, 1) - 2 * Hx
+            Ny = hasproperty(base, :Ny) ? base.Ny : size(bh, 2) - 2 * Hy
+            Array{Float64}(parent(bh.data)[Hx+1 : Hx+Nx, Hy+1 : Hy+Ny, 1])
+        end
+    catch
+        nothing
+    end
+
+    return bottom
+end
+
+"""
+    resolve_bathymetry_for_plot(lons, lats; sources = (), fallback = nothing)
+
+Pick the first bathymetry source that actually describes a seafored, and normalise it.
+
+A field is accepted only if it is a matrix of the expected size containing at least one
+finite negative (submerged) value. A constant sentinel such as `fill(-150.0, ...)` carries
+no bathymetric information and is rejected, so callers never mask a real water column
+against invented topography.
+
+# Inputs
+- `lons`, `lats`: Horizontal coordinate vectors defining the expected matrix size.
+- `sources`: Candidate bathymetry objects, tried in order.
+- `fallback`: Value returned when no source is usable (default `nothing`).
+
+# Outputs
+- `Matrix{Float64}` or `nothing`.
+"""
+function resolve_bathymetry_for_plot(lons, lats; sources = (), fallback = nothing)
+    expected = (length(lons), length(lats))
+    for src in sources
+        isnothing(src) && continue
+        m = src
+        if m isa AbstractString
+            m = read_immersed_bathymetry(m)
+        end
+        isnothing(m) && continue
+        mat = try
+            Float64.(m)
+        catch
+            continue
+        end
+        size(mat) == expected || continue
+        all(isfinite, mat) || continue
+        # Must contain genuine submerged topography to be usable for masking.
+        minimum(mat) < 0.0 || continue
+        length(unique(mat)) > 1 || continue
+        return mat
+    end
+    return fallback
 end
 
 """
@@ -1152,6 +1267,23 @@ function extract_hydrodynamic_dataset(
                 end
             end
 
+            # Model-native mixing fields, written by the simulation's JLD2Writer. When
+            # present these are the exact κ/ν the hydrodynamics advected with; absence
+            # (legacy records) falls back to the Richardson proxy downstream.
+            read_native_3d(sym) = begin
+                haskey(file, "timeseries/$(sym)") || return nothing
+                raw = Float64.(file["timeseries/$(sym)/$(key_sel)"])
+                if size(raw) == (Nx, Ny, Nz)
+                    raw
+                elseif size(raw, 1) >= (Nx + 2 * Hx) && size(raw, 2) >= (Ny + 2 * Hy)
+                    raw[i_c, j_c, (1 + Hz):(Nz + Hz)]
+                else
+                    raw[1:Nx, 1:Ny, 1:Nz]
+                end
+            end
+            native_κ_j = read_native_3d(:κ)
+            native_ν_j = read_native_3d(:ν)
+
             # Extract real bathymetry from immersed boundary grid if available
             bathymetry_j = if !isnothing(grid_obj) &&
                               hasproperty(grid_obj, :immersed_boundary) &&
@@ -1164,14 +1296,17 @@ function extract_hydrodynamic_dataset(
                 elseif size(raw_bh, 1) >= Nx && size(raw_bh, 2) >= Ny
                     ndims(raw_bh) == 3 ? raw_bh[1:Nx, 1:Ny, 1] : raw_bh[1:Nx, 1:Ny]
                 else
-                    fill(-150.0, Nx, Ny)
+                    nothing
                 end
             else
-                fill(-150.0, Nx, Ny)
+                nothing
             end
         end
 
-        diag = compute_hydrodynamic_diagnostics(lons_j, lats_j, deps_j, u_j, v_j, w_j, T_j, S_j)
+        diag = compute_hydrodynamic_diagnostics(
+            lons_j, lats_j, deps_j, u_j, v_j, w_j, T_j, S_j;
+            native_κ = native_κ_j, native_ν = native_ν_j
+        )
         k_sel = resolve_depth_index(deps_j, depth, depth_level)
         sel_time = isempty(times_j) ? 0.0 : times_j[resolve_time_index(times_j, time_seconds, time_index)]
 
@@ -1237,7 +1372,15 @@ function extract_hydrodynamic_dataset(
             richardson_number = diag.richardson,
             vorticity = diag.vorticity,
             elevation = loaded.elevation,
-            bathymetry = fill(-150.0, length(loaded.lons), length(loaded.lats))
+            # Resolve the real seabed: prefer an explicit bathymetry carried on the record,
+            # else the ImmersedBoundaryGrid bottom height from the simulation JLD2. Never
+            # fabricate a flat plane, which would wrongly mask the real water column.
+            bathymetry = resolve_bathymetry_for_plot(
+                loaded.lons, loaded.lats;
+                sources = (hasproperty(loaded, :bathymetry) ? getproperty(loaded, :bathymetry) : nothing,
+                           hasproperty(hydro_input, :jld2_path) ? getproperty(hydro_input, :jld2_path) : nothing),
+                fallback = nothing
+            )
         )
     end
 
@@ -1260,7 +1403,7 @@ function extract_hydrodynamic_dataset(
         bathy_mat = if g isa ImmersedBoundaryGrid && hasproperty(g.immersed_boundary, :bottom_height)
             Array(interior(g.immersed_boundary.bottom_height))
         else
-            fill(-150.0, length(m_lons), length(m_lats))
+            nothing
         end
 
         model_time = hasproperty(hydro_input, :clock) ? Float64(hydro_input.clock.time) : 0.0
@@ -1325,7 +1468,7 @@ function extract_hydrodynamic_dataset(
         in_t = get_field((:temperature, :T, :temp), fill(4.5, nx_in, ny_in, nz_in))
         in_s = get_field((:salinity, :S, :sal), fill(33.0, nx_in, ny_in, nz_in))
         in_elev = get_field((:elevation, :η, :eta, :ssh), zeros(Float64, nx_in, ny_in))
-        in_bathy = get_field((:bathymetry, :bathy, :elevation_bottom), fill(-150.0, nx_in, ny_in))
+        in_bathy = get_field((:bathymetry, :bathy, :elevation_bottom), nothing)
 
         # Handle 4D time slices if present
         slice_3d(arr) = begin
@@ -1374,7 +1517,10 @@ function extract_hydrodynamic_dataset(
             richardson_number = diag.richardson,
             vorticity = diag.vorticity,
             elevation = Float64.(in_elev isa AbstractMatrix ? in_elev : fill(0.0, nx_in, ny_in)),
-            bathymetry = Float64.(in_bathy isa AbstractMatrix ? in_bathy : fill(-150.0, nx_in, ny_in))
+            bathymetry = resolve_bathymetry_for_plot(
+                collect(Float64, in_lons), collect(Float64, in_lats);
+                sources = (in_bathy, hydro_input), fallback = nothing
+            )
         )
     end
 
@@ -2004,6 +2150,46 @@ function plot_hydrodynamic_diffusion(
 end
 
 """
+    assert_plottable(data, description, variable) -> data
+
+Validate that a masked 2D field contains at least two distinct finite values.
+
+Makie's `contourf` recipe requires a finite value range; when a field is entirely `NaN`
+(typically because the transect lies wholly landward, or the upstream record is empty) it
+raises deep inside the compute pipeline with an opaque `linspace(NaN, NaN)` error. This
+function converts that into an actionable message naming the transect and variable.
+
+# Inputs
+- `data`: Masked 2D array, possibly containing `NaN` for land/below-seafloor cells.
+- `description`: Human-readable description of what was being plotted.
+- `variable`: Variable symbol, included in the error message.
+
+# Outputs
+- `data`: returned unchanged, for call-site chaining.
+
+# Throws
+- `ErrorException` if no finite values are present, or if all finite values are identical.
+"""
+function assert_plottable(data, description::AbstractString, variable)
+    finite_vals = filter(isfinite, data)
+    if isempty(finite_vals)
+        error(
+            "Cannot render $(description): field '$(variable)' contains no finite values. " *
+            "The transect lies entirely below the seafloor or landward of the wet domain, " *
+            "or the source hydrodynamic record is empty/missing."
+        )
+    end
+    if length(unique(finite_vals)) == 1
+        error(
+            "Cannot render $(description): field '$(variable)' is spatially uniform " *
+            "($(first(finite_vals))); contouring requires a non-zero value range. This " *
+            "usually indicates an uninitialised or single-level source record."
+        )
+    end
+    return data
+end
+
+"""
     plot_hydrodynamic_section(
         hydrodynamics::Any;
         variable::Symbol = :temperature,
@@ -2103,87 +2289,68 @@ function plot_hydrodynamic_section(
 
     fig = Figure(size = (1050, 520), fontsize = 12)
 
+    # Bathymetry is optional: when the source record carries no seabed, the full water
+    # column is rendered rather than masking it against fabricated topography.
+    has_bathy = !isnothing(hydro.bathymetry) && ndims(hydro.bathymetry) == 2 &&
+                size(hydro.bathymetry) == (nx, ny)
+
     if is_zonal
         j_fixed = argmin(abs.(lats .- Float64(coordinate)))
         coord_val = lats[j_fixed]
         sec_data = zeros(Float64, nx, nz)
-        b_section = hydro.bathymetry[:, j_fixed]
+        b_section = has_bathy ? hydro.bathymetry[:, j_fixed] : fill(NaN, nx)
 
         for i in 1:nx, k in 1:nz
             z_val = depths[k]
             b_val = b_section[i]
-            if !isnan(b_val) && z_val < b_val
+            if isfinite(b_val) && z_val < b_val
                 sec_data[i, k] = NaN
             else
                 sec_data[i, k] = field_3d[i, j_fixed, k]
             end
         end
 
-        # Check for all-NaN data and use fallback
-        valid_data = sec_data[.!isnan.(sec_data)]
-        if isempty(valid_data)
-            @warn "Cross-section data for $(variable) is all NaN at coordinate $(coord_val). Using temperature as fallback."
-            sec_data = zeros(Float64, nx, nz)
-            for i in 1:nx, k in 1:nz
-                z_val = depths[k]
-                b_val = b_section[i]
-                if !isnan(b_val) && z_val < b_val
-                    sec_data[i, k] = NaN
-                else
-                    sec_data[i, k] = hydro.temperature[i, j_fixed, k]
-                end
-            end
-            cmap = :thermal
-            var_label = "Temperature T (°C) [fallback]"
-        end
+        assert_plottable(
+            sec_data,
+            "hydrodynamic cross-section along latitude $(round(coord_val, digits=2))°N",
+            variable
+        )
 
         fig_title = isnothing(title) ?
             "Hydrodynamic Vertical Cross-Section along Latitude $(round(coord_val, digits=2))°N [t = $(t_hr) h]" : title
         ax = Axis(fig[1, 1], title = fig_title, xlabel = "Longitude (°E)", ylabel = "Depth (m)")
 
         co = contourf!(ax, lons, depths, sec_data, colormap = cmap, levels = 16)
-        lines!(ax, lons, b_section, color = :black, linewidth = 2.5)
+        has_bathy && lines!(ax, lons, b_section, color = :black, linewidth = 2.5)
         Colorbar(fig[1, 2], co, label = var_label)
     else
         i_fixed = argmin(abs.(lons .- Float64(coordinate)))
         coord_val = lons[i_fixed]
         sec_data = zeros(Float64, ny, nz)
-        b_section = hydro.bathymetry[i_fixed, :]
+        b_section = has_bathy ? hydro.bathymetry[i_fixed, :] : fill(NaN, ny)
 
         for j in 1:ny, k in 1:nz
             z_val = depths[k]
             b_val = b_section[j]
-            if !isnan(b_val) && z_val < b_val
+            if isfinite(b_val) && z_val < b_val
                 sec_data[j, k] = NaN
             else
                 sec_data[j, k] = field_3d[i_fixed, j, k]
             end
         end
 
-        # Check for all-NaN data and use fallback
-        valid_data = sec_data[.!isnan.(sec_data)]
-        if isempty(valid_data)
-            @warn "Cross-section data for $(variable) is all NaN at coordinate $(coord_val). Using temperature as fallback."
-            sec_data = zeros(Float64, ny, nz)
-            for j in 1:ny, k in 1:nz
-                z_val = depths[k]
-                b_val = b_section[j]
-                if !isnan(b_val) && z_val < b_val
-                    sec_data[j, k] = NaN
-                else
-                    sec_data[j, k] = hydro.temperature[i_fixed, j, k]
-                end
-            end
-            cmap = :thermal
-            var_label = "Temperature T (°C) [fallback]"
-        end
+        assert_plottable(
+            sec_data,
+            "hydrodynamic cross-section along longitude $(round(coord_val, digits=2))°E",
+            variable
+        )
 
         fig_title = isnothing(title) ?
             "Hydrodynamic Vertical Cross-Section along Longitude $(round(coord_val, digits=2))°E [t = $(t_hr) h]" : title
         ax = Axis(fig[1, 1], title = fig_title, xlabel = "Latitude (°N)", ylabel = "Depth (m)")
 
         co = contourf!(ax, lats, depths, sec_data, colormap = cmap, levels = 16)
-        lines!(ax, lats, b_section, color = :black, linewidth = 2.5)
+        has_bathy && lines!(ax, lats, b_section, color = :black, linewidth = 2.5)
         Colorbar(fig[1, 2], co, label = var_label)
     end
 
@@ -2710,6 +2877,9 @@ function export_interactive_tracks_html(
 
         nz_h = length(h_depths)
         stride_h = max(1, round(Int, nx_h / 20))
+        has_hydro_bathy = !isnothing(hydro_data.bathymetry) &&
+                          ndims(hydro_data.bathymetry) == 2 &&
+                          size(hydro_data.bathymetry) == (nx_h, ny_h)
 
         # Build depth_levels array for multi-depth interaction
         depth_levels_entries = String[]
@@ -2729,7 +2899,10 @@ function export_interactive_tracks_html(
                 strat_val = round(hydro_data.stratification[i, j, k_idx] * 10000.0, digits = 3)
                 diff_val = round(hydro_data.diffusion[i, j, k_idx] * 10000.0, digits = 3)
                 eta_val = round(hydro_data.elevation[i, j] * 100.0, digits = 1)
-                b_val = round(hydro_data.bathymetry[i, j], digits = 1)
+                # Seabed depth is optional metadata; emit NaN when the source record
+                # carries no bathymetry so the Leaflet depth control is skipped rather
+                # than fabricated from an invented flat plane.
+                b_val = has_hydro_bathy ? round(hydro_data.bathymetry[i, j], digits = 1) : "null"
                 dir_deg = round(mod(90.0 - rad2deg(atan(hydro_data.v[i, j, k_idx], hydro_data.u[i, j, k_idx])), 360.0), digits = 1)
 
                 v_item = """{"lon":$(lon_v),"lat":$(lat_v),"u":$(u_val),"v":$(v_val),"speed":$(spd_val),"dir":$(dir_deg),"w":$(w_val),"temp":$(t_val),"sal":$(s_val),"strat":$(strat_val),"diff":$(diff_val),"eta":$(eta_val),"depth":$(b_val)}"""
@@ -2773,10 +2946,15 @@ function export_interactive_tracks_html(
         end
 
         eta_grid_json = "[" * join(["[" * join([string(round(hydro_data.elevation[i, j] * 100.0, digits = 1)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
-        bathy_grid_json = "[" * join(["[" * join([string(round(hydro_data.bathymetry[i, j], digits = 1)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        # Bathymetry grid is optional: emit JSON nulls and a degenerate colour range when
+        # the source record carries no seabed, so the map renders without a depth layer
+        # instead of indexing a missing array.
+        bathy_grid_json = has_hydro_bathy ?
+            ("[" * join(["[" * join([string(round(hydro_data.bathymetry[i, j], digits = 1)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]") :
+            ("[" * join(["[" * join(["null" for _ in 1:ny_h], ",") * "]" for _ in 1:nx_h], ",") * "]")
 
         valid_eta = filter(!isnan, hydro_data.elevation .* 100.0)
-        valid_b = filter(!isnan, hydro_data.bathymetry)
+        valid_b = has_hydro_bathy ? filter(isfinite, hydro_data.bathymetry) : Float64[]
         eta_min = isempty(valid_eta) ? -10.0 : round(minimum(valid_eta), digits=1)
         eta_max = isempty(valid_eta) ? 10.0 : round(maximum(valid_eta), digits=1)
         b_min = isempty(valid_b) ? -3000.0 : round(minimum(valid_b), digits=1)

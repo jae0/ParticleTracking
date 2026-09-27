@@ -168,23 +168,17 @@ function generate_depth_stratified_voronoi_units(
     target_shallow = round(Int, n_units * Float64(s_prob))
     target_deep = n_units - target_core - target_shallow
 
-    # 1. Resolve bathymetry source through NumericalEarth.jl
+    # 1. Resolve bathymetry source. NumericalEarth.jl (ETOPO 2022) is the supported
+    #    path; a pre-supplied function is passed through untouched, and a local
+    #    NetCDF file is read directly so runs remain reproducible without re-downloading.
     bathy_data = if bathymetry isa Function
         nothing
-    elseif bathymetry isa NamedTuple && haskey(bathymetry, :elevation)
+    elseif bathymetry isa NamedTuple && hasproperty(bathymetry, :elevation)
         bathymetry
     elseif bathymetry isa AbstractString && isfile(bathymetry)
-        NumericalEarth.load_regional_bathymetry(
-            filepath = bathymetry,
-            lon_range = lon_range,
-            lat_range = lat_range
-        )
+        load_bathymetry_from_netcdf(bathymetry, "elevation")
     else
-        # Default :numerical_earth, :auto, or nothing
-        NumericalEarth.load_regional_bathymetry(
-            lon_range = lon_range,
-            lat_range = lat_range
-        )
+        etopo_bathymetry_field(lon_range, lat_range)
     end
 
     # Load optional coastline polygons to strictly exclude land points
