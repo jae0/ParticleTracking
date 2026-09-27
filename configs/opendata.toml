@@ -218,6 +218,14 @@ ascent_speed = 0.010                # Ascent swimming speed (~10 mm/s)
 ascent_target_depth = -10.0         # Target epipelagic depth (m)
 buffer_km = 50.0
 
+# Stochasticity controls, identical to configs/snowcrab.toml. See the note there:
+# 0.25 is a placeholder, not a fitted value. Set any to 0.0 for deterministic
+# (mean-field) behaviour.
+cv_molt = 0.25
+cv_mortality = 0.25
+cv_settlement = 0.25
+settlement_stochastic = true
+
 [dvm]
 # Diel vertical migration: larvae rise at night to feed, descend by day to avoid predators.
 enable_dvm = true

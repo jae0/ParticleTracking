@@ -11,7 +11,7 @@ using Oceananigans.Advection: WENOVectorInvariant
 # `ContinuousForcing` lives in `Oceananigans.Forcings`, which Oceananigans `using`s
 # internally but does not re-export at top level. `ZeroForcing` is defined locally below,
 # so it is deliberately not imported here.
-using Oceananigans.Forcings: ContinuousForcing
+using Oceananigans.Forcings: ContinuousForcing, MultipleForcings, Relaxation
 using ClimaOcean
 using Dates
 using NCDatasets
@@ -150,13 +150,25 @@ function build_hydrodynamic_model(
     u_tide_val = isnothing(tidal_forcing) ? nothing : tidal_forcing.u
     v_tide_val = isnothing(tidal_forcing) ? nothing : tidal_forcing.v
 
-    # Sponge relaxation. The relaxation needs the instantaneous velocity, so the forcing is
-    # declared with `field_dependencies = (:u, :v)`: Oceananigans then calls it as
-    # `f(x, y, z, t, u, v)`. Without that declaration it is called as `f(x, y, z, t)` and
-    # raises `MethodError` on the missing velocity arguments.
+    # Sponge relaxation, expressed as an Oceananigans `Relaxation`.
     #
-    # Every captured value is `isbits` (see `ExponentialInflow`), so the composed forcing is
-    # lowerable into a GPU kernel.
+    # `Relaxation(; rate, mask, target)` contributes
+    #     rate * mask(X) * (target(X, t) - field)
+    # which, with `rate = 1/tau_relax` and `mask = gamma`, is exactly the sponge tendency
+    # `-gamma * (psi - ref) / tau_relax`. This replaces an earlier
+    # `ContinuousForcing(...; field_dependencies = (:u, :v))`, which had to be spelled that way
+    # because the closure needed the instantaneous velocity.
+    #
+    # That declaration is what broke the GPU: a `ContinuousForcing` carrying *any*
+    # `field_dependencies` produced invalid LLVM IR in
+    # `gpu_compute_hydrostatic_free_surface_Gu!` (Oceananigans 0.111 + CUDA.jl 6), for velocity
+    # and tracer dependencies alike. `Relaxation` needs no dependency declaration at all -- it
+    # reads the field it relaxes through `r.relaxed`, which the materializer rebinds to the model
+    # field and `Adapt`s per device -- so it lowers cleanly.
+    #
+    # The tidal body forcing is kept as a separate additive term via `MultipleForcings`, so the
+    # total is numerically identical to the previous construction:
+    #     tide(x, y, z, t) + rate * gamma * (ref - u)
     if sponge_active
         sponge_relaxation = LateralBoundaryRelaxation(
             (lon_min_grid, lon_max_grid), (lat_min_grid, lat_max_grid);
@@ -168,24 +180,32 @@ function build_hydrodynamic_model(
             v_decay = v_decay
         )
 
-        # These closures call the Symbol-free `sponge_relaxation_u`/`_v` entry points.
-        # Dispatching through a `Symbol` here would put a non-bits value in the kernel ABI
-        # and the free-surface kernel would fail to compile on GPU.
-        u_func = if isnothing(u_tide_val)
-            (x, y, z, t, u, v) -> sponge_relaxation_u(sponge_relaxation, x, y, z, t, u)
-        else
-            (x, y, z, t, u, v) -> Float64(u_tide_val(x, y, z, t)) + sponge_relaxation_u(sponge_relaxation, x, y, z, t, u)
+        relax_rate = 1.0 / Float64(sponge_tau)
+        # Quadratic sponge weight, zero in the interior and 1 on the open boundary.
+        # `compute_sponge_gamma` is `@inline` and pure over `isbits` arguments.
+        sponge_mask = (x, y, z) -> compute_sponge_gamma(
+            x, y, lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width
+        )
+        # `ExponentialInflow` is the reference upstream profile; it is `isbits`, so capturing it
+        # in these closures keeps the forcing lowerable into a kernel.
+        u_target = (x, y, z, t) -> Float64(sponge_relaxation.u_ref(x, y, z, t))
+        v_target = (x, y, z, t) -> Float64(sponge_relaxation.v_ref(x, y, z, t))
+
+        u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_target)
+        v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_target)
+
+        if !isnothing(u_tide_val)
+            u_forcing = MultipleForcings(
+                u_forcing, ContinuousForcing((x, y, z, t) -> Float64(u_tide_val(x, y, z, t)))
+            )
         end
-        v_func = if isnothing(v_tide_val)
-            (x, y, z, t, u, v) -> sponge_relaxation_v(sponge_relaxation, x, y, z, t, v)
-        else
-            (x, y, z, t, u, v) -> Float64(v_tide_val(x, y, z, t)) + sponge_relaxation_v(sponge_relaxation, x, y, z, t, v)
+        if !isnothing(v_tide_val)
+            v_forcing = MultipleForcings(
+                v_forcing, ContinuousForcing((x, y, z, t) -> Float64(v_tide_val(x, y, z, t)))
+            )
         end
 
-        composed_forcing = (;
-            u = ContinuousForcing(u_func; field_dependencies = (:u, :v)),
-            v = ContinuousForcing(v_func; field_dependencies = (:u, :v))
-        )
+        composed_forcing = (; u = u_forcing, v = v_forcing)
     else
         # No sponge: plain prescribed body forcing, called as f(x, y, z, t).
         composed_forcing = (; u = ZeroForcing(), v = ZeroForcing())
@@ -199,7 +219,13 @@ function build_hydrodynamic_model(
         end
     end
 
-    merged_forcing = merge(forcing, composed_forcing)
+    # `composed_forcing` supplies the sponge/tide terms this function is responsible for, but a
+    # caller-supplied `u`/`v` forcing must not be silently discarded. Merge so that `composed_forcing`
+    # wins only for the components it actually defines and that the caller did not already set.
+    # (The previous unconditional `merge(forcing, composed_forcing)` overwrote caller forcing with
+    # `ZeroForcing` whenever the sponge was inactive, with no warning.)
+    additions = filter(p -> !haskey(forcing, p.first), pairs(composed_forcing))
+    merged_forcing = isempty(forcing) ? composed_forcing : merge(forcing, NamedTuple(additions))
 
     eff_closure = closure !== nothing ? closure : closure_scheme
     active_closure = if eff_closure === nothing
@@ -380,22 +406,24 @@ end
 Read one WOA23 variable plus its coordinate axes from NetCDF.
 
 Returns `values` as a `(depth, lat, lon)` `Array` with all three axes in **ascending** order,
-and WOA's `-1.0e30` fill value mapped to `NaN`.
+and WOA's missingness mapped to `NaN`.
+
+Real WOA23 files are four-dimensional — `(lon, lat, depth, time)` with a singleton time axis —
+so a length-1 trailing axis is dropped here. Land/ice appears as `Missing` in the current release
+and as a large negative fill value in older ones; both become `NaN`.
 
 Two convention differences from the model grid are handled here:
 
 * WOA stores depth positive-downward (0, 5, 10 … m); the model grid is negative-downward, so
   depths are negated and re-sorted to ascending (i.e. surface first).
-* WOA stores the Atlantic sector as positive longitudes (e.g. `47.5`) whereas the model grid
-  uses signed degrees East (e.g. `-47.5`), so longitudes are wrapped into `[-180, 180)` and
-  re-sorted alongside the data.
+* Longitudes are wrapped into `[-180, 180)` and re-sorted alongside the data. This is a no-op for
+  the global WOA23 grid (already `-179.88 … 179.88`) but matters for sector files that store the
+  Atlantic as positive longitudes.
 """
 function read_woa_variable(filepath::AbstractString, varname::AbstractString)
     NCDatasets.NCDataset(filepath, "r") do ds
         haskey(ds, varname) || error(
             "WOA file $(filepath) has no variable '$(varname)'.")
-
-        var = ds[varname]
 
         lon_raw = collect(Float64, ds["lon"][:])
         lat_raw = collect(Float64, ds["lat"][:])
@@ -412,14 +440,30 @@ function read_woa_variable(filepath::AbstractString, varname::AbstractString)
         lat = lat_raw[jp]
         depth = dep_model[kp]
 
-        vals = permutedims(Array(var), (3, 2, 1))  # (lon, lat, depth) -> (depth, lat, lon)
+        # Real WOA23 files carry a trailing singleton time axis, so the variable arrives as
+        # (lon, lat, depth, time) rather than (lon, lat, depth). Accept either and drop a
+        # length-1 trailing axis; anything else genuinely ambiguous is an error.
+        raw = Array(ds[varname])
+        if ndims(raw) == 4
+            size(raw, 4) == 1 || error(
+                "WOA variable '$(varname)' has $(size(raw, 4)) time levels; this reader " *
+                "expects a single climatological period. Select a month first.")
+            raw = raw[:, :, :, 1]
+        elseif ndims(raw) != 3
+            error("WOA variable '$(varname)' has $(ndims(raw)) dimensions; expected 3 " *
+                  "(lon, lat, depth) or 4 with a singleton time axis.")
+        end
+
+        # WOA masks land/ice either with a huge negative fill value or, in the current
+        # A5B4 release, with `Missing`. Both have to become NaN: a `Missing` left in place
+        # would poison every downstream interpolation.
+        vals = permutedims(Float64.(coalesce.(raw, NaN)), (3, 2, 1))  # (lon,lat,depth)->(depth,lat,lon)
         vals = vals[kp, jp, ip]
 
         size(vals) == (length(depth), length(lat), length(lon)) || error(
             "Unexpected WOA variable '$(varname)' with size $(size(vals)); expected " *
             "(depth=$(length(depth)), lat=$(length(lat)), lon=$(length(lon))).")
 
-        # WOA masks land/ice with a huge negative fill value.
         vals[vals .<= -1.0e29] .= NaN
 
         return (vals, lon, lat, depth)

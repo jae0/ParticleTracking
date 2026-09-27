@@ -16,6 +16,7 @@ Automated unit test suite for the ParticleTracking package covering:
 
 using Test
 using Random
+using Statistics
 
 # Import necessary symbols from external packages
   # Required external imports for tests
@@ -168,6 +169,151 @@ using ParticleTracking
 
         suit_warm = evaluate_settlement_suitability(-100.0, 8.5)
         @test suit_warm.suitable == false # too warm
+    end
+
+    @testset "6b. Stochastic Biology Controls (cv_molt / cv_mortality / cv_settlement)" begin
+        # These tests guard two separate defects found together:
+        #
+        # 1. The three coefficients of variation were loaded into the config and written to
+        #    resolved_config.toml, but never forwarded by the driver to track_larval_cohort.
+        #    Every run used the library defaults of 0.0 (fully deterministic) while the
+        #    provenance file asserted 0.25. The driver pass-through check at the end of this
+        #    testset is the guard against that recurring.
+        # 2. update_larval_stage redrew a particle's molt thresholds on *every* call. In a
+        #    time-stepping loop that resamples the developmental rate each step, so a stage
+        #    could regress (:zoea2 -> :zoea1) and settlement competence could flicker.
+        #    Thresholds are now drawn once per particle by draw_molt_thresholds and reused.
+
+        # --- cv_molt = 0 reproduces the exact base thresholds -------------------
+        @test update_larval_stage(:zoea1, 64.9; cv_molt = 0.0) == :zoea1
+        @test update_larval_stage(:zoea1, 65.0; cv_molt = 0.0) == :zoea2
+        @test update_larval_stage(:zoea2, 130.0; cv_molt = 0.0) == :megalopa
+        @test update_larval_stage(:megalopa, 200.0; cv_molt = 0.0) == :instar1_settled
+        @test draw_molt_thresholds(MersenneTwister(1); cv_molt = 0.0) == (65.0, 130.0, 200.0)
+
+        r1 = MersenneTwister(7); rand(r1, 50)
+        r2 = MersenneTwister(7); rand(r2, 50)
+        @test update_larval_stage(:zoea1, 70.0; cv_molt = 0.0, rng = r1) ==
+              update_larval_stage(:zoea1, 70.0; cv_molt = 0.0, rng = r2)
+
+        # --- cv_molt > 0 spreads the transition degree-days --------------------
+        # Thresholds are drawn ONCE per particle, then reused: this is the property the
+        # time-stepping loop relies on, and the one that was broken when the draw happened
+        # inside update_larval_stage on every call.
+        function molt_threshold_dd(seed::Int)
+            rng = MersenneTwister(seed)
+            th = draw_molt_thresholds(rng;
+                 dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
+                 dd_megalopa_to_settle = 200.0, cv_molt = 0.25)
+            for dd in 0.0:0.25:300.0
+                if stage_from_thresholds(dd, th) != :zoea1
+                    return dd
+                end
+            end
+            return NaN
+        end
+        thresholds = [molt_threshold_dd(s) for s in 1:200]
+        @test all(isfinite, thresholds)
+        @test length(unique(thresholds)) > 1
+        @test var(thresholds) > 0.0
+        # mean should sit at the 65 DD base value (tolerance covers the 0.25 DD scan
+        # resolution and Monte-Carlo error over 200 draws)
+        @test 55.0 <= sum(thresholds) / length(thresholds) <= 75.0
+
+        # --- thresholds stay monotonic in degree-days --------------------------
+        th_m = draw_molt_thresholds(MersenneTwister(3); cv_molt = 0.4)
+        @test th_m[1] < th_m[2] < th_m[3]          # strictly increasing triple
+        order = Dict(:zoea1 => 0, :zoea2 => 1, :megalopa => 2, :instar1_settled => 3)
+        ranks = Int[order[stage_from_thresholds(dd, th_m)] for dd in 0.0:1.0:260.0]
+        @test issorted(ranks)
+
+        # Repeated calls with a FIXED triple must be reproducible even though cv_molt > 0:
+        # this is the regression that let a stage regress between timesteps.
+        for dd in (0.0, 40.0, 80.0, 150.0, 210.0)
+            @test update_larval_stage(:zoea1, dd; cv_molt = 0.4, thresholds = th_m,
+                                      rng = MersenneTwister(999)) ==
+                  stage_from_thresholds(dd, th_m)
+        end
+
+        # a wider cv must produce a wider spread of first-transition degree-days
+        spread_for(cv) = var([begin
+                th = draw_molt_thresholds(MersenneTwister(s); cv_molt = cv)
+                dd = 0.0
+                while stage_from_thresholds(dd, th) == :zoea1 && dd < 400.0
+                    dd += 0.25
+                end
+                dd
+            end for s in 1:150])
+        @test spread_for(0.02) < spread_for(0.25) < spread_for(0.50)
+
+        # --- settlement: cv_settlement = 0 is exactly deterministic -------------
+        det = evaluate_settlement_suitability(-120.0, 3.5; stochastic = false, cv_settlement = 0.0)
+        @test det.suitable == true
+        @test det.hsi == det.probability
+        det_bad = evaluate_settlement_suitability(-800.0, 2.0; stochastic = false, cv_settlement = 0.0)
+        @test det_bad.suitable == false
+
+        # --- settlement: stochastic draws vary across seeds ---------------------
+        # Use a marginal (not optimal) site so HSI is strictly between 0 and 1; at the
+        # optimum HSI == 1 and every Bernoulli draw succeeds by construction.
+        # z = -60 m sits between optimal_max_depth (-80) and max_depth (-50), so
+        # s_z = (-60 - -50) / (-80 - -50) = 1/3, and T = 1 C is thermally optimal.
+        marginal = (-60.0, 1.0)
+        hsi_marg = evaluate_settlement_suitability(marginal...; stochastic = false).hsi
+        @test 0.0 < hsi_marg < 1.0
+
+        draws = [evaluate_settlement_suitability(marginal...;
+                    stochastic = true, cv_settlement = 0.0,
+                    rng = MersenneTwister(s)).suitable for s in 1:80]
+        @test length(unique(draws)) == 2
+        frac = sum(draws) / length(draws)
+        @test frac > 0.0
+        @test frac < 1.0
+        # the realised settlement rate should track HSI to within Monte-Carlo error
+        @test abs(frac - hsi_marg) < 0.25
+
+        # --- settlement: cv_settlement perturbs the acceptance probability --------
+        probs = [evaluate_settlement_suitability(marginal...;
+                     stochastic = true, cv_settlement = 0.5,
+                     rng = MersenneTwister(s)).probability for s in 1:80]
+        @test length(unique(round.(probs, digits = 6))) > 1
+        @test all(0.0 .<= probs .<= 1.0)
+
+        # a zero HSI stays a hard gate even with stochasticity switched on
+        @test evaluate_settlement_suitability(-800.0, 2.0;
+                  stochastic = true, cv_settlement = 0.5,
+                  rng = MersenneTwister(1)).suitable == false
+
+        # --- config plumbing: TOML -> options -> resolved dict -------------------
+        cfg = get_default_configuration()
+        cfg["biology"]["n_particles"] = 10
+        cfg["biology"]["cv_molt"] = 0.4
+        cfg["biology"]["cv_mortality"] = 0.3
+        cfg["biology"]["cv_settlement"] = 0.2
+        cfg["biology"]["settlement_stochastic"] = false
+        parsed = configuration_to_options(cfg)
+        @test parsed.cv_molt == 0.4
+        @test parsed.cv_mortality == 0.3
+        @test parsed.cv_settlement == 0.2
+        @test parsed.settlement_stochastic == false
+
+        rt = options_to_configuration(parsed)
+        @test rt["biology"]["cv_molt"] == 0.4
+        @test rt["biology"]["cv_mortality"] == 0.3
+        @test rt["biology"]["cv_settlement"] == 0.2
+        @test rt["biology"]["settlement_stochastic"] == false
+
+        # --- regression guard: the driver must forward these --------------------
+        # A config value that never reaches its consumer is a silent lie in
+        # resolved_config.toml, which is exactly how the 0.25/0.0 discrepancy arose.
+        driver_src = read(joinpath(@__DIR__, "..", "ParticleTrackingRun.jl"), String)
+        for kw in ("cv_molt", "cv_mortality", "cv_settlement", "settlement_stochastic")
+            @test occursin(Regex("$kw\\s*=\\s*opts\\.$kw"), driver_src)
+        end
+        # both track_larval_cohort call sites must be covered
+        n_calls = length(collect(eachmatch(r"track_larval_cohort\(", driver_src)))
+        n_passes = length(collect(eachmatch(r"cv_molt\s*=\s*opts\.cv_molt", driver_src)))
+        @test n_passes == n_calls
     end
 
     @testset "7. Lagrangian Particle Tracking & Marine Land Exclusion" begin

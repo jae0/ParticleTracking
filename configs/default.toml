@@ -187,6 +187,21 @@ ascent_speed = 0.010
 ascent_target_depth = -10.0
 buffer_km = 50.0
 
+# --- Stochasticity controls -------------------------------------------------
+# Coefficients of variation for the three stochastic biology processes. Set any of
+# them to 0.0 to get the deterministic mean-field behaviour (particles sharing a
+# thermal history molt in lockstep; mortality applied as an expected fraction).
+# These are wired to track_larval_cohort by the driver, so changing them changes
+# the run and the value is recorded in resolved_config.toml.
+#
+# 0.25 is a placeholder, not a fitted value: real cohorts show substantial spread in
+# developmental rate. Calibrate against field observations before treating any
+# result as quantitative.
+cv_molt = 0.25                # per-particle degree-day threshold spread
+cv_mortality = 0.25           # per-particle mortality-rate spread
+cv_settlement = 0.25          # spread on the habitat-suitability index
+settlement_stochastic = true  # draw settlement probabilistically rather than on HSI alone
+
 [dvm]
 # Stage-dependent diel vertical migration. The stage names are generic; map them
 # to real life stages via the config when a species is specified.

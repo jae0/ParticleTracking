@@ -8,6 +8,106 @@ benthic nursery settlement suitability filtering.
 
 using Random
 
+# ==============================================================================
+# Stochastic dispersion helpers
+#
+# Every `cv_*` knob below controls **dispersion only**. The population mean is
+# held at the configured base value, so switching a coefficient on never quietly
+# changes the expected rate. Each helper is exactly identity at `cv == 0`, which
+# is what makes the deterministic path bit-for-bit reproducible.
+# ==============================================================================
+
+"""
+    lognormal_sigma(cv::Real) -> Float64
+
+Convert a coefficient of variation into the log-scale standard deviation of a
+lognormal, `σ = sqrt(log(1 + cv²))`.
+
+A lognormal is used rather than a Normal because all the quantities being
+dispersed here — developmental rates, mortality rates — are strictly positive and
+right-skewed, which is how biological rates actually behave. A Normal must be
+clamped at zero, and the clamp is not a harmless detail: it piles a point mass on
+the boundary. Measured on the molt threshold at 200 000 draws, `cv = 0.5` put
+**2.4 %** of larvae at exactly the 1.0 degree-day floor and `cv = 0.75` put
+**9.5 %** there, i.e. cohorts of larvae that molt instantaneously. A lognormal is
+positive by construction, so there is nothing to clamp and no such artifact.
+"""
+@inline function lognormal_sigma(cv::Real)
+    c = abs(Float64(cv))
+    return c > 0 ? sqrt(log1p(c * c)) : 0.0
+end
+
+"""
+    draw_lognormal_mean(base::Real, cv::Real, rng) -> Float64
+
+Draw a positive, right-skewed value with population mean `base` and coefficient
+of variation `cv`.
+
+Parameterisation is mean-preserving: `σ = sqrt(log(1 + cv²))` and the draw is
+`base * exp(σ·z − σ²/2)` with `z ~ Normal(0,1)`, so `E[draw] = base` and
+`CV[draw] = cv` exactly. The `−σ²/2` term is what shifts the lognormal's median
+below its mean; omitting it would make the mean `base·exp(σ²/2)`, i.e. turning a
+`cv` up would also raise the expected rate.
+
+At `cv == 0` the result is exactly `base`.
+"""
+@inline function draw_lognormal_mean(base::Real, cv::Real, rng::AbstractRNG)
+    b = Float64(base)
+    σ = lognormal_sigma(cv)
+    σ > 0 || return b
+    return b * exp(σ * randn(rng) - 0.5 * σ * σ)
+end
+
+"""
+    draw_beta_index(base::Real, cv::Real, rng; min_concentration = 0.05) -> Float64
+
+Draw a value in `(0, 1)` representing a **bounded suitability index**, with population mean `base`
+and coefficient of variation `cv`.
+
+A suitability index is a probability-like quantity confined to `[0, 1]`, so neither dispersion used
+elsewhere in this file applies to it:
+
+* a **lognormal** has the wrong support — it is unbounded above, and a suitability index above 1 is
+  not a slightly optimistic index, it is an invalid one;
+* a **clipped Normal** is not mean preserving. At the optimum (`base = 1`) roughly half the mass
+  falls above 1 and is clipped to exactly 1 while the rest is clipped down, so the *expected*
+  acceptance is pushed below `base`. Turning `cv_settlement` up would then silently **reduce**
+  settlement — a dispersion knob changing the mean.
+
+A **Beta** is the standard choice for a bounded index with a controllable mean and dispersion, and
+it is the only one of the three that hits the requested mean *and* CV exactly. For
+`Beta(α, β)` with mean `μ` and concentration `κ = α + β`:
+
+    mean = μ,   var = μ(1 − μ) / (κ + 1)   ⟹   κ = (1 − μ)/(μ·cv²) − 1
+
+and the shapes follow as `α = μκ`, `β = (1 − μ)κ`.
+
+**Feasibility limit.** A variable on `[0, 1]` has `var ≤ μ(1 − μ)`, so a bounded index of mean `μ`
+cannot have a CV larger than `sqrt((1 − μ)/μ)` — 0.33 at `μ = 0.9`, 1.0 at `μ = 0.5`, 3.0 at
+`μ = 0.1`. This is a property of the interval, not a modelling choice: asking for `cv = 0.5` on an
+index of 0.9 means a substantial fraction of cases must sit at 0. `κ` is floored at
+`min_concentration` so such a request degrades to a near-Bernoulli draw instead of producing a
+negative concentration, and the mean is still preserved. Worth knowing when reading results: at a
+high `μ` the effective CV saturates below the requested one.
+
+`base` of exactly 0 or 1 is returned unchanged, so the unsuitability gate and the optimum are
+respected exactly. `cv = 0` returns `base` unchanged.
+"""
+@inline function draw_beta_index(base::Real, cv::Real, rng::AbstractRNG; min_concentration::Real = 0.05)
+    μ = Float64(base)
+    # Endpoints are hard values: 0 is the unsuitability gate, 1 is the optimum.
+    (μ <= 0.0) && return 0.0
+    (μ >= 1.0) && return 1.0
+    c = abs(Float64(cv))
+    (c > 0) || return μ
+
+    # κ = (1 − μ)/(μ·cv²) − 1, floored so α, β stay positive.
+    κ = max((1.0 - μ) / (μ * c * c) - 1.0, Float64(min_concentration))
+    α = μ * κ
+    β = (1.0 - μ) * κ
+    return clamp(rand(rng, Beta(α, β)), 0.0, 1.0)
+end
+
 """
     larval_ascent_velocity(
         z::Real;
@@ -380,6 +480,104 @@ function larval_passive_sinking_velocity(
 end
 
 """
+    draw_molt_thresholds(rng; dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
+                              dd_megalopa_to_settle = 200.0, cv_molt = 0.0) -> NTuple{3,Float64}
+
+Draw one particle's cumulative degree-day thresholds for the three stage transitions.
+
+**Dispersion is applied to the stage increments, not to the cumulative thresholds.** The base
+thresholds are decomposed into the increments needed to pass through them,
+`(b₁, b₂ − b₁, b₃ − b₂)` — for the defaults `(65, 65, 70)` degree-days — each increment is drawn
+from a mean-preserving lognormal, and the thresholds are the running sums:
+
+```math
+t_1 = \\Delta_1, \\quad t_2 = \\Delta_1 + \\Delta_2, \\quad t_3 = \\Delta_1 + \\Delta_2 + \\Delta_3
+```
+
+where `Δₖ = baseₖ · exp(σ·zₖ − σ²/2)`, `σ = sqrt(log(1 + cv_molt²))`, `zₖ ~ Normal(0,1)`.
+
+This construction matters, because the obvious alternatives are both wrong:
+
+* Drawing the **cumulative thresholds** independently and then forcing `t₂ > t₁`, `t₃ > t₂` with
+  `max` looks equivalent but is not: the `max` guard propagates a slow-developer tail upward, so
+  the mean of `t₃` is inflated (measured: 217 degree-days instead of 200 at `cv = 0.5`, and 234 at
+  `cv = 0.75`). `cv_molt` would then be a knob that silently lengthens the expected time to
+  settlement instead of only dispersing it.
+* Drawing a Normal and clamping at zero piles an artificial spike on the floor — at `cv = 0.5`,
+  **2.4 %** of larvae were given a Zoea I duration of about two hours (`cv = 0.75`: 9.5 %).
+
+With increments, **ordering is automatic** (every `Δₖ > 0`), nothing is clamped, and all three
+means are preserved exactly: `E[t₁] = b₁`, `E[t₂] = b₂`, `E[t₃] = b₃`. The *total* requirement is
+less dispersed than any single stage, which is the correct behaviour — variability averages out
+across stages — so the CV of `t₃` is naturally below `cv_molt`.
+
+Because `DD = (T − T_base)·d` for a cohort at fixed temperature, the increment CV is also the stage
+duration CV, so published stage-duration dispersion transfers directly.
+
+**These must be drawn once per particle and then reused**, never redrawn per call. A developmental
+threshold is a fixed property of the individual larva: redrawing it on every timestep resamples the
+developmental rate at random each step, which lets a particle's stage regress (`:zoea2` → `:zoea1`)
+and makes settlement competence flicker on and off. See [`update_larval_stage`](@ref).
+
+# Inputs
+- `rng`: Random number generator.
+- `dd_zoea1_to_zoea2`, `dd_zoea2_to_megalopa`, `dd_megalopa_to_settle`: Base cumulative degree-day
+  thresholds. Must be strictly increasing.
+- `cv_molt`: Coefficient of variation of the stage increments. `0.0` reproduces the base thresholds
+  exactly.
+
+# Outputs
+- `NTuple{3, Float64}`: `(t1, t2, t3)`, strictly increasing.
+"""
+function draw_molt_thresholds(
+    rng::AbstractRNG;
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0,
+    cv_molt::Real = 0.0
+)
+    b1 = Float64(dd_zoea1_to_zoea2)
+    b2 = Float64(dd_zoea2_to_megalopa)
+    b3 = Float64(dd_megalopa_to_settle)
+    if !(cv_molt > 0)
+        return (b1, b2, b3)
+    end
+    # Increments needed to pass through each base threshold in turn. Positive increments are what
+    # make the running sums strictly increasing, so the bases must be strictly increasing.
+    increments = (b1, b2 - b1, b3 - b2)
+    any(x -> !(x > 0.0), increments) && throw(ArgumentError(
+        "draw_molt_thresholds requires strictly increasing cumulative thresholds, got " *
+        "($b1, $b2, $b3); the stage increments must all be positive."))
+
+    d1 = draw_lognormal_mean(increments[1], cv_molt, rng)
+    d2 = draw_lognormal_mean(increments[2], cv_molt, rng)
+    d3 = draw_lognormal_mean(increments[3], cv_molt, rng)
+    return (d1, d1 + d2, d1 + d2 + d3)
+end
+
+"""
+    stage_from_thresholds(degree_days, thresholds) -> Symbol
+
+Map a cumulative degree-day total onto a developmental stage using a fixed threshold triple
+`(t1, t2, t3)`.
+
+Because degree-days are non-decreasing in time and the thresholds are fixed, the returned stage is
+monotone non-decreasing for a fixed `thresholds` argument.
+"""
+@inline function stage_from_thresholds(degree_days::Real, thresholds::NTuple{3, <:Real})
+    t1, t2, t3 = thresholds
+    if degree_days < t1
+        return :zoea1
+    elseif degree_days < t2
+        return :zoea2
+    elseif degree_days < t3
+        return :megalopa
+    else
+        return :instar1_settled
+    end
+end
+
+"""
     update_larval_stage(
         current_stage::Symbol,
         degree_days::Real;
@@ -387,6 +585,7 @@ end
         dd_zoea2_to_megalopa::Real = 130.0,
         dd_megalopa_to_settle::Real = 200.0,
         cv_molt::Real = 0.0,
+        thresholds::Union{Nothing, NTuple{3, <:Real}} = nothing,
         rng::AbstractRNG = Random.default_rng()
     )
 
@@ -405,6 +604,13 @@ When `cv_molt > 0`, each particle's molt thresholds are drawn from a normal dist
 with mean = base threshold and sd = cv_molt * base threshold. This introduces individual
 variability in developmental timing.
 
+!!! warning "Draw thresholds once per particle, not once per call"
+    A developmental threshold is a fixed property of the individual larva. Calling this function
+    repeatedly with `cv_molt > 0` and no `thresholds` argument redraws a *new* threshold on every
+    call, so the stage can regress between steps (`:zoea2` back to `:zoea1`) and settlement
+    competence can flicker. In a time-stepping loop, draw once per particle with
+    [`draw_molt_thresholds`](@ref) and pass the result back via `thresholds`.
+
 # Inputs
 - `current_stage::Symbol`: Present developmental stage.
 - `degree_days::Real`: Accumulated degree-days (°C · days).
@@ -412,6 +618,9 @@ variability in developmental timing.
 - `dd_zoea2_to_megalopa::Real`: Base degree-day threshold for Zoea II -> Megalopa.
 - `dd_megalopa_to_settle::Real`: Base degree-day threshold for Megalopa -> Instar I.
 - `cv_molt::Real`: Coefficient of variation for molt thresholds (default 0.0 = deterministic).
+  Only consulted when `thresholds` is `nothing`.
+- `thresholds`: Optional fixed `(t1, t2, t3)` triple for this particle. When supplied, `cv_molt`
+  and `rng` are ignored, so repeated calls are reproducible in the threshold.
 - `rng::AbstractRNG`: Random number generator for stochastic thresholds.
 
 # Outputs
@@ -424,26 +633,24 @@ function update_larval_stage(
     dd_zoea2_to_megalopa::Real = 130.0,
     dd_megalopa_to_settle::Real = 200.0,
     cv_molt::Real = 0.0,
+    thresholds::Union{Nothing, NTuple{3, <:Real}} = nothing,
     rng::AbstractRNG = Random.default_rng()
 )
     if current_stage == :dead || current_stage == :instar1_settled
         return current_stage
     end
 
-    # Stochastic thresholds: draw from N(mean, cv * mean) if cv > 0
-    t1 = cv_molt > 0 ? max(1.0, rand(rng, Normal(dd_zoea1_to_zoea2, dd_zoea1_to_zoea2 * cv_molt))) : dd_zoea1_to_zoea2
-    t2 = cv_molt > 0 ? max(t1 + 1.0, rand(rng, Normal(dd_zoea2_to_megalopa, dd_zoea2_to_megalopa * cv_molt))) : dd_zoea2_to_megalopa
-    t3 = cv_molt > 0 ? max(t2 + 1.0, rand(rng, Normal(dd_megalopa_to_settle, dd_megalopa_to_settle * cv_molt))) : dd_megalopa_to_settle
+    # Prefer a caller-supplied fixed threshold triple (drawn once per particle by
+    # `draw_molt_thresholds`); only draw here when called standalone.
+    th = isnothing(thresholds) ?
+         draw_molt_thresholds(rng;
+             dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
+             dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
+             dd_megalopa_to_settle = dd_megalopa_to_settle,
+             cv_molt = cv_molt) :
+         thresholds
 
-    if degree_days < t1
-        return :zoea1
-    elseif degree_days < t2
-        return :zoea2
-    elseif degree_days < t3
-        return :megalopa
-    else
-        return :instar1_settled
-    end
+    return stage_from_thresholds(degree_days, th)
 end
 
 """
@@ -542,17 +749,18 @@ function evaluate_settlement_suitability(
 
     hsi = clamp(s_z * s_t, 0.0, 1.0)
 
-    # Stochastic settlement: minimum HSI gate + normal draw for acceptance probability
-    # If hsi == 0, immediately unsuitable (hard gate)
-    # If hsi > 0, acceptance probability ~ Normal(hsi, cv_settlement * hsi) clipped to [0,1]
-    # Then draw U(0,1) and accept if U <= p_accept
+    # Stochastic settlement: HSI gate, then a per-larva Bernoulli draw.
+    #
+    # `cv_settlement` perturbs the suitability *index*, which is a bounded probability, so it uses
+    # a Beta dispersion rather than the lognormal used for the positive rate-like quantities. A
+    # Normal clipped to [0,1] is not mean preserving: at the optimum (hsi = 1) half the mass clips
+    # down below 1, so the expected acceptance falls below hsi and raising `cv_settlement` would
+    # silently *reduce* settlement. See draw_beta_index.
     if hsi == 0.0
         suitable = false
         p_accept = 0.0
     elseif stochastic && cv_settlement > 0.0
-        # Draw acceptance probability from N(hsi, cv * hsi), clipped
-        sd = hsi * cv_settlement
-        p_accept = clamp(rand(rng, Normal(hsi, sd)), 0.0, 1.0)
+        p_accept = draw_beta_index(hsi, cv_settlement, rng)
         suitable = rand(rng) <= p_accept
     elseif stochastic
         # Traditional Bernoulli with HSI as probability
@@ -1124,6 +1332,16 @@ function track_larval_cohort(
     ascent_complete = Vector{Bool}(undef, n_particles)
     ascent_duration = fill(0.0, n_particles)
 
+    # Per-particle molt thresholds, drawn ONCE here and reused for the whole run. Drawing inside
+    # the time loop would resample each larva's developmental rate every step, letting a stage
+    # regress and making settlement competence flicker. With fixed thresholds and non-decreasing
+    # degree-days the stage sequence is monotone by construction.
+    molt_thresholds = [draw_molt_thresholds(rng;
+                          dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
+                          dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
+                          dd_megalopa_to_settle = dd_megalopa_to_settle,
+                          cv_molt = cv_molt) for _ in 1:n_particles]
+
     # Set initial states at t = 0
     traj_lon[:, 1] = copy(larvae.lon)
     traj_lat[:, 1] = copy(larvae.lat)
@@ -1204,19 +1422,29 @@ function track_larval_cohort(
                 cold_threshold       = mortality_cold_threshold,
                 cold_sensitivity     = mortality_cold_sensitivity
             )
-            # Deterministic survival fraction
-            traj_surv[p, s + 1] = max(0.0, traj_surv[p, s] * exp(-mort_rate * dt_days))
-
-            # Stochastic mortality: if cv_mortality > 0, draw individual mortality rate from
-            # Normal(mort_rate, cv_mortality * mort_rate) and apply Bernoulli death
+            # Mortality. The two modes are mutually exclusive: applying both would double-count,
+            # because the mean-field decay would remove survival that the Bernoulli draw removes
+            # a second time.
             if cv_mortality > 0.0 && current_alive[p]
-                individual_mort_rate = max(0.0, rand(rng, Normal(mort_rate, mort_rate * cv_mortality)))
+                # Stochastic: draw an individual mortality rate from a mean-preserving lognormal
+                # with CV `cv_mortality`, then apply a Bernoulli death. The lognormal is
+                # positive by construction, so unlike the previous `max(0, Normal(μ, cv·μ))` there
+                # is no pile-up of zero-rate individuals, and the `−σ²/2` shift keeps the expected
+                # rate at `mort_rate` so `cv_mortality` controls dispersion only.
+                # `traj_surv` holds its previous value until death, so the recorded survival is an
+                # outcome rather than an expectation.
+                individual_mort_rate = draw_lognormal_mean(mort_rate, cv_mortality, rng)
                 p_survive = exp(-individual_mort_rate * dt_days)
                 if rand(rng) > p_survive
                     current_alive[p] = false
                     cur_stage = :dead
                     traj_surv[p, s + 1] = 0.0
+                else
+                    traj_surv[p, s + 1] = traj_surv[p, s]
                 end
+            else
+                # Mean-field: survival reported as an expected fraction, no independent draws.
+                traj_surv[p, s + 1] = max(0.0, traj_surv[p, s] * exp(-mort_rate * dt_days))
             end
 
             traj_temp[p, s + 1] = cur_T
@@ -1226,11 +1454,7 @@ function track_larval_cohort(
                 new_stage = update_larval_stage(
                     cur_stage,
                     current_degree_days[p],
-                    dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
-                    dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
-                    dd_megalopa_to_settle = dd_megalopa_to_settle,
-                    cv_molt = cv_molt,
-                    rng = rng
+                    thresholds = molt_thresholds[p]
                 )
 
                 if new_stage != cur_stage
@@ -1239,8 +1463,10 @@ function track_larval_cohort(
                 end
 
                 # Settlement evaluation for competent larvae
+                # Competence uses this particle's own megalopa->settle threshold so it stays
+                # consistent with the stage assigned just above.
                 is_competent = (new_stage == :instar1_settled) ||
-                               (cur_stage == :megalopa && current_degree_days[p] >= dd_megalopa_to_settle)
+                               (cur_stage == :megalopa && current_degree_days[p] >= molt_thresholds[p][3])
 
                 if is_competent
                     if competence_onset_step[p] < 0

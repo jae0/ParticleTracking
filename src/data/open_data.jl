@@ -225,12 +225,23 @@ Retrieve real ocean bathymetry from open scientific data repositories
 - Simons, R. A. (2019). ERDDAP: The Environmental Research Division's Data
   Access Program. NOAA CoastWatch / SWFSC.
 """
-function fetch_open_bathymetry(; lon_range::Tuple{Real, Real} = (-68.0, -57.0), lat_range::Tuple{Real, Real} = (42.0, 47.0), output_path::AbstractString = joinpath("inputs", "real_bathymetry.nc"), dataset_id::AbstractString = "etopo180", stride::Int = 1, verbose::Bool = true )
+function fetch_open_bathymetry(; lon_range::Tuple{Real, Real} = (-68.0, -57.0), lat_range::Tuple{Real, Real} = (42.0, 47.0), output_path::AbstractString = joinpath("inputs", "real_bathymetry.nc"), dataset_id::AbstractString = "ETOPO_2022_v1_15s", stride::Int = 1, verbose::Bool = true )
     mkpath(dirname(output_path))
     min_lat, max_lat = lat_range[1], lat_range[2]
     min_lon, max_lon = lon_range[1], lon_range[2]
 
-    primary_url = "https://coastwatch.pfeg.noaa.gov/erddap/griddap/$(dataset_id).nc?altitude[($(min_lat)):$(stride):($(max_lat))][($(min_lon)):$(stride):($(max_lon))]"
+    # Each ERDDAP dataset names its elevation variable differently: ETOPO 2022 uses `z`,
+    # ETOPO 180 and GEBCO/SRTM-derived sets use `altitude`, and srtm30plus uses `elevation`.
+    # Verified against the live catalogue 2026-09-27; `nceiEtopo2022` is a 404 and was the
+    # previous default here.
+    erddap_vars = Dict(
+        "ETOPO_2022_v1_15s" => "z",
+        "etopo180"          => "altitude",
+        "srtm30plus"        => "elevation"
+    )
+    var = get(erddap_vars, dataset_id, "z")
+
+    primary_url = "https://coastwatch.pfeg.noaa.gov/erddap/griddap/$(dataset_id).nc?$(var)[($(min_lat)):$(stride):($(max_lat))][($(min_lon)):$(stride):($(max_lon))]"
     # Backup ArcGIS NCEI global mosaic server export
     backup_url = "https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer/exportImage?bbox=$(min_lon),$(min_lat),$(max_lon),$(max_lat)&bboxSR=4326&imageSR=4326&format=tiff&f=json"
 
@@ -309,13 +320,17 @@ function fetch_etopo2022_bathymetry(;
     min_lon, max_lon = Float64(lon_range[1]), Float64(lon_range[2])
     stride = resolution_arcsec >= 60 ? 4 : 1
 
+    # Verified against the live ERDDAP catalogue 2026-09-27:
+    #   * `nceiEtopo2022` does NOT exist (404). The working ETOPO 2022 id is
+    #     `ETOPO_2022_v1_15s`, and its elevation variable is named `z`, not `altitude`.
+    #   * `etopo180` still exists and is kept as a coarser fallback.
     urls = [
-        # NOAA CoastWatch ERDDAP nceiEtopo2022
-        "https://coastwatch.pfeg.noaa.gov/erddap/griddap/nceiEtopo2022.nc?" *
-        "altitude[($(min_lat)):$(stride):($(max_lat))][($(min_lon)):$(stride):($(max_lon))]",
-        # Fallback to etopo180
+        "https://coastwatch.pfeg.noaa.gov/erddap/griddap/ETOPO_2022_v1_15s.nc?" *
+        "z[($(min_lat)):$(stride):($(max_lat))][($(min_lon)):$(stride):($(max_lon))]",
         "https://coastwatch.pfeg.noaa.gov/erddap/griddap/etopo180.nc?" *
-        "altitude[($(min_lat)):1:($(max_lat))][($(min_lon)):1:($(max_lon))]"
+        "altitude[($(min_lat)):1:($(max_lat))][($(min_lon)):1:($(max_lon))]",
+        "https://coastwatch.pfeg.noaa.gov/erddap/griddap/srtm30plus.nc?" *
+        "elevation[($(min_lat)):1:($(max_lat))][($(min_lon)):1:($(max_lon))]"
     ]
 
     downloaded = false
@@ -1290,6 +1305,7 @@ function fetch_open_woa_climatology(;
     lat_range::Tuple{Real, Real} = (40.0, 48.5),
     month::Int = 0,
     output_dir::AbstractString = "inputs",
+    include_o2::Bool = true,
     verbose::Bool = true
 )
     mkpath(output_dir)
@@ -1329,10 +1345,22 @@ function fetch_open_woa_climatology(;
         "[$(i_lon_lo):1:$(i_lon_hi)]"
     end
 
-    # Build candidate download URLs for T, S, O2, 0.25° primary, 1° fallback
+    # Build candidate download URLs for T, S, O2.
+    #
+    # Verified layout (2026-09-27) on the NCEI static data server, which serves whole files:
+    #   https://www.ncei.noaa.gov/data/oceans/woa/WOA23/DATA/<var>/netcdf/A5B4/0.25/woa23_A5B4_t00_04.nc
+    #   https://www.ncei.noaa.gov/data/oceans/woa/WOA23/DATA/<var>/netcdf/A5B4/1.00/woa23_A5B4_t00_01.nc
+    #
+    # Two corrections against the previous version of this list:
+    #   * The revision tag is `A5B4`, not `A5B7`; no `A5B7` directory exists on the data server.
+    #   * Dissolved oxygen is only published at 1.00 deg and 5.00 deg, under a different
+    #     subtree (`oxygen/netcdf/all/<res>/woa23_all_o00_01.nc`) with an `all_` filename prefix.
+    #
+    # The OPeNDAP (dodsC) entries are tried first because they subset server-side and transfer a
+    # few MB instead of ~1.7 GB, but that service is not always up: NCEI's THREDDS returned
+    # 503 throughout 2026-09-27 while the main www host and the static data server were fine.
+    # The static file URLs are therefore listed as well, and are the reliable fallback.
     function woa_url_candidates(variable_letter, varname)
-        base_fn_25 = "woa23_A5B7_$(variable_letter)$(month_str)_04.nc"
-        base_fn_1  = "woa23_A5B7_$(variable_letter)$(month_str)_01.nc"
         sub_dir = if variable_letter == "t"
             "temperature"
         elseif variable_letter == "s"
@@ -1342,36 +1370,34 @@ function fetch_open_woa_climatology(;
         else
             "nutrients"
         end
-        path_25 = "$(sub_dir)/A5B7/0.25"
-        path_1  = "$(sub_dir)/A5B7/1.00"
-        subset_str = "$(varname)$(opendap_subset(varname))," *
-                     "lon$(opendap_subset("lon")),lat$(opendap_subset("lat"))," *
-                     "depth[0:1:$(i_dep_hi)],time[0:1:0]"
-
-        # Mirror list — tried in order. Each entry is a (base_url, description) pair.
-        mirrors = [
-            # Primary: NOAA NCEI THREDDS (OPeNDAP subset + full file)
-            ("https://www.ncei.noaa.gov/thredds/dodsC/ncei/woa", "NOAA NCEI THREDDS (OPeNDAP)"),
-            # Mirrors: institutional THREDDS catalogs
-            ("https://thredds.ucar.edu/thredds/dodsC/ncei/woa", "UCAR/Unidata THREDDS mirror"),
-            ("https://tds.marine.rutgers.edu/thredds/dodsC/ncei/woa", "Rutgers THREDDS mirror"),
-            ("https://data.nodc.noaa.gov/thredds/dodsC/ncei/woa", "NODC THREDDS mirror"),
-            # AWS S3 Open Data mirror (if available for WOA23)
-            ("https://noaa-woa23.s3.amazonaws.com", "AWS S3 Open Data (WOA23)"),
-            # Direct fileServer (full files only, no subsetting)
-            ("https://www.ncei.noaa.gov/thredds/fileServer/ncei/woa", "NOAA NCEI fileServer"),
-        ]
 
         urls = String[]
-        for (base, desc) in mirrors
-            # OPeNDAP subset URL
-            if occursin("dodsC", base)
-                push!(urls, "$(base)/$(path_25)/$(base_fn_25)?$(subset_str)")
+        if variable_letter in ["o", "O", "A"]
+            # Oxygen: 1.00 deg and 5.00 deg only, different subtree and filename prefix.
+            push!(urls, "https://www.ncei.noaa.gov/data/oceans/woa/WOA23/DATA/oxygen/netcdf/all/1.00/woa23_all_o$(month_str)_01.nc")
+            push!(urls, "https://www.ncei.noaa.gov/data/oceans/woa/WOA23/DATA/oxygen/netcdf/all/5.00/woa23_all_o$(month_str)_05.nc")
+            push!(urls, "https://www.ncei.noaa.gov/thredds/dodsC/ncei/woa/oxygen/netcdf/all/1.00/woa23_all_o$(month_str)_01.nc?$(varname)$(opendap_subset(varname))")
+        else
+            base_fn_25 = "woa23_A5B4_$(variable_letter)$(month_str)_04.nc"
+            base_fn_1  = "woa23_A5B4_$(variable_letter)$(month_str)_01.nc"
+            path_25 = "$(sub_dir)/netcdf/A5B4/0.25"
+            path_1  = "$(sub_dir)/netcdf/A5B4/1.00"
+            static_base = "https://www.ncei.noaa.gov/data/oceans/woa/WOA23/DATA"
+
+            # 1. Static whole-file server: verified working, 0.25 deg then 1.00 deg fallback.
+            push!(urls, "$(static_base)/$(path_25)/$(base_fn_25)")
+            push!(urls, "$(static_base)/$(path_1)/$(base_fn_1)")
+
+            # 2. OPeNDAP subsetting, when the THREDDS service is up. Far smaller transfers.
+            subset_str = "$(varname)$(opendap_subset(varname))," *
+                         "lon$(opendap_subset("lon")),lat$(opendap_subset("lat"))," *
+                         "depth[0:1:$(i_dep_hi)],time[0:1:0]"
+            for thredds in ("https://www.ncei.noaa.gov/thredds/dodsC/ncei/woa",
+                            "https://thredds.ucar.edu/thredds/dodsC/ncei/woa",
+                            "https://tds.marine.rutgers.edu/thredds/dodsC/ncei/woa",
+                            "https://data.nodc.noaa.gov/thredds/dodsC/ncei/woa")
+                push!(urls, "$(thredds)/$(path_25)/$(base_fn_25)?$(subset_str)")
             end
-            # Full 0.25° file
-            push!(urls, "$(base)/$(path_25)/$(base_fn_25)")
-            # 1° fallback
-            push!(urls, "$(base)/$(path_1)/$(base_fn_1)")
         end
         urls
     end
@@ -1383,8 +1409,9 @@ function fetch_open_woa_climatology(;
     for (variable_letter, varname, out_path) in [
         ("t", "t_an", t_file),
         ("s", "s_an", s_file),
-        ("o", "o_an", o_file)
+        (include_o2 ? ("o", "o_an", o_file) : nothing)
     ]
+        isnothing(variable_letter) && continue
         if isfile(out_path) && filesize(out_path) > 1024
             verbose && println("WOA23: using cached file $(out_path)")
             continue
@@ -1407,6 +1434,70 @@ function fetch_open_woa_climatology(;
         end
     end
 
+    # Resolve a lon/lat bounding box to a half-open index window on an axis, padded by one
+    # node on each side so the trilinear interpolator always has a bracketing pair. Falls back
+    # to the whole axis if the request does not overlap, rather than producing an empty range.
+    function _woa_window(woa_lon, woa_lat, lon_range, lat_range)
+        function window(axis, lo, hi)
+            hits = findfirst(i -> axis[i] >= lo, 1:length(axis))
+            islast = findlast(i -> axis[i] <= hi, 1:length(axis))
+            (isnothing(hits) || isnothing(islast) || hits > islast) && return (1, length(axis))
+            a = max(1, hits - 1)
+            b = min(length(axis), islast + 1)
+            # Guarantee at least two nodes so the interpolator can form an interval.
+            b = min(length(axis), max(b, a + 1))
+            (a, b)
+        end
+        i1, i2 = window(woa_lon, Float64(lon_range[1]), Float64(lon_range[2]))
+        j1, j2 = window(woa_lat, Float64(lat_range[1]), Float64(lat_range[2]))
+        return (i1, i2, j1, j2)
+    end
+
+    # Fill masked (NaN) cells in a `(lon, lat, depth)` array, in place.
+    #
+    # Stage 1 handles gaps inside a water column by linear interpolation between the bracketing
+    # valid depths, carrying the nearest valid value down past the deepest gap. Stage 2 handles
+    # columns that are masked over their entire depth range with the mean of all valid values
+    # in the window. Returns `(n_interior_gaps_filled, n_empty_columns)`.
+    function _repair_woa_field!(field_3d)
+        n_lon, n_lat, n_dep = size(field_3d)
+        n_gap = 0
+        n_empty = 0
+
+        for j in 1:n_lat, i in 1:n_lon
+            valid = findall(k -> !isnan(field_3d[i, j, k]), 1:n_dep)
+            isempty(valid) && (n_empty += 1; continue)
+
+            first_v, last_v = first(valid), last(valid)
+            for k in 1:n_dep
+                isnan(field_3d[i, j, k]) || continue
+                if k < first_v
+                    field_3d[i, j, k] = field_3d[i, j, first_v]      # above the first valid level
+                elseif k > last_v
+                    field_3d[i, j, k] = field_3d[i, j, last_v]      # below the seabed: hold bottom water
+                else
+                    lo = last(valid[kk] for kk in eachindex(valid) if valid[kk] < k)
+                    hi = first(valid[kk] for kk in eachindex(valid) if valid[kk] > k)
+                    w = (k - lo) / (hi - lo)
+                    field_3d[i, j, k] =
+                        field_3d[i, j, lo] * (1 - w) + field_3d[i, j, hi] * w
+                end
+                n_gap += 1
+            end
+        end
+
+        if n_empty > 0
+            good = filter(!isnan, field_3d)
+            fill_value = isempty(good) ? 0.0 : sum(good) / length(good)
+            for j in 1:n_lat, i in 1:n_lon
+                all(!isnan, @view field_3d[i, j, :]) && continue
+                field_3d[i, j, :] .= fill_value
+            end
+        end
+
+        return (n_gap, n_empty)
+    end
+
     # Build trilinear (lon, lat, z) interpolating closures from the downloaded files.
     # Depths in WOA23 are positive-downward; we convert to negative-upward here.
     function make_woa_interpolator(filepath, varname, fallback_val)
@@ -1419,6 +1510,10 @@ function fetch_open_woa_climatology(;
             end
         end
 
+        # Read only the requested lon/lat window. The WOA23 0.25 deg files are global
+        # (1440 x 720 x 102, ~850 MB as Float64 per variable); a shelf-scale domain is a few
+        # percent of that, so reading everything would dominate peak memory for no benefit.
+        # The full depth axis is kept so no profile is ever truncated.
         woa_lon, woa_lat, woa_dep, field_3d = NCDatasets.Dataset(filepath, "r") do ds
             lname  = findfirst(n -> haskey(ds, n), ["lon", "longitude", "x"]) |>
                      (idx -> isnothing(idx) ? "lon" : ["lon", "longitude", "x"][idx])
@@ -1429,15 +1524,20 @@ function fetch_open_woa_climatology(;
             vname  = haskey(ds, varname) ? varname :
                      first(filter(k -> !in(k, [lname, laname, dname, "time", "crs"]),
                                   keys(ds)))
-            raw = ds[vname][:, :, :, 1]
+            # Coordinate axes are small (1440 / 720 nodes), so read them in full to resolve
+            # the window, then read only the data slab we actually need.
             lons = collect(Float64, ds[lname][:])
             lats = collect(Float64, ds[laname][:])
             deps = collect(Float64, ds[dname][:])
+            i1, i2, j1, j2 = _woa_window(lons, lats, lon_range, lat_range)
+            raw = ds[vname][i1:i2, j1:j2, :, 1]
             deps_neg = -abs.(deps)
-            def_num = fallback_val isa Function ? 0.0 : Float64(fallback_val)
-            field = Array{Float64}(coalesce.(raw, def_num))
-            replace!(field, NaN => def_num)
-            lons, lats, deps_neg, field
+            # Masked cells become NaN, never 0.0. WOA masks land and the volume below the
+            # seabed; a 0.0 fill is not "absent", it is a physical claim (0 K, 0 PSU) that
+            # corrupts the equation of state. NaN is repaired further down, where the reason
+            # for the gap is known.
+            field = Array{Float64}(coalesce.(raw, NaN))
+            lons[i1:i2], lats[j1:j2], deps_neg, field
         end
 
         if !issorted(woa_lon)
@@ -1451,6 +1551,24 @@ function fetch_open_woa_climatology(;
         end
 
         n_lon, n_lat, n_dep = size(field_3d)
+
+        # Repair masked cells in two stages, because the two reasons a cell is masked want
+        # different fixes:
+        #
+        #  1. Gaps *within* a water column (WOA masks the volume below the seabed) are filled
+        #     by linear interpolation between the bracketing valid depths, or by carrying the
+        #     nearest valid value down. This is the case that matters: below the seabed the
+        #     bottom water is a far better estimate than any global mean, and a 0.0 fill here
+        #     is what produced the S = 0 hazard.
+        #  2. Columns with no valid value at all (land) fall back to the mean of the valid
+        #     values in the requested window. These should not be sampled by the model, whose
+        #     water column is built from bathymetry, but a defined value beats a NaN leaking
+        #     into the dynamics. The count is reported so it is never silently invisible.
+        n_gap, n_landcol = _repair_woa_field!(field_3d)
+        if verbose && (n_gap > 0 || n_landcol > 0)
+            println("WOA23: repaired $(n_gap) masked level(s) by vertical interpolation " *
+                    "and filled $(n_landcol) fully-masked column(s) from the window mean.")
+        end
 
         function woa_interp(lon, lat, z)
             i_raw = searchsortedlast(woa_lon, Float64(lon))

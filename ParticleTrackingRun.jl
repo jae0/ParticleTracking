@@ -1139,6 +1139,15 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         tidal_u_amplitudes = Dict(:M2 => opts.tidal_u_amp, :S2 => 0.44 * opts.tidal_u_amp),
         tidal_v_amplitudes = Dict(:M2 => opts.tidal_v_amp, :S2 => 0.42 * opts.tidal_v_amp),
         enable_molting = opts.enable_molting,
+        # Stochasticity controls. These must be passed explicitly: `track_larval_cohort` defaults
+        # all three coefficients of variation to 0.0, i.e. a fully deterministic cohort. Loading
+        # them into `opts` and writing them to `resolved_config.toml` is not enough on its own --
+        # if they are not forwarded here the provenance file records a stochastic model that the
+        # run never actually used.
+        cv_molt = opts.cv_molt,
+        cv_mortality = opts.cv_mortality,
+        cv_settlement = opts.cv_settlement,
+        settlement_stochastic = opts.settlement_stochastic,
         enable_bbl = true,
         enable_sinking = true,
         enable_initial_ascent = opts.enable_initial_ascent,
@@ -1811,6 +1820,13 @@ function run_segment_visualize(;
             velocity_fn = flow_ssp585,
             total_duration = opts.track_duration,
             dt = opts.track_dt,
+            # Same biology as the primary cohort, so the cross-scenario comparison is not
+            # confounded by one branch running deterministic biology and the other stochastic.
+            enable_molting = opts.enable_molting,
+            cv_molt = opts.cv_molt,
+            cv_mortality = opts.cv_mortality,
+            cv_settlement = opts.cv_settlement,
+            settlement_stochastic = opts.settlement_stochastic,
             rng = rng_comp
         )
         scenario_comp[:ssp585_2050] = trajs_ssp585

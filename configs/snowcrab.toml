@@ -212,6 +212,22 @@ ascent_speed = 0.010                # Ascent swimming speed (~10 mm/s)
 ascent_target_depth = -10.0         # Target epipelagic depth for ascent completion (m)
 buffer_km = 50.0                    # Spatial seeding buffer beyond boundaries (km)
 
+# Stochasticity controls. Set any to 0.0 for deterministic (mean-field) behaviour:
+#   cv_molt       per-particle degree-day molt-threshold spread
+#   cv_mortality  per-particle mortality-rate spread
+#   cv_settlement spread on the habitat-suitability index (HSI)
+#   settlement_stochastic  draw settlement probabilistically rather than on HSI alone
+#
+# 0.25 is a placeholder, not a fitted value. Sainte-Marie & Sainte-Marie (1999)
+# report real spread in stage durations for C. opilio; calibrate these against that
+# (and field observations) before treating downstream recruitment numbers as
+# quantitative. Forwarded to track_larval_cohort by the driver and recorded in
+# resolved_config.toml.
+cv_molt = 0.25
+cv_mortality = 0.25
+cv_settlement = 0.25
+settlement_stochastic = true
+
 [dvm]
 # Diel Vertical Migration (DVM) parameters for snow crab larvae
 # Stage-specific day/night depths based on field observations (Sainte-Marie et al., Kuhn & Choi 2011)
