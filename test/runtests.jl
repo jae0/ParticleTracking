@@ -1251,22 +1251,22 @@ using ParticleTracking
         #    options <-> config round-trip, are each driven from one table so the same
         #    fields are checked through all three representations without repetition.
         opts_default = HydrodynamicOptions()
-        defaults = [(:animate_hydro, false), (:anim_variable, :dashboard), (:anim_fps, 10),
-                    (:anim_format, "mp4"), (:anim_depth, -2.5), (:anim_output_path, "")]
-        @test all(getproperty(opts_default, f) == v for (f, v) in defaults)
+        defaults = (; animate_hydro = false, anim_variable = :dashboard, anim_fps = 10,
+                    anim_format = "mp4", anim_depth = -2.5, anim_output_path = "")
+        @test all(getproperty(opts_default, f) == v for (f, v) in pairs(defaults))
 
-        custom = [(:animate_hydro, true), (:anim_variable, :speed), (:anim_fps, 15),
-                  (:anim_format, "gif"), (:anim_depth, -10.0), (:anim_overlay_particles, true),
-                  (:anim_output_path, "outputs/custom_speed.gif")]
-        opts_custom = HydrodynamicOptions(custom...)
-        @test all(getproperty(opts_custom, f) == v for (f, v) in custom)
+        custom = (; animate_hydro = true, anim_variable = :speed, anim_fps = 15,
+                  anim_format = "gif", anim_depth = -10.0, anim_overlay_particles = true,
+                  anim_output_path = "outputs/custom_speed.gif")
+        opts_custom = HydrodynamicOptions(; custom...)
+        @test all(getproperty(opts_custom, f) == v for (f, v) in pairs(custom))
 
         cfg_dict = options_to_configuration(opts_custom)
         @test all(cfg_dict["visualization"][k] == v for (k, v) in
             ("animate_hydro" => true, "anim_variable" => "speed", "anim_fps" => 15,
              "anim_output_path" => "outputs/custom_speed.gif"))
         opts_restored = configuration_to_options(cfg_dict)
-        @test all(getproperty(opts_restored, f) == v for (f, v) in custom)
+        @test all(getproperty(opts_restored, f) == v for (f, v) in pairs(custom))
 
         # 2 & 3. Field and dashboard animation generation (GIF rendering)
         anim_cases = [

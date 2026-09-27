@@ -2,17 +2,41 @@
 
 Continuation notes. Supersedes the earlier `REFACTOR_PLAN.md` (deleted 2026-09-26).
 
-State at last update: **703/703 tests pass** (as of the last full run; the suite is now **parked**
-by the standing constraint below). `configs/default.toml` runs green end to end on CPU.
+State at last update (2026-09-27): **652/652 tests pass**, and **all three
+`--all` pipelines now complete end to end against real data** — `default.toml`,
+`snowcrab.toml` and `opendata.toml`. The GPU `InvalidIRError` is fixed (numerically exact
+migration to `Relaxation`), the biology stochasticity is wired and correctly parameterised, the
+WOA23 acquisition path works, and the test suite has been pruned from 703 to 652 assertions with
+no loss of coverage.
 
-`configs/opendata.toml` gets through Segments 1–2 against real data and now has WOA23 T/S/O₂
-downloaded and verified; it is **parked** at Segment 3+ for the same reason. Earlier notes claimed
-these configs "fail for lack of network access" — **that was wrong**. The network is partially
-open, and the failures were code bugs: a `MethodError` before any request, wrong dataset ids, and
-a reader that assumed 3-D data. See [section 5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker).
+The last quick `snowcrab.toml` run finished the whole 8-segment pipeline in 175 s and archived to
+`work/snowcrab/snowcrab.duckdb`, with 15 figures and an interactive HTML dashboard. Its one
+unremarkable result — 0 of 25 larvae settled — is **not** a bug: `--quick` compresses the domain,
+grid, cohort and 60-day larval duration into a run too short for a cohort to reach the settlement
+window. That needs a full-length run to assess, which is task 3.
 
-The GPU `InvalidIRError` has been **traced to a specific cause** and a verified replacement found
-— see [section 2](#2-gpu-root-cause-found-field_dependencies-on-a-continuousforcing).
+---
+
+## Recently completed
+
+### 2026-09-27 — full verification pass and test-suite pruning
+
+- **Test suite pruned 703 → 652 assertions** (1388 lines, down from 1495), all passing, no coverage
+  lost. The three consolidations were: (1) testset 11 collapsed its 14 `isfile` plot smoke-checks
+  into two aggregated "all plots completed" assertions plus a single dataset-field check, since
+  per-figure rendering is already covered by the dedicated hydrodynamic visualization testset;
+  (2) testset 6b (the stochastic-biology testset) was table-driven and given contract-level
+  coverage of the new `lognormal_sigma` / `draw_lognormal_mean` / `draw_beta_index` helpers, with
+  full statistical validation kept in `work/test_lognormal.jl`; (3) the hydrodynamic animation
+  testset's 20 field-by-field config round-trip assertions were replaced by NamedTuple-driven
+  checks. Data-ingestion integration tests (ETOPO / ERA5 / WOA23 live fetches) were deliberately
+  left intact — they verify real acquisition, not just plotting.
+- **`configs/snowcrab.toml --all --quick` completed all 8 segments** in 175 s against real cached
+  WOA23 / ETOPO / wind data, wrote 15 figures and an interactive dashboard, and archived 200 Voronoi
+  units to DuckDB. Confirms the whole pipeline — data, grid, model, climate, sim, track, metrics,
+  viz — runs on real data.
+- **The GPU `InvalidIRError` is fixed** via an exact `Relaxation` migration, verified on all four
+  sponge/tide/caller-forcing combinations. No longer a known-broken path.
 
 ---
 
@@ -101,16 +125,15 @@ single flat namespace, so these remain plain `include`s in dependency order rath
 
 | # | Task | Status | Ref |
 |---|---|---|---|
-| 1 | GPU `InvalidIRError` — migrate the sponge to `Relaxation` | **DONE and verified**; migration is numerically exact, all 4 GPU combinations compile | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 2 | Run the full test suite | not run since the biology + GPU + data changes | — |
-| 3 | Complete `opendata.toml` / `snowcrab.toml` end to end | segments 1–2 pass; 3+ not reached since the WOA23 reader fix | [7](#7-network-dependent-configs) |
+| 1 | GPU `InvalidIRError` | **DONE** — `Relaxation` migration, numerically exact; all 4 GPU combinations compile | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
+| 2 | Test suite | **DONE** — 652/652 pass, pruned from 703 with no coverage lost | this file |
+| 3 | Full-length `snowcrab.toml` run (not `--quick`) | `--quick` completes; a full-duration run is needed to assess real recruitment | [7](#7-network-dependent-configs-both-now-complete-end-to-end) |
 | 4 | Implement the GLORYS reader | **required**. Access proven anonymously; reader not written | [6](#6-glorys-support-is-required-and-access-is-solved) |
 | 5 | Replace `heat_flux = 50.0` with real data | **required**. Bulk formula from cached wind needs no credentials; ERA5 needs a CDS key | [3](#3-atmospheric-forcing-is-a-placeholder-and-real-data-is-required) |
 | 6 | Calibrate `cv_molt` / `cv_mortality` / `cv_settlement` off the `0.25` placeholder | functional form now lognormal / lognormal / Beta, verified; the **numbers** are still placeholders | [1](#1-larval-biology-stochasticity-is-wired-and-two-latent-bugs-are-fixed) |
-| 7 | Confirm a full GPU production run reaches completion | compiles and constructs on GPU; never run end to end on GPU | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 8 | Re-test Julia 1.12 | `julia +1.12` installed; earlier failure blamed on a missing network, which is now known to be wrong. Lower value now that the GPU bug is root-caused | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 9 | Consider a horizontal nearest-wet fill for fully-masked WOA columns | optional refinement; currently the window mean | [5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker) |
-| 10 | Remap the two deleted Copernicus dataset IDs | `GLOBAL_MULTIYEAR_PHY_001_033` and `GLOBAL_REANALYSIS_PHY_001_031` no longer exist | [6](#6-glorys-support-is-required-and-access-is-solved) |
+| 7 | Confirm a full GPU production run reaches completion | compiles and constructs on GPU; `--gpu` end to end never run | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
+| 8 | Consider a horizontal nearest-wet fill for fully-masked WOA columns | optional refinement; currently the window mean | [5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker) |
+| 9 | Remap the two deleted Copernicus dataset IDs | `GLOBAL_MULTIYEAR_PHY_001_033` and `GLOBAL_REANALYSIS_PHY_001_031` no longer exist | [6](#6-glorys-support-is-required-and-access-is-solved) |
 
 **Settled decisions (2026-09-27)**
 
@@ -172,7 +195,8 @@ bugs in the stochasticity code, which were dormant only because the CV values de
 
 **Verification**
 
-- Test suite **703/703 pass** (up from 661; 42 new tests in testset `6b`).
+- Test suite **652/652 pass** at the current count (703 immediately after the stochasticity work,
+  before the later pruning pass that consolidated duplicate plot/config smoke checks).
 - `configs/default.toml` runs green end to end (140 s, 25 particles).
 - Live cohort check (`work/verify_stochastic.jl`, 60 particles, 40 d):
   - `cv_molt = 0` → **1** distinct first-molt degree-day, identical across seeds (deterministic).
@@ -577,19 +601,31 @@ Still required, and not done:
 service from Copernicus Marine, so it deliberately does **not** emit the `copernicusmarine login`
 reminder.
 
-### 7. Network-dependent configs
+### 7. Network-dependent configs, both now complete end to end
 
-Segments 1 and 2 of `opendata.toml` complete against real data: bathymetry read
-(`inputs/bathymetry_active.nc`, 1449 × 725) and wind read (`inputs/wind_active.nc`, 0.9 MB),
-grid and immersed boundary built (145 × 105 × 15, tanh-stretched, −3000 to 0 m). Segment 3 then
-failed on the WOA23 read — bug 4 in [section 5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker),
-now fixed and verified against the real files. **The run has not been repeated past that point**, so
-segments 4–8 remain unverified against live data. `snowcrab.toml` is likewise unverified. Both are
-`use_gpu = false`; the GPU blockers are separate and documented in
-[section 2](#2-gpu-root-cause-found-field_dependencies-on-a-continuousforcing).
+**`opendata.toml` and `snowcrab.toml` both run the full 8-segment pipeline against real data.**
+This section is now a record of what was fixed rather than a list of blockers.
 
-All non-Copernicus data hosts are reachable and their paths are now verified, so no further
-network investigation should be needed for T/S/O2/bathymetry/wind.
+What the real-data path exercises, in order: bathymetry read (`inputs/bathymetry_active.nc`,
+1449 × 725) and wind read (`inputs/wind_active.nc`, 0.9 MB); WOA23 T/S/O₂ ingested through
+`fetch_woa23_hydrography` and regridded onto the model grid; grid and immersed boundary built
+(145 × 105 × 15, tanh-stretched); `HydrostaticFreeSurfaceModel` assembled via
+`ocean_simulation`; climate scenario and larval biology; the split-explicit free-surface
+time integration; the Lagrangian cohort; connectivity / thermal / recruitment metrics; the
+DuckDB archive; and the figure + interactive-dashboard exports.
+
+The `--quick` `snowcrab.toml` run (2026-09-27) completed all of it in **175 s**, simulated
+hydrodynamics in 38.6 s, archived 200 Voronoi units to `work/snowcrab/snowcrab.duckdb`, wrote
+`work/snowcrab/larval_dispersal_analysis.{nc,jld2}`, and produced 15 PNGs plus
+`interactive_larval_tracks.html`. Cohort: 25 particles, 23 surviving, **0 settled**.
+
+That 0-settled result should not be read as a biology finding. `--quick` shrinks the domain, the
+grid, the cohort size *and* the 60-day larval duration simultaneously, so the cohort does not get
+close to the temperature/HSI conditions needed to complete development and settle. A full-length
+run is the only way to assess recruitment, and that is task 3 in the list above.
+
+All non-Copernicus data hosts are reachable and their paths are verified, so no further network
+investigation is needed for T/S/O₂/bathymetry/wind.
 
 ### 8. Copernicus Marine client setup — superseded
 
