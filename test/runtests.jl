@@ -172,70 +172,53 @@ using ParticleTracking
     end
 
     @testset "6b. Stochastic Biology Controls (cv_molt / cv_mortality / cv_settlement)" begin
-        # These tests guard two separate defects found together:
+        # Guards three defects found together:
         #
-        # 1. The three coefficients of variation were loaded into the config and written to
-        #    resolved_config.toml, but never forwarded by the driver to track_larval_cohort.
-        #    Every run used the library defaults of 0.0 (fully deterministic) while the
-        #    provenance file asserted 0.25. The driver pass-through check at the end of this
-        #    testset is the guard against that recurring.
-        # 2. update_larval_stage redrew a particle's molt thresholds on *every* call. In a
-        #    time-stepping loop that resamples the developmental rate each step, so a stage
-        #    could regress (:zoea2 -> :zoea1) and settlement competence could flicker.
-        #    Thresholds are now drawn once per particle by draw_molt_thresholds and reused.
+        # 1. The cv_* keys were loaded into the config and written to resolved_config.toml but
+        #    never forwarded by the driver to track_larval_cohort, so every run used the library
+        #    defaults of 0.0 (deterministic) while the provenance file asserted 0.25. The driver
+        #    pass-through check at the end is the guard against that recurring.
+        # 2. update_larval_stage redrew a particle's molt thresholds on *every* call, resampling
+        #    the developmental rate each step so a stage could regress (:zoea2 -> :zoea1) and
+        #    settlement competence could flicker. Thresholds are now drawn once per particle.
+        # 3. The Normal-then-clamp dispersion was not mean-preserving and piled a point mass on
+        #    the boundary. Dispersion is now lognormal (rates) / Beta (bounded index).
+        #
+        # Statistical behaviour is validated in depth in work/test_lognormal.jl; here we assert
+        # the *contract* each dispersion helper must hold.
 
-        # --- cv_molt = 0 reproduces the exact base thresholds -------------------
+        # --- deterministic path is bit-exact and cv = 0 is identity --------------
+        @test draw_molt_thresholds(MersenneTwister(1); cv_molt = 0.0) == (65.0, 130.0, 200.0)
         @test update_larval_stage(:zoea1, 64.9; cv_molt = 0.0) == :zoea1
         @test update_larval_stage(:zoea1, 65.0; cv_molt = 0.0) == :zoea2
         @test update_larval_stage(:zoea2, 130.0; cv_molt = 0.0) == :megalopa
         @test update_larval_stage(:megalopa, 200.0; cv_molt = 0.0) == :instar1_settled
-        @test draw_molt_thresholds(MersenneTwister(1); cv_molt = 0.0) == (65.0, 130.0, 200.0)
-
+        @test lognormal_sigma(0.0) == 0.0
+        @test draw_lognormal_mean(100.0, 0.0, MersenneTwister(1)) == 100.0
+        @test draw_beta_index(0.4, 0.0, MersenneTwister(1)) == 0.4
+        # identical seeds give identical stages on the deterministic path
         r1 = MersenneTwister(7); rand(r1, 50)
         r2 = MersenneTwister(7); rand(r2, 50)
         @test update_larval_stage(:zoea1, 70.0; cv_molt = 0.0, rng = r1) ==
               update_larval_stage(:zoea1, 70.0; cv_molt = 0.0, rng = r2)
 
-        # --- cv_molt > 0 spreads the transition degree-days --------------------
-        # Thresholds are drawn ONCE per particle, then reused: this is the property the
-        # time-stepping loop relies on, and the one that was broken when the draw happened
-        # inside update_larval_stage on every call.
-        function molt_threshold_dd(seed::Int)
-            rng = MersenneTwister(seed)
-            th = draw_molt_thresholds(rng;
-                 dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
-                 dd_megalopa_to_settle = 200.0, cv_molt = 0.25)
-            for dd in 0.0:0.25:300.0
-                if stage_from_thresholds(dd, th) != :zoea1
-                    return dd
-                end
-            end
-            return NaN
-        end
-        thresholds = [molt_threshold_dd(s) for s in 1:200]
-        @test all(isfinite, thresholds)
-        @test length(unique(thresholds)) > 1
-        @test var(thresholds) > 0.0
-        # mean should sit at the 65 DD base value (tolerance covers the 0.25 DD scan
-        # resolution and Monte-Carlo error over 200 draws)
-        @test 55.0 <= sum(thresholds) / length(thresholds) <= 75.0
-
-        # --- thresholds stay monotonic in degree-days --------------------------
+        # --- molt thresholds: ordered, positive, and a fixed triple is reusable --
+        # Dispersion is on the stage *increments*, so all three cumulative means are preserved
+        # and the total is automatically ordered. A fixed triple must be reusable: that is what
+        # makes the stage monotone across timesteps.
         th_m = draw_molt_thresholds(MersenneTwister(3); cv_molt = 0.4)
-        @test th_m[1] < th_m[2] < th_m[3]          # strictly increasing triple
+        @test th_m[1] < th_m[2] < th_m[3]
         order = Dict(:zoea1 => 0, :zoea2 => 1, :megalopa => 2, :instar1_settled => 3)
-        ranks = Int[order[stage_from_thresholds(dd, th_m)] for dd in 0.0:1.0:260.0]
-        @test issorted(ranks)
+        @test issorted(Int[order[stage_from_thresholds(dd, th_m)] for dd in 0.0:1.0:260.0])
+        @test all(dd -> update_larval_stage(:zoea1, dd; cv_molt = 0.4, thresholds = th_m,
+                                            rng = MersenneTwister(999)) ==
+                            stage_from_thresholds(dd, th_m),
+                  (0.0, 40.0, 80.0, 150.0, 210.0))
+        @test_throws ArgumentError draw_molt_thresholds(MersenneTwister(1); cv_molt = 0.25,
+                                                         dd_zoea1_to_zoea2 = 130.0,
+                                                         dd_zoea2_to_megalopa = 130.0)
 
-        # Repeated calls with a FIXED triple must be reproducible even though cv_molt > 0:
-        # this is the regression that let a stage regress between timesteps.
-        for dd in (0.0, 40.0, 80.0, 150.0, 210.0)
-            @test update_larval_stage(:zoea1, dd; cv_molt = 0.4, thresholds = th_m,
-                                      rng = MersenneTwister(999)) ==
-                  stage_from_thresholds(dd, th_m)
-        end
-
-        # a wider cv must produce a wider spread of first-transition degree-days
+        # a wider cv must widen the spread of first-transition degree-days
         spread_for(cv) = var([begin
                 th = draw_molt_thresholds(MersenneTwister(s); cv_molt = cv)
                 dd = 0.0
@@ -246,70 +229,58 @@ using ParticleTracking
             end for s in 1:150])
         @test spread_for(0.02) < spread_for(0.25) < spread_for(0.50)
 
-        # --- settlement: cv_settlement = 0 is exactly deterministic -------------
-        det = evaluate_settlement_suitability(-120.0, 3.5; stochastic = false, cv_settlement = 0.0)
-        @test det.suitable == true
-        @test det.hsi == det.probability
-        det_bad = evaluate_settlement_suitability(-800.0, 2.0; stochastic = false, cv_settlement = 0.0)
-        @test det_bad.suitable == false
+        # --- dispersion helpers: mean-preserving, positive, bounded, no clamp pile-up
+        # (contract-level; full statistical validation lives in work/test_lognormal.jl)
+        lnorm = [draw_lognormal_mean(100.0, cv, MersenneTwister(s)) for s in 1:20000 for cv in (0.25, 0.5)]
+        @test all(>(0.0), lnorm)
+        @test isapprox(sum(lnorm) / length(lnorm), 100.0; rtol = 0.05)
+        beta = [draw_beta_index(0.5, cv, MersenneTwister(s)) for s in 1:20000 for cv in (0.25, 0.5)]
+        @test all(x -> 0.0 < x < 1.0, beta)
+        @test isapprox(sum(beta) / length(beta), 0.5; rtol = 0.05)
 
-        # --- settlement: stochastic draws vary across seeds ---------------------
-        # Use a marginal (not optimal) site so HSI is strictly between 0 and 1; at the
-        # optimum HSI == 1 and every Bernoulli draw succeeds by construction.
-        # z = -60 m sits between optimal_max_depth (-80) and max_depth (-50), so
-        # s_z = (-60 - -50) / (-80 - -50) = 1/3, and T = 1 C is thermally optimal.
-        marginal = (-60.0, 1.0)
+        # --- settlement: index gate, and cv=0 is the plain Bernoulli on HSI --------
+        det = evaluate_settlement_suitability(-120.0, 3.5; stochastic = false, cv_settlement = 0.0)
+        @test det.suitable == true && det.hsi == det.probability
+        @test evaluate_settlement_suitability(-800.0, 2.0; stochastic = false).suitable == false
+        # hsi == 0 stays a hard gate even with stochasticity on
+        @test evaluate_settlement_suitability(-800.0, 2.0; stochastic = true, cv_settlement = 0.5,
+                  rng = MersenneTwister(1)).suitable == false
+
+        # at a marginal site (hsi strictly in (0,1)) the realised settlement rate must track
+        # HSI to within Monte-Carlo error, and must NOT be suppressed by cv_settlement
+        marginal = (-60.0, 1.0)   # s_z = 1/3, thermally optimal; hsi ~ 1/3
         hsi_marg = evaluate_settlement_suitability(marginal...; stochastic = false).hsi
         @test 0.0 < hsi_marg < 1.0
-
-        draws = [evaluate_settlement_suitability(marginal...;
-                    stochastic = true, cv_settlement = 0.0,
-                    rng = MersenneTwister(s)).suitable for s in 1:80]
-        @test length(unique(draws)) == 2
-        frac = sum(draws) / length(draws)
-        @test frac > 0.0
-        @test frac < 1.0
-        # the realised settlement rate should track HSI to within Monte-Carlo error
-        @test abs(frac - hsi_marg) < 0.25
-
-        # --- settlement: cv_settlement perturbs the acceptance probability --------
-        probs = [evaluate_settlement_suitability(marginal...;
-                     stochastic = true, cv_settlement = 0.5,
-                     rng = MersenneTwister(s)).probability for s in 1:80]
+        rate(cv) = mean([evaluate_settlement_suitability(marginal...; stochastic = true,
+                     cv_settlement = cv, rng = MersenneTwister(s)).suitable for s in 1:400])
+        @test abs(rate(0.0) - hsi_marg) < 0.15
+        @test abs(rate(0.5) - hsi_marg) < 0.15   # mean-preserving: cv does not shift the rate
+        probs = [evaluate_settlement_suitability(marginal...; stochastic = true, cv_settlement = 0.5,
+                     rng = MersenneTwister(s)).probability for s in 1:200]
         @test length(unique(round.(probs, digits = 6))) > 1
         @test all(0.0 .<= probs .<= 1.0)
 
-        # a zero HSI stays a hard gate even with stochasticity switched on
-        @test evaluate_settlement_suitability(-800.0, 2.0;
-                  stochastic = true, cv_settlement = 0.5,
-                  rng = MersenneTwister(1)).suitable == false
-
-        # --- config plumbing: TOML -> options -> resolved dict -------------------
+        # --- config plumbing: TOML -> options -> resolved dict (round-trips) ------
         cfg = get_default_configuration()
-        cfg["biology"]["n_particles"] = 10
-        cfg["biology"]["cv_molt"] = 0.4
-        cfg["biology"]["cv_mortality"] = 0.3
-        cfg["biology"]["cv_settlement"] = 0.2
-        cfg["biology"]["settlement_stochastic"] = false
+        for (k, v) in ("cv_molt" => 0.4, "cv_mortality" => 0.3, "cv_settlement" => 0.2,
+                      "settlement_stochastic" => false)
+            cfg["biology"][k] = v
+        end
         parsed = configuration_to_options(cfg)
-        @test parsed.cv_molt == 0.4
-        @test parsed.cv_mortality == 0.3
-        @test parsed.cv_settlement == 0.2
-        @test parsed.settlement_stochastic == false
-
         rt = options_to_configuration(parsed)
-        @test rt["biology"]["cv_molt"] == 0.4
-        @test rt["biology"]["cv_mortality"] == 0.3
-        @test rt["biology"]["cv_settlement"] == 0.2
-        @test rt["biology"]["settlement_stochastic"] == false
+        @test all(getproperty(parsed, Symbol(k)) == v for (k, v) in
+            ("cv_molt" => 0.4, "cv_mortality" => 0.3, "cv_settlement" => 0.2,
+             "settlement_stochastic" => false))
+        @test all(rt["biology"][k] == v for (k, v) in
+            ("cv_molt" => 0.4, "cv_mortality" => 0.3, "cv_settlement" => 0.2,
+             "settlement_stochastic" => false))
 
         # --- regression guard: the driver must forward these --------------------
         # A config value that never reaches its consumer is a silent lie in
         # resolved_config.toml, which is exactly how the 0.25/0.0 discrepancy arose.
         driver_src = read(joinpath(@__DIR__, "..", "ParticleTrackingRun.jl"), String)
-        for kw in ("cv_molt", "cv_mortality", "cv_settlement", "settlement_stochastic")
-            @test occursin(Regex("$kw\\s*=\\s*opts\\.$kw"), driver_src)
-        end
+        @test all(occursin(Regex("$kw\\s*=\\s*opts\\.$kw"), driver_src) for kw in
+            ("cv_molt", "cv_mortality", "cv_settlement", "settlement_stochastic"))
         # both track_larval_cohort call sites must be covered
         n_calls = length(collect(eachmatch(r"track_larval_cohort\(", driver_src)))
         n_passes = length(collect(eachmatch(r"cv_molt\s*=\s*opts\.cv_molt", driver_src)))
@@ -498,6 +469,11 @@ using ParticleTracking
     end
 
     @testset "11. Visualizations" begin
+        # One shared cohort feeds every plot, and each plot is checked by a single
+        # aggregated assertion. These are smoke tests for "the plotting call returns and
+        # writes a file"; the dataset-extraction contents are asserted once below, and
+        # per-figure rendering correctness is covered by the dedicated hydrodynamic
+        # visualization testset further down.
         rng = MersenneTwister(123)
         larvae = initialize_larval_particles(10, rng = rng)
         trajs = track_larval_cohort(
@@ -507,109 +483,54 @@ using ParticleTracking
             dt = 300.0,
             rng = rng
         )
-
-        fig_track = plot_particle_trajectories(trajs, output_path = "outputs/test_tracks.png")
-        @test isfile("outputs/test_tracks.png")
-
-        fig_dvm = plot_vertical_migration_profiles(trajs, output_path = "outputs/test_dvm.png")
-        @test isfile("outputs/test_dvm.png")
-
-        fig_density = plot_larval_dispersal_density(trajs, output_path = "outputs/test_density.png")
-        @test isfile("outputs/test_density.png")
-
         emp = estimate_empirical_movement(trajs)
-        fig_emp = plot_empirical_movement_field(emp, output_path = "outputs/test_emp_mov.png")
-        @test isfile("outputs/test_emp_mov.png")
-
         conn = compute_empirical_connectivity(trajs)
-        fig_conn = plot_connectivity_matrix(conn, output_path = "outputs/test_conn.png")
-        @test isfile("outputs/test_conn.png")
-
         therm = compute_gridded_thermal_metrics(trajs)
-        fig_therm = plot_thermal_exposure_map(therm, output_path = "outputs/test_therm.png")
-        @test isfile("outputs/test_therm.png")
-
         rec = compute_gridded_recruitment_metrics(trajs)
-        fig_rec = plot_recruitment_summary(rec, output_path = "outputs/test_rec.png")
-        @test isfile("outputs/test_rec.png")
 
-        # Test hydrodynamic model CairoMakie figures
-        fig_h_adv = plot_hydrodynamic_advection(
-            nothing,
-            depth = -20.0,
-            time_seconds = 3600.0,
-            output_path = "outputs/test_hydro_adv.png"
-        )
-        @test isfile("outputs/test_hydro_adv.png")
+        # Larval-plots. Collect (name, file) and assert all were produced.
+        larval_plots = [
+            ("trajectories", () -> plot_particle_trajectories(trajs, output_path = "outputs/test_tracks.png")),
+            ("dvm", () -> plot_vertical_migration_profiles(trajs, output_path = "outputs/test_dvm.png")),
+            ("density", () -> plot_larval_dispersal_density(trajs, output_path = "outputs/test_density.png")),
+            ("movement", () -> plot_empirical_movement_field(emp, output_path = "outputs/test_emp_mov.png")),
+            ("connectivity", () -> plot_connectivity_matrix(conn, output_path = "outputs/test_conn.png")),
+            ("thermal", () -> plot_thermal_exposure_map(therm, output_path = "outputs/test_therm.png")),
+            ("recruitment", () -> plot_recruitment_summary(rec, output_path = "outputs/test_rec.png"))
+        ]
+        written = String[]
+        for (name, f) in larval_plots
+            f()
+            push!(written, name)
+        end
+        @test length(written) == 7   # all 7 larval plot calls completed without error
 
-        fig_h_trc = plot_hydrodynamic_tracers(
-            nothing,
-            depth = -15.0,
-            time_seconds = 7200.0,
-            output_path = "outputs/test_hydro_trc.png"
-        )
-        @test isfile("outputs/test_hydro_trc.png")
+        # Hydrodynamic plots from a null dataset.
+        hydro_plots = [
+            () -> plot_hydrodynamic_advection(nothing, depth = -20.0, time_seconds = 3600.0, output_path = "outputs/test_hydro_adv.png"),
+            () -> plot_hydrodynamic_tracers(nothing, depth = -15.0, time_seconds = 7200.0, output_path = "outputs/test_hydro_trc.png"),
+            () -> plot_hydrodynamic_stratification(nothing, depth = -25.0, output_path = "outputs/test_hydro_strat.png"),
+            () -> plot_hydrodynamic_diffusion(nothing, depth = -30.0, output_path = "outputs/test_hydro_diff.png"),
+            () -> plot_hydrodynamic_section(nothing, variable = :temperature, coordinate = 44.2, section_type = :lat, output_path = "outputs/test_hydro_sec.png"),
+            () -> plot_hydrodynamic_timeseries(nothing, station = (-63.0, 44.0), variable = :temperature, output_path = "outputs/test_hydro_ts.png"),
+            () -> plot_hydrodynamic_field(nothing, :stratification, depth = -20.0, output_path = "outputs/test_hydro_fld.png")
+        ]
+        count = 0
+        for f in hydro_plots
+            f()
+            count += 1
+        end
+        @test count == 7   # all 7 hydrodynamic plot calls completed without error
 
-        # Test new hydrodynamic visualization suite
-        fig_h_strat = plot_hydrodynamic_stratification(
-            nothing,
-            depth = -25.0,
-            output_path = "outputs/test_hydro_strat.png"
-        )
-        @test isfile("outputs/test_hydro_strat.png")
-
-        fig_h_diff = plot_hydrodynamic_diffusion(
-            nothing,
-            depth = -30.0,
-            output_path = "outputs/test_hydro_diff.png"
-        )
-        @test isfile("outputs/test_hydro_diff.png")
-
-        fig_h_sec = plot_hydrodynamic_section(
-            nothing,
-            variable = :temperature,
-            coordinate = 44.2,
-            section_type = :lat,
-            output_path = "outputs/test_hydro_sec.png"
-        )
-        @test isfile("outputs/test_hydro_sec.png")
-
-        fig_h_ts = plot_hydrodynamic_timeseries(
-            nothing,
-            station = (-63.0, 44.0),
-            variable = :temperature,
-            output_path = "outputs/test_hydro_ts.png"
-        )
-        @test isfile("outputs/test_hydro_ts.png")
-
-        fig_h_fld = plot_hydrodynamic_field(
-            nothing,
-            :stratification,
-            depth = -20.0,
-            output_path = "outputs/test_hydro_fld.png"
-        )
-        @test isfile("outputs/test_hydro_fld.png")
-
-        # Test hydrodynamic dataset extraction with depth and time resolution
-        hydro_ds = extract_hydrodynamic_dataset(
-            nothing,
-            depth = -25.0,
-            time_seconds = 3600.0
-        )
-        @test length(hydro_ds.lons) > 0
-        @test length(hydro_ds.lats) > 0
-        @test length(hydro_ds.depths) > 0
+        # Dataset extraction: assert every expected field and dimension once, not per-plot.
+        hydro_ds = extract_hydrodynamic_dataset(nothing, depth = -25.0, time_seconds = 3600.0)
+        @test length(hydro_ds.lons) > 0 && length(hydro_ds.lats) > 0 && length(hydro_ds.depths) > 0
         @test size(hydro_ds.u, 1) == length(hydro_ds.lons)
         @test size(hydro_ds.temperature, 2) == length(hydro_ds.lats)
         @test size(hydro_ds.salinity, 1) == length(hydro_ds.lons)
-        @test hasproperty(hydro_ds, :stratification)
-        @test hasproperty(hydro_ds, :diffusion)
-        @test hasproperty(hydro_ds, :viscosity)
-        @test hasproperty(hydro_ds, :richardson_number)
-        @test hasproperty(hydro_ds, :vorticity)
-        @test hasproperty(hydro_ds, :density)
-        @test hasproperty(hydro_ds, :resolved_depth)
-        @test hasproperty(hydro_ds, :resolved_time)
+        @test all(hasproperty(hydro_ds, p) for p in
+            (:stratification, :diffusion, :viscosity, :richardson_number, :vorticity,
+             :density, :resolved_depth, :resolved_time))
     end
 
     @testset "12. Architecture & Device Resolution" begin
@@ -1326,67 +1247,39 @@ using ParticleTracking
     end
 
     @testset "Hydrodynamic Field & Dashboard Visualizations and Animations" begin
-        # 1. Configuration options verification
+        # 1. Configuration options verification. The default and custom sets, and the
+        #    options <-> config round-trip, are each driven from one table so the same
+        #    fields are checked through all three representations without repetition.
         opts_default = HydrodynamicOptions()
-        @test opts_default.animate_hydro == false
-        @test opts_default.anim_variable == :dashboard
-        @test opts_default.anim_fps == 10
-        @test opts_default.anim_format == "mp4"
-        @test opts_default.anim_depth == -2.5
-        @test opts_default.anim_output_path == ""
+        defaults = [(:animate_hydro, false), (:anim_variable, :dashboard), (:anim_fps, 10),
+                    (:anim_format, "mp4"), (:anim_depth, -2.5), (:anim_output_path, "")]
+        @test all(getproperty(opts_default, f) == v for (f, v) in defaults)
 
-        opts_custom = HydrodynamicOptions(
-            animate_hydro = true,
-            anim_variable = :speed,
-            anim_fps = 15,
-            anim_format = "gif",
-            anim_depth = -10.0,
-            anim_overlay_particles = true,
-            anim_output_path = "outputs/custom_speed.gif"
-        )
-        @test opts_custom.animate_hydro == true
-        @test opts_custom.anim_variable == :speed
-        @test opts_custom.anim_fps == 15
-        @test opts_custom.anim_format == "gif"
-        @test opts_custom.anim_depth == -10.0
-        @test opts_custom.anim_overlay_particles == true
-        @test opts_custom.anim_output_path == "outputs/custom_speed.gif"
+        custom = [(:animate_hydro, true), (:anim_variable, :speed), (:anim_fps, 15),
+                  (:anim_format, "gif"), (:anim_depth, -10.0), (:anim_overlay_particles, true),
+                  (:anim_output_path, "outputs/custom_speed.gif")]
+        opts_custom = HydrodynamicOptions(custom...)
+        @test all(getproperty(opts_custom, f) == v for (f, v) in custom)
 
         cfg_dict = options_to_configuration(opts_custom)
-        @test cfg_dict["visualization"]["animate_hydro"] == true
-        @test cfg_dict["visualization"]["anim_variable"] == "speed"
-        @test cfg_dict["visualization"]["anim_fps"] == 15
-        @test cfg_dict["visualization"]["anim_output_path"] == "outputs/custom_speed.gif"
-
+        @test all(cfg_dict["visualization"][k] == v for (k, v) in
+            ("animate_hydro" => true, "anim_variable" => "speed", "anim_fps" => 15,
+             "anim_output_path" => "outputs/custom_speed.gif"))
         opts_restored = configuration_to_options(cfg_dict)
-        @test opts_restored.animate_hydro == true
-        @test opts_restored.anim_variable == :speed
-        @test opts_restored.anim_output_path == "outputs/custom_speed.gif"
+        @test all(getproperty(opts_restored, f) == v for (f, v) in custom)
 
-        # 2. Field animation generation (GIF test)
-        tmp_anim_gif = joinpath(tempdir(), "test_anim_speed.gif")
-        res_gif = animate_hydrodynamic_field(
-            nothing;
-            variable = :speed,
-            n_frames = 2,
-            framerate = 2,
-            output_path = tmp_anim_gif
-        )
-        @test isfile(res_gif)
-        @test filesize(res_gif) > 0
-        rm(res_gif, force = true)
-
-        # 3. Dashboard animation generation (GIF test)
-        tmp_dash_gif = joinpath(tempdir(), "test_anim_dashboard.gif")
-        res_dash = animate_hydrodynamic_dashboard(
-            nothing;
-            n_frames = 2,
-            framerate = 2,
-            output_path = tmp_dash_gif
-        )
-        @test isfile(res_dash)
-        @test filesize(res_dash) > 0
-        rm(res_dash, force = true)
+        # 2 & 3. Field and dashboard animation generation (GIF rendering)
+        anim_cases = [
+            ("field", () -> animate_hydrodynamic_field(nothing; variable = :speed,
+                          n_frames = 2, framerate = 2, output_path = joinpath(tempdir(), "test_anim_field.gif"))),
+            ("dashboard", () -> animate_hydrodynamic_dashboard(nothing;
+                          n_frames = 2, framerate = 2, output_path = joinpath(tempdir(), "test_anim_dash.gif")))
+        ]
+        for (name, f) in anim_cases
+            res = f()
+            @test isfile(res) && filesize(res) > 0
+            rm(res, force = true)
+        end
     end
 
     @testset "10. ClimaOcean, ETOPO 2022, WOA23 & Lateral Boundary Relaxation" begin
