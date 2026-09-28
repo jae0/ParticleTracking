@@ -1122,19 +1122,30 @@ function setup_hydrodynamic_simulation(
     # 3. Numerical stability watchdog callback
     if watchdog
         stability_check(s) = begin
-            u_max = maximum(abs, interior(s.model.velocities.u))
-            v_max = maximum(abs, interior(s.model.velocities.v))
-            spd_max = max(u_max, v_max)
+            u_int = interior(s.model.velocities.u)
+            v_int = interior(s.model.velocities.v)
+            spd = max.(abs.(u_int), abs.(v_int))
+            # Where is the maximum? A bare magnitude cannot distinguish a localised problem
+            # (the Bay of Fundy narrows, a steep bank, a sponge edge) from a domain-wide one,
+            # and those call for completely different fixes.
+            spd_max, loc = findmax(spd)
+            g = s.model.grid
+            lon_loc, lat_loc = g.metrics.lon_metrics[loc[1]][loc[2]]
+            dep_loc = g.metrics.z_metrics[loc[3]] |> only
             if isnan(spd_max) || isinf(spd_max) || spd_max > divergence_velocity_limit
                 error(
                     "Numerical divergence detected at iteration $(iteration(s)), " *
                     "time $(prettytime(s)). Velocity magnitude u_max = $(spd_max) m/s " *
-                    "(limit: $(divergence_velocity_limit) m/s)."
+                    "(limit: $(divergence_velocity_limit) m/s) at " *
+                    "lon=$(round(lon_loc, digits=2)) lat=$(round(lat_loc, digits=2)) " *
+                    "depth=$(round(dep_loc, digits=1)) m."
                 )
             elseif spd_max > 5.0 && (iteration(s) % 50 == 0)
                 @warn(
                     "Elevated interior velocity magnitude: max(|u|,|v|) = " *
-                    "$(round(spd_max, digits=2)) m/s at iteration $(iteration(s)) ($(prettytime(s)))."
+                    "$(round(spd_max, digits=2)) m/s at iteration $(iteration(s)) ($(prettytime(s))), " *
+                    "located at lon=$(round(lon_loc, digits=2)) lat=$(round(lat_loc, digits=2)) " *
+                    "depth=$(round(dep_loc, digits=1)) m."
                 )
             end
         end

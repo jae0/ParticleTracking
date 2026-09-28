@@ -124,8 +124,28 @@ function load_vertical_grid_csv(filepath::AbstractString)::Vector{Float64}
         end
     end
     if !issorted(faces)
+        # A positive-downward file (0, 10, 20, ... 5000) is *ascending* and therefore passes this
+        # check, but Oceananigans expects z faces negative and ascending (deepest first, surface
+        # last). An inverted axis silently produces nonsense grid metrics: the split-explicit
+        # free-surface substepping computes a NaN CFL and the run dies with
+        # `InexactError: Int64(NaN)` several segments later, far from the cause. Reject the wrong
+        # convention here, with a message naming it.
+        if issorted(faces; rev = true)
+            error(
+                "Vertical grid file $(filepath) is written positive-downward (first face " *
+                "$(first(faces)) m, last $(last(faces)) m). Oceananigans requires z faces " *
+                "NEGATIVE and ascending, ending at 0 m at the surface: rewrite so the first " *
+                "row is the deepest layer and the last row's top is 0.0.")
+        end
         error("Parsed vertical grid faces from $(filepath) are not monotonically sorted.")
     end
+    # Surface must be 0 m. Anything else means the column is offset or the wrong convention.
+    abs(last(faces)) <= 1e-6 || error(
+        "Vertical grid faces from $(filepath) must end at 0.0 m (the surface); got " *
+        "$(last(faces)) m.")
+    first(faces) < 0 || error(
+        "Vertical grid faces from $(filepath) must be negative below the surface; got " *
+        "$(first(faces)) m as the first (deepest) face.")
     return faces
 end
 

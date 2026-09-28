@@ -413,17 +413,16 @@ single flat namespace, so these remain plain `include`s in dependency order rath
 
 | # | Task | Status | Ref |
 |---|---|---|---|
-| 1 | **The halo/ghost-cell divergence is still unfixed** (up to ~6300 m/s at day 730), and `divergence_velocity_limit` inspects the wrong window (`4:end-3` vs the recorded halo `(7,7,5)`) so it can neither see this nor catch a real interior blow-up | **open**; fell off the list once the vertical grid was promoted to #1. Does **not** contaminate particle results (interior max ≤ 1.7 m/s, interpolator reads the core only) | [10](#10-the-2-year-hydrodynamics-the-interior-is-sound-but-the-vertical-grid-does-not-resolve-the-study-region) |
-| 2 | GPU `InvalidIRError` | **DONE** — `Relaxation` migration, numerically exact; all 4 GPU combinations compile | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 3 | Test suite | **DONE** — 445/445 pass, pruned from 732 with no coverage lost | this file |
-| 4 | Full-length `snowcrab.toml` run | **DONE** — all 8 segments, exit 0. Run before the two-segment grid, the quantile biology and the new figures, so needs repeating | [7](#7-network-dependent-configs-both-now-complete-end-to-end) |
-| 5 | Implement the GLORYS reader | **required**. Access proven anonymously; reader not written | [6](#6-glorys-support-is-required-and-access-is-solved) |
-| 6 | Replace `heat_flux = 50.0` with real data | **required**. Bulk formula from cached wind needs no credentials; ERA5 needs a CDS key | [3](#3-atmospheric-forcing-is-a-placeholder-and-real-data-is-required) |
-| 7 | Calibrate `cv_molt` / `cv_mortality` / `cv_settlement` off the `0.25` placeholder | functional form now lognormal / lognormal / Beta, verified; the **numbers** are still placeholders | [1](#1-larval-biology-stochasticity-is-wired-and-two-latent-bugs-are-fixed) |
-| 8 | Confirm a full GPU production run reaches completion | compiles and constructs on GPU; `--gpu` end to end never run | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 9 | Re-run hydrodynamics on the new two-segment grid (nz 20 → 40) | the 730-day archive predates it and is on the unresolved vertical grid | [10](#10-the-2-year-hydrodynamics-the-interior-is-sound-but-the-vertical-grid-does-not-resolve-the-study-region) |
+| 1 | **Ingest the user's benthic temperature dataset** (lon, lat, depth, timestamp; °C; 50–350 m; no salinity) | **blocked on file access**; design settled below | [11](#11-benthic-temperature-ingest--designed-awaiting-the-file) |
+| 2 | **Velocity instability unresolved** — `max(|u|)` climbs to ~8.9 m/s from a 0.25 m/s tidal forcing | **highest open technical item.** Diagnostic run with location-aware watchdog was started 2026-09-28; result not yet read | [10](#10-velocity-instability-open) |
+| 3 | **`min_dt_seconds` inconsistent** — `configuration_to_options` round-trips 1.0 correctly, but the driver still reports 2.0 | **half fixed.** Hardcoded `2.0` at `configuration.jl:1243` removed; the driver's `opts` construction path is not yet identified | [9](#9-min_dt_seconds-partially-fixed-and-still-inconsistent) |
+| 4 | Fix the GPU `InvalidIRError` follow-ups / confirm GPU end-to-end | GPU compiles and runs on all 4 sponge×tide combinations; never run end to end | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
+| 5 | Run the full test suite | last full run 445/445; not re-run since the biology + grid + config changes | — |
+| 6 | Implement the GLORYS reader | **required**. Access proven anonymously; reader not written | [6](#6-glorys-support-is-required-and-access-is-solved) |
+| 7 | Replace `heat_flux = 50.0` with real data | **required**. Bulk formula from cached wind needs no credentials; ERA5 needs a CDS key | [3](#3-atmospheric-forcing-is-a-placeholder-and-real-data-is-required) |
+| 8 | Calibrate `cv_molt` / `cv_mortality` / `cv_settlement` off the `0.25` placeholder | functional form now lognormal / lognormal / Beta, verified; the **numbers** are still placeholders | [1](#1-larval-biology-stochasticity-is-wired-and-two-latent-bugs-are-fixed) |
+| 9 | Remap the two deleted Copernicus dataset IDs | `GLOBAL_MULTIYEAR_PHY_001_033` and `GLOBAL_REANALYSIS_PHY_001_031` no longer exist | [6](#6-glorys-support-is-required-and-access-is-solved) |
 | 10 | Consider a horizontal nearest-wet fill for fully-masked WOA columns | optional refinement; currently the window mean | [5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker) |
-| 11 | Remap the two deleted Copernicus dataset IDs | `GLOBAL_MULTIYEAR_PHY_001_033` and `GLOBAL_REANALYSIS_PHY_001_031` no longer exist | [6](#6-glorys-support-is-required-and-access-is-solved) |
 | 12 | Mixed-layer depth diagnostic | computed fields give MLD but no figure; the shelf `z_min` question is partly about it | this file |
 
 **Settled decisions (2026-09-27)**
@@ -1169,3 +1168,69 @@ rather than assuming it is called.
 - **`_grid.jld2` sidecars** are the only supported way to read grid geometry back; deserialising
   `serialized/grid` yields an unusable `JLD2.ReconstructedStatic`.
 - Geography comes only from TOML `[domain]` / `[boundaries]`; no hard-coded domain constants.
+
+---
+
+### 11. Benthic temperature ingest — designed, awaiting the file
+
+**Blocked on the user obtaining access to the dataset (2026-09-28).** The design is settled, so this
+is a build task rather than a design task.
+
+**The data.** `(lon, lat, depth, timestamp)`, multi-year, degrees Celsius, **no salinity**, mostly
+*benthic* temperatures between 50 and 350 m. Some vertical profiles exist but are not currently
+available.
+
+**Why it is worth adding.** The depth range lands almost exactly on the settlement band:
+
+```
+settlement_min_depth = -350.0     user data spans  50 .. 350 m
+settlement_max_depth =  -50.0
+settlement_max_temp   =   6.0     thermal gate applied to near-bed temperature
+```
+
+Settlement suitability is a function of tidally filtered **near-bed** temperature and depth, so this
+dataset speaks directly to the term that gates settlement — the most consequential input in the
+biology, and the one behind the 22/500 settled figure.
+
+**What it cannot do.** It is *not* a drop-in replacement for WOA23 as the initial stratification: the
+model needs temperature at every level from 0 to 5000 m, and this is a benthic observation confined
+to 50–350 m. It is a **constraint on the shelf portion of the column**. It also does not address the
+velocity instability.
+
+**It may nonetheless help stability.** WOA23's annual-mean climatology smears the cold intermediate
+layer, and an under- or over-resolved pycnocline is a classic source of spurious baroclinic
+instability. A properly resolved CIL could be both more accurate *and* more stable. This is a
+hypothesis to test against the velocity diagnostic, not a reassurance.
+
+**Design decisions already made**
+
+1. **Lower-shelf blend, not a replacement.** WOA23 retained for the surface and below 350 m so the
+   column stays complete.
+2. **Monthly climatology.** The run is climatological and repeating over 120 days, so reduce the
+   multi-year record to a 12-month climatology and drop it into the existing annual cycle.
+3. **Keep WOA23 salinity.** None is supplied, but temperature inconsistent with salinity yields a
+   density field consistent with neither — so the overlap must be *measured*, not assumed.
+4. **Ingest-time validation.** Reject or flag non-finite, fill-value and out-of-range values. This
+   class of bug has already bitten the project (`Missing` → `0.0` in the WOA23 reader), and a bad
+   fill in a field feeding a 6 °C gate would do real damage.
+5. **A blend weight, so three runs are comparable** — WOA23 only / user data only / blended — to show
+   what actually changes.
+6. **A startup overlap diagnostic** printing user value vs WOA23 at the same location as a
+   difference map. Differences under roughly 0.5 °C mean use the data directly; large ones mean
+   something is wrong with the file, the units, or the fill convention.
+7. **2D now, 3D later.** The vertical profiles, when they arrive, slot into the same reader and
+   upgrade the field without changing the interface.
+
+**Needed to build it**
+
+- File format (NetCDF variables and dimensions, or other) and the variable name.
+- Depth convention (negative-down metres?) and whether the axis reaches the seabed or stops at 350 m.
+- Fill/missing encoding: `NaN`, `-999`, `-1e30`, or empty.
+- Timestamp units and the units attribute (seconds since epoch, days, ...).
+
+**Open questions for the user**
+
+- Is the depth axis the *observation* depth (near-bed per cast) or a grid level? This decides
+  whether the field is treated as benthic or as a level field.
+- Is the multi-year record to be used as a climatology, or does a specific year matter for the
+  climate-scenario comparison?

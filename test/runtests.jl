@@ -664,6 +664,60 @@ using ParticleTracking
         end
     end
 
+    @testset "15b. Driver Options Reconstruction Is Complete" begin
+        # ParticleTrackingRun.jl REBUILDS HydrodynamicOptions from an explicit keyword list rather
+        # than mutating the parsed struct, so any omitted field silently reverts to its constructor
+        # default and the TOML value is discarded. That happened to cv_molt / cv_mortality /
+        # cv_settlement (making the biology deterministic while resolved_config.toml recorded the
+        # configured values) and to min_dt_seconds.
+        #
+        # Extract the keys by PARSING, not by scanning lines. A line/regex scan missed three keys
+        # already present at a different indent, so a fix duplicated them and the driver stopped
+        # parsing with "keyword argument repeated".
+        struct_fields = Set(String.(fieldnames(HydrodynamicOptions)))
+        driver_path = joinpath(@__DIR__, "..", "ParticleTrackingRun.jl")
+        ex = Meta.parseall(read(driver_path, String))
+        @test ex isa Expr                       # the driver must parse at all
+        keys_in_order = String[]
+        function collect_option_keys!(e)
+            if e isa Expr
+                if e.head === :call && !isempty(e.args) && e.args[1] === :HydrodynamicOptions
+                    for a in e.args[2:end]
+                        (a isa Expr && a.head === :kw) && push!(keys_in_order, String(a.args[1]))
+                    end
+                end
+                foreach(collect_option_keys!, e.args)
+            end
+            nothing
+        end
+        collect_option_keys!(ex)
+
+        dups = [k for k in unique(keys_in_order) if count(==(k), keys_in_order) > 1]
+        @test isempty(dups) ||
+              error("ParticleTrackingRun.jl passes these options more than once (a repeated " *
+                    "keyword is a syntax error): " * join(sort(dups), ", "))
+        @test isempty(setdiff(struct_fields, Set(keys_in_order))) ||
+              error("ParticleTrackingRun.jl omits these HydrodynamicOptions fields, so they " *
+                    "revert to defaults: " *
+                    join(sort(collect(setdiff(struct_fields, Set(keys_in_order)))), ", "))
+        @test isempty(setdiff(Set(keys_in_order), struct_fields)) ||
+              error("reconstruction passes keys that are not fields: " *
+                    join(sort(collect(setdiff(Set(keys_in_order), struct_fields))), ", "))
+        @test length(keys_in_order) == length(struct_fields)   # 1:1, no duplicates
+
+        # and the values must actually survive parsing + serialisation
+        cfg = get_default_configuration()
+        cfg["biology"]["cv_molt"] = 0.4
+        cfg["biology"]["cv_mortality"] = 0.3
+        cfg["biology"]["cv_settlement"] = 0.2
+        cfg["hydrodynamics"]["min_dt_seconds"] = 1.0
+        o = configuration_to_options(cfg)
+        @test (o.cv_molt, o.cv_mortality, o.cv_settlement, o.min_dt_seconds) == (0.4, 0.3, 0.2, 1.0)
+        rt = options_to_configuration(o)
+        @test rt["biology"]["cv_molt"] == 0.4
+        @test rt["hydrodynamics"]["min_dt_seconds"] == 1.0
+    end
+
     @testset "12. Architecture & Device Resolution" begin
         # CPU resolution
         @test resolve_architecture(:cpu) isa Oceananigans.Architectures.CPU

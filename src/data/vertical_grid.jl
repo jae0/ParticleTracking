@@ -98,14 +98,26 @@ function stretched_tanh_z_faces(
     nz::Int = 20,
     Lz::Real = 5000.0;
     scaling::Real = 2.0,
-    csv_path::Union{Nothing, AbstractString} = nothing
+    csv_path::Union{Nothing, AbstractString} = nothing,
+    strict::Bool = true
 )
     nz > 0 || error("nz must be positive, got $nz")
-    if !isnothing(csv_path) && !isempty(csv_path) && isfile(csv_path)
-        f = load_vertical_grid_csv(csv_path)
-        length(f) == nz + 1 || error(
-            "vertical grid file $(csv_path) has $(length(f)) faces but nz + 1 = $(nz + 1) is required.")
-        return f
+    if !isnothing(csv_path) && !isempty(csv_path)
+        if isfile(csv_path)
+            f = load_vertical_grid_csv(csv_path)
+            if length(f) == nz + 1
+                return f
+            end
+            msg = "Vertical grid file $(csv_path) has $(length(f)) faces but nz + 1 = $(nz + 1) is required."
+            # Silently substituting a generated grid here would run the whole simulation on a
+            # vertical grid the operator did not choose, and the result looks plausible enough
+            # that nothing downstream would reveal the substitution. `strict` defaults to true so
+            # that a malformed file stops the run.
+            strict && error(msg)
+            @warn msg " Generating a tanh grid instead."
+        elseif strict
+            error("Vertical grid file $(csv_path) does not exist.")
+        end
     end
     s = max(0.01, Float64(scaling))
     denom = exp(s) - 1.0

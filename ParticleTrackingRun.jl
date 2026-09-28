@@ -285,46 +285,15 @@ using
 NumericalEarth
 using CSV, DataFrames, Interpolations
 
+# NOTE: `stretched_tanh_z_faces` used to be redefined here, which shadowed the library's
+# version (`ParticleTracking.stretched_tanh_z_faces`, src/data/vertical_grid.jl) with a
+# duplicate that parsed the vertical-grid CSV incorrectly -- it read `CSV.read(...;
+# header=false)[:, 1]`, i.e. the *name* column of a `name,z_bottom,z_top` file, so
+# `Vector{Float64}` threw, the error was swallowed by a `catch`, and the run continued on an
+# auto-generated tanh grid instead of the requested levels. The library version delegates to
+# `load_vertical_grid_csv` and hard-errors on a length mismatch, so it is the one to use.
+
     """
-    stretched_tanh_z_faces(nz::Int, Lz::Real; csv_path=nothing) -> Vector{Float64}
-
-Generate stretched vertical grid faces using hyperbolic tangent stretching.
-If `csv_path` is provided and exists, loads z-faces from the CSV file (expects a single column of depths in meters, negative down).
-Otherwise generates tanh-stretched faces from 0 to -Lz with surface refinement.
-
-# Inputs
-- `nz::Int`: Number of vertical layers
-- `Lz::Real`: Total water column depth (positive)
-- `csv_path`: Optional path to CSV file containing pre-computed z-faces
-
-# Outputs
-- `Vector{Float64}`: Z-coordinates of cell faces from 0 (surface) to -Lz (bottom), length `nz+1`
-"""
-function stretched_tanh_z_faces(nz::Int, Lz::Real; csv_path=nothing) :: Vector{Float64}
-    if !isnothing(csv_path) && isfile(csv_path)
-        try
-            data = CSV.read(csv_path, DataFrames.DataFrame; header=false)
-            z_faces = Vector{Float64}(data[:, 1])
-            if length(z_faces) == nz + 1
-                println("Loaded z_faces from CSV: $(length(z_faces)) faces")
-                return z_faces
-            else
-                @warn "CSV z_faces length (\$(length(z_faces))) != nz+1 (\$(nz+1)); generating tanh stretch"
-            end
-        catch err
-            @warn "Failed to load z_faces from CSV (\$(err)); generating tanh stretch"
-        end
-    end
-
-    k = 2.0
-    s = range(0.0, 1.0, length = nz + 1)
-    z_faces = -Lz .* tanh.(k .* (1.0 .- s)) ./ tanh(k)
-    
-    println("Generated tanh-stretched z_faces: \$(length(z_faces)) faces from 0 to -\$(Lz)m")
-    return collect(z_faces)
-end
-
-"""
 
 resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
 
@@ -497,10 +466,15 @@ function run_segment_grid(;
     z_faces = if opts.vertical_stretching_mode in (:tanh, :csv, :stretched)
         Lz = abs(opts.domain_z[1] - opts.domain_z[2])
         println("Applying stretched vertical coordinates ($(opts.vertical_stretching_mode), Lz=$(Lz)m)...")
+        # `strict` when the config *asks* for a CSV: silently substituting a generated tanh grid
+        # would run the whole simulation on a vertical grid the operator did not choose, and the
+        # resulting field looks plausible enough that nobody would notice. A missing or malformed
+        # file must stop the run instead.
         stretched_tanh_z_faces(
             opts.grid_size[3],
             Lz;
-            csv_path = opts.vertical_grid_file
+            csv_path = opts.vertical_grid_file,
+            strict = (opts.vertical_stretching_mode === :csv) || !isempty(opts.vertical_grid_file)
         )
     elseif opts.vertical_stretching_mode in (:two_segment, :shelf)
         # Two-segment grid: a surface-refined upper segment that actually resolves the shallow
@@ -2478,6 +2452,7 @@ function main(args = ARGS)
     s2_u = Float64(base_opts.s2_u_amp)
     s2_v = Float64(base_opts.s2_v_amp)
     max_dt_val = Float64(base_opts.max_dt)
+    min_dt_val = Float64(base_opts.min_dt_seconds)
     scenario = base_opts.scenario
     proj_year = base_opts.projection_year
     sim_dur = base_opts.sim_duration
@@ -2852,6 +2827,23 @@ function main(args = ARGS)
         s2_u_amp = s2_u,
         s2_v_amp = s2_v,
         max_dt = max_dt_val,
+        min_dt_seconds = min_dt_val,
+        # The options struct is REBUILT here rather than mutated, so any field not listed silently
+        # reverts to the constructor default and the TOML value is lost. These were omitted, which
+        # quietly reset the biology to cv = 0.0 (fully deterministic) while
+        # `resolved_config.toml` recorded 0.25 -- the exact "config value never reaches its
+        # consumer" failure this project has hit three times now.
+        cv_molt = base_opts.cv_molt,
+        cv_mortality = base_opts.cv_mortality,
+        cv_settlement = base_opts.cv_settlement,
+        settlement_stochastic = base_opts.settlement_stochastic,
+        max_current_speed = base_opts.max_current_speed,
+        max_flow_snapshots = base_opts.max_flow_snapshots,
+        nz_above = base_opts.nz_above,
+        vertical_break_depth = base_opts.vertical_break_depth,
+        # `allow_analytical_fallback`, `reuse_hydro` and `track_only` are already set further
+        # down this call from their CLI locals; do not repeat them here (a repeated keyword is a
+        # syntax error, and the pair of "fixes" for them was duplicated by exactly this mistake).
         scenario = scenario,
         projection_year = proj_year,
         sim_dt = sim_dt,

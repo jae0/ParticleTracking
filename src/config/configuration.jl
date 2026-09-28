@@ -1240,7 +1240,10 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :target_cfl               => opts.target_cfl,
         :target_wave_cfl          => 0.20,
         :max_dt_seconds           => opts.max_dt,
-        :min_dt_seconds           => 2.0,
+        # Was hardcoded to 2.0, so the second options struct (built from this dict at the call
+        # site below) always carried 2.0 regardless of what the TOML asked for. Use the value
+        # that was actually parsed.
+        :min_dt_seconds           => opts.min_dt_seconds,
         :coriolis_latitude        => 44.5,
         :divergence_limit         => 20.0,
         :output_dir               => opts.output_dir,
