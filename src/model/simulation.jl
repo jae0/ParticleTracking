@@ -54,6 +54,27 @@ throttle \$\\Delta t\$ during intense spring-neap tidal acceleration episodes.
 # References
 - Canuto, C., et al. (2007). *Spectral Methods*. Springer-Verlag.
 """
+# Smallest vertical cell thickness (m).
+#
+# The CFL must use the SMALLEST cell, never the mean. `Lz / Nz` is the mean, and on a stretched
+# grid it badly underestimates the constraint: the two-segment shelf grid reports `Lz/Nz = 125 m`
+# while its surface cell is about 5.4 m, a factor of ~23. Using the mean let the adaptive
+# time-stepper pick a dt stable for 125 m cells but violently unstable for the surface layer -- the
+# run reached max(|u|) = 7.6 m/s at CFL 0.428 against a 0.20 target and diverged. On the previous
+# uniform grid the same formula was already ~5.6x optimistic (250 m mean against a 44.7 m cell).
+#
+# Falls back to `Lz / Nz` if the grid does not expose a cell-centre vector.
+function min_vertical_spacing(base_g)
+    if hasproperty(base_g, :z) && hasproperty(base_g.z, :cᵃᵃᶠ)
+        c = collect(Float64, parent(base_g.z.cᵃᵃᶠ))
+        if length(c) > 1
+            d = minimum(abs.(diff(c)))
+            isfinite(d) && d > 0 && return Float64(d)
+        end
+    end
+    return Float64(base_g.Lz) / base_g.Nz
+end
+
 function compute_advective_cfl(
     model,
     Δt::Real;
@@ -86,7 +107,9 @@ function compute_advective_cfl(
     else
         1000.0
     end
-    dz_approx = Float64(base_g.Lz) / base_g.Nz
+    # Smallest vertical cell, NOT Lz/Nz: see `min_vertical_spacing`. This single line is the
+    # difference between a stable surface layer and a diverging one on a stretched grid.
+    dz_approx = min_vertical_spacing(base_g)
 
     cfl_x = (u_max * Δt) / max(1.0, dx_approx)
     cfl_y = (v_max * Δt) / max(1.0, dy_approx)

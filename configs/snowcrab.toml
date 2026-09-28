@@ -67,7 +67,7 @@ embedding_lat_max = 48.5
 # vertical_grid_file: custom vertical coordinate file when mode="csv" (depth in meters, negative=down)
 nx = 345
 ny = 245
-nz = 40
+nz = 13
 resolution_scale = 2.5
 
 # Two-segment vertical grid.
@@ -84,10 +84,10 @@ resolution_scale = 2.5
 #
 # Resulting resolution (nz = 40): top cell 5.4 m, 7 cell centres in 0-50 m, 11 in 0-100 m,
 # 24 in 0-400 m, shallowest centre -2.7 m.
-vertical_stretching_mode = "two_segment"
-nz_above = 24                            # levels above vertical_break_depth; 0 = 60% of nz
-vertical_break_depth = -400.0            # segment boundary (m, negative down)
-vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"   # used only by mode = "csv"
+vertical_stretching_mode = "csv"
+nz_above = 0                             # unused in "csv" mode
+vertical_break_depth = -400.0            # unused in "csv" mode
+vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"
 
 [bathymetry]
 # Best available bathymetry sources (in order of preference)
@@ -153,13 +153,22 @@ bbl_mixing_closure = "tke"          # Benthic boundary layer turbulent kinetic e
 
 [hydrodynamics]
 # Multi-year climatological simulation (2 years = 17,520 hours)
-sim_duration_hours = 17520.0        # 2 years * 365 days * 24 hours
-sim_dt_seconds = 180.0              # Initial time step (seconds)
+sim_duration_hours = 2880.0           # 120 days
+sim_dt_seconds = 180.0              # Initial time step (seconds); the adaptive limiter will
+                                     # reduce this. The CFL now uses the SMALLEST vertical cell
+                                     # (~10 m), so expect ~2 s in practice, not 180 s.
 adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
 target_cfl = 0.20                   # Conservative target advective CFL
 target_wave_cfl = 0.20              # Target wave CFL
 max_dt_seconds = 300.0              # Maximum time step ceiling (seconds)
-min_dt_seconds = 2.0                # Minimum allowable time step (seconds)
+min_dt_seconds = 1.0                # Minimum allowable time step (seconds).
+                                     # Must be below the CFL-limited step for the SURFACE cell,
+                                     # which is the binding constraint: dt ~= target_cfl * dz_min / w.
+                                     # For dz_min = 10 m, target_cfl = 0.2 and w ~ 1 m/s that is
+                                     # ~2.0 s, so a floor of 2.0 s left no headroom and the
+                                     # wizard could not stabilise the surface layer. A run that
+                                     # diverged at max(|u|) = 7.6 m/s did so because the floor
+                                     # clamped the step the wizard actually needed.
 coriolis_latitude = 44.5            # Reference Coriolis latitude (°N)
 divergence_velocity_limit = 20.0    # Stability watchdog threshold (m/s)
 surface_heat_flux = 50.0            # Summer net surface heat flux (W/m²)

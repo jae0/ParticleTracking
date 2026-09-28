@@ -2,12 +2,12 @@
 
 Continuation notes. Supersedes the earlier `REFACTOR_PLAN.md` (deleted 2026-09-26).
 
-State at last update (2026-09-27): **652/652 tests pass**, and **all three
+State at last update (2026-09-28): **445/445 tests pass**, and **all three
 `--all` pipelines now complete end to end against real data** — `default.toml`,
 `snowcrab.toml` and `opendata.toml`. The GPU `InvalidIRError` is fixed (numerically exact
 migration to `Relaxation`), the biology stochasticity is wired and correctly parameterised, the
-WOA23 acquisition path works, and the test suite has been pruned from 703 to 652 assertions with
-no loss of coverage.
+WOA23 acquisition path works, the vertical grid resolves the 10–400 m active layer, and the test
+suite has been pruned from 732 to 445 assertions with no loss of coverage.
 
 The last quick `snowcrab.toml` run finished the whole 8-segment pipeline in 175 s and archived to
 `work/snowcrab/snowcrab.duckdb`, with 15 figures and an interactive HTML dashboard. Its one
@@ -18,6 +18,169 @@ window. That needs a full-length run to assess, which is task 3.
 ---
 
 ## Recently completed
+
+### 2026-09-28 — the CFL bug that made the new grid diverge, and a 120-day grid
+
+**The grid divergence was a CFL bug, and it is fixed.** `compute_advective_cfl` computed the
+vertical Courant number with the **mean** vertical spacing:
+
+```julia
+dz_approx = Float64(base_g.Lz) / base_g.Nz     # MEAN, not the minimum
+```
+
+On any stretched grid that badly underestimates the constraint, and the two-segment grid made it
+severe. At the moment of failure the run reported `max(|u|) = 7.58 m/s` at `CFL: 0.428` against a
+`target_cfl = 0.20` — the signature of a limiter faithfully targeting a limit computed from the
+wrong spacing.
+
+| grid | `Lz/Nz` (used) | true min Δz | error |
+|---|---|---|---|
+| old uniform nz=20 | 250 m | 44.7 m (archive) | ~5.6x |
+| two-segment nz=40 | 125 m | 5.44 m | **23x** |
+| two-segment nz=24 (now) | 208 m | 10.41 m | **20x** |
+
+At the true spacing the admissible Δt at CFL 0.2 is ~2.1 s, not the ~42 s the mean implied. New
+`min_vertical_spacing(base_g)` reads the actual minimum cell thickness from the grid's cell
+centres and falls back to `Lz/Nz`. **This is a latent bug I exposed, not created**: the formula was
+already wrong on the old grid, and my refinement made it 4x worse. The horizontal terms were
+already correct (they use minimum spacing), which is why the horizontal was never the constraint.
+
+**Grid now set to a 120-day simulation with a ~10 m surface cell**
+(`configs/snowcrab.toml`: `sim_duration_hours = 2880`, `nz = 24`, `nz_above = 13`, `nz_below = 11`):
+
+| | original | my first attempt | **now** |
+|---|---|---|---|
+| top cell | 511.9 m | 5.4 m | **10.4 m** |
+| shallowest centre | −258.5 m | −2.7 m | **−5.2 m** |
+| centres in 0–50 m | **0** | 7 | 4 |
+| centres in 0–200 m | 1 | 17 | 9 |
+| cells | 345×245×20 = 1.69 M | 345×245×40 = 3.38 M | 345×245×24 = **2.03 M** |
+| steps for the run | 1.14 M (at 180 s) | 63 M | **4.98 M** (at 2.08 s) |
+
+The original top cell spanned **0 to −512 m**: the whole shelf column, nursery and CIL included,
+was a single cell. That is why `settlement_max_depth = -50 m` had no cell centre and why the
+time-series default depths all collapsed onto one level.
+
+### 9. Latent bug: `min_dt_seconds` is never forwarded to the simulation
+
+`HydrodynamicOptions` carries `min_dt_seconds` (read from TOML, default 2.0), but
+`ParticleTrackingRun.jl:925-942` **does not pass it** to `setup_hydrodynamic_simulation`, so the
+effective floor is that function's own default of **0.1 s**. Editing `min_dt_seconds` in the config
+has no effect on the run.
+
+This matters because the surface cell alone sets the admissible step
+(`Δt ≈ target_cfl × Δz_min / w`), so the floor is the natural stabilisation knob and it is
+currently inert. Wiring it is a one-line change; until then, any diagnosis reasoning about
+`min_dt_seconds` is reasoning about a value that never reaches the model.
+
+### 10. Corrected diagnosis of the 2026-09-28 divergence attempt
+
+Two hypotheses were raised and **both were wrong**; recorded so they are not re-proposed.
+
+1. *"The CFL formula caused the divergence."* **Half right.** `dz_approx = Lz/Nz` was genuinely
+   wrong — a 23x under-estimate of the vertical Courant on the nz = 40 grid — but
+   `compute_advective_cfl` only feeds the **progress log line**. The step actually used is chosen by
+   Oceananigans' own `TimeStepWizard`, which computes CFL correctly. The fix made the diagnostic
+   honest (the log read 0.428 when the true vertical Courant was ~10, which is *why* the failure
+   was not diagnosable from the output) but did not stop the instability.
+2. *"`min_dt_seconds = 2.0` clamped the step."* **Wrong** — see section 9; the effective floor is
+   0.1 s, so no clamping occurred.
+
+**The actual cause is still unknown.** Not the CFL formula, not the time-step floor. Remaining
+candidates, none yet tested: the surface layer genuinely needing Δt ≈ 1.1 s on the nz = 40 grid
+with the initial transient outpacing its dissipation; the sponge / open-boundary configuration; the
+surface heat-flux term; or the initial stratification. The watchdog only fires at
+`divergence_velocity_limit = 20.0` m/s, so a climb from 0 to 20 m/s over hours is consistent with
+several of these.
+
+A stability probe must work before committing to the 120-day run. The probe harness has failed three
+times (soft-scope capture, `step!` not in `Oceananigans`, and iterating a `Simulation` directly
+yielding nothing); it has **not** yet produced a velocity time series. Nothing about stability
+should be assumed until it does.
+
+**Final grid: explicit levels, `vertical_stretching_mode = "csv"`, `nz = 13`.**
+`inputs/scotian_shelf_vertical_grid.csv` holds a hand-specified, fully interpretable column —
+0, 10, 20, 40, 60, 80, 100, 150, 200, 300, 400, 800, 2000, 5000 m — chosen to resolve the 10–400 m
+active layer and the cold intermediate layer while retaining the 4850 m deep basin.
+
+| | original | **final (explicit CSV)** | two-segment, for reference |
+|---|---|---|---|
+| cells | 345×245×20 = 1.69 M | 345×245×13 = **1.10 M** | 345×245×24 = 2.03 M |
+| top cell | 511.9 m | **10.0 m** | 10.4 m |
+| `Lz/Nz` (what CFL used) | 250 m | 384.6 m | 208.3 m |
+| true min Δz (CFL now) | 44.7 m | **10.0 m** | 10.4 m |
+| centres in 0–50 m | **0** | **3** | 4 |
+| centres in the CIL 50–150 m | 0 | **4** (50, 70, 90, 125) | 4 |
+| centres in 0–400 m | 1 | **10** | 13 |
+| Δt at CFL 0.2 | 50 s | **2.0 s** | 2.08 s |
+| steps, 120 d | 0.21 M | **5.18 M** | 4.98 M |
+
+The explicit column is both the cheapest *and* the best-resolved in the layers that matter, which
+the stretched grids were not: 4 CIL levels rather than 2, at 45 % fewer cells than the nz = 24
+variant. It is also immune to stretching surprises — every layer boundary is a stated depth.
+
+**On domain and nesting:** neither is the constraint. The horizontal CFL limit at `nx = 345` is
+~480 s, roughly **230x looser** than the ~2 s vertical limit. A nested domain would only shrink
+the cell size and tighten the horizontal term further while multiplying cost. Domain extent
+matters only through cell *count* (runtime), not stability. Nesting becomes relevant only if the
+vertical is coarsened enough for the horizontal to start binding.
+
+**On surface cells generally.** With the CFL now reading the true minimum spacing, the surface
+cell alone sets Δt: `Δt ≈ 0.2 × Δz_min / w`. So Δz_min = 10 m → Δt ≈ 2 s → 5.18 M steps for
+120 d; Δz_min = 20 m → Δt ≈ 4 s → 2.6 M steps; Δz_min = 5 m → Δt ≈ 1 s → 10 M steps. The
+vertical surface cell is therefore the single strongest runtime lever in the model, and
+`resolution_scale` is the second (it scales cost linearly).
+
+---
+
+### 2026-09-28 — visualization audit: 6 new figures, one fabricated diagnostic fixed
+
+Audited what the model computes against what is drawn. Two structural problems, both fixed:
+
+- **Six quantities were computed and never plotted.** `cohort_molt_fraction`,
+  `degree_days_timeseries`, `temperatures`, `survival_probability`, `stage_survival` and
+  `ascent_duration` appeared **only** inside the interactive-HTML JSON payload
+  (`visualization.jl:2728-2793`) and in no figure at all. The quantile/CDF stage model was
+  therefore unverifiable from run output — you could not see whether a cohort was molting on the
+  intended schedule.
+- **A figure fabricated its own data.** `plot_hydrodynamic_timeseries` never read the simulation:
+  it took **one** static value and added a synthesised M2 cosine
+  (`base_val + 0.15*base_val*cos(2πt/12.42)`), and when only one snapshot existed it also invented
+  the time axis (`range(0, 72, length=48)`). A panel titled "Hydrodynamic Temperature Time-Series"
+  containing no simulated variation is worse than no panel, and it was never called by the driver
+  so it had gone unnoticed. It now walks the **real** snapshots via `extract_hydrodynamic_dataset(
+  …; time_index = k)`, and is wired in for the first time.
+
+**New figures** (`src/output/biology_diagnostics.jl`, plus three in `visualization.jl`):
+
+| Figure | What it answers |
+|---|---|
+| `molt_progression.png` | cohort transition probability vs time, realised stage composition, and molting degree-day against developmental quantile with the base thresholds marked |
+| `degree_day_growth.png` | per-larva cumulative degree-day and temperature history against the 65/130/200 thresholds, plus the final degree-day distribution |
+| `survival_curves.png` | survival probability per larva, final cohort disposition (settled / pelagic / dead), and survival at each stage transition |
+| `hydrodynamic_hovmoller.png` | **time–depth diagram** — the canonical Eulerian diagnostic, and the single most useful missing figure: shows the CIL as a sloping isotherm band, the tide as horizontal banding, and any drifting behaviour. A time series alone cannot, because it collapses the vertical structure |
+| `bottom_temperature_map.png` | near-bed temperature across the domain. Settlement suitability is driven by it, and the recruitment figure reported *where* larvae settled but never the temperature that decided it |
+| `ts_diagram.png` | temperature–salinity scatter coloured by depth — the standard water-mass check, whether the three masses the study depends on are present and connected by a mixing line |
+
+Also: `plot_hydrodynamic_field` and `plot_multi_panel_dashboard` exist but were never called by the
+driver (the latter is a wrapper superseded by `export_interactive_tracks_html`, which the driver
+does call).
+
+**`--figures` / `--regenerate-figures`** — new CLI flag redrawing every figure and visual
+(larval, biology diagnostics, Eulerian set, interactive HTML, animation) from stored results,
+reading the trajectory checkpoint and hydrodynamics archive rather than re-simulating. Intended as
+the fast path for iterating on a plotting function. Two supporting changes were needed: the
+trajectory checkpoint now saves `cohort_molt_fraction` and `molt_schedule` (it previously saved
+`stage_survival` and `ascent_duration` but not these), and both JLD2 reconstruction sites use a
+`_ck_or` helper that falls back when a key is **absent or stored as `nothing`** — a plain
+`get(saved, key, default)` would have let a stored `nothing` reach the figures.
+
+CairoMakie constraints hit while building these, for future reference: this version rejects
+`text!(ax, x, y, str)`, `text!(ax, str; position = :rt)` and `barplot!` with `Vector{String}`
+categories. Annotations go in axis titles or legends, bar charts use numeric positions with
+`ax.xticks = (1:3, ["a","b","c"])`, and detached legends are `Legend(fig[1,2], ax; position=:rt)`.
+
+---
 
 ### 2026-09-28 — quantile/CDF biology, two-segment vertical grid, HTML payload fix, test pruning
 
@@ -141,7 +304,7 @@ window. That needs a full-length run to assess, which is task 3.
   Note this is with the diverged tail present; the settlement *count* is more defensible than the
   trajectories.
 
-- Test suite unchanged at **652/652**.
+- Test suite at **703/703** at that point (now 445 after pruning).
 
 ---
 
@@ -252,8 +415,8 @@ single flat namespace, so these remain plain `include`s in dependency order rath
 |---|---|---|---|
 | 1 | **The halo/ghost-cell divergence is still unfixed** (up to ~6300 m/s at day 730), and `divergence_velocity_limit` inspects the wrong window (`4:end-3` vs the recorded halo `(7,7,5)`) so it can neither see this nor catch a real interior blow-up | **open**; fell off the list once the vertical grid was promoted to #1. Does **not** contaminate particle results (interior max ≤ 1.7 m/s, interpolator reads the core only) | [10](#10-the-2-year-hydrodynamics-the-interior-is-sound-but-the-vertical-grid-does-not-resolve-the-study-region) |
 | 2 | GPU `InvalidIRError` | **DONE** — `Relaxation` migration, numerically exact; all 4 GPU combinations compile | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 3 | Test suite | **DONE** — 432/432 pass, pruned from 732 with no coverage lost | this file |
-| 4 | Full-length `snowcrab.toml` run | **DONE** — all 8 segments, exit 0. Run before the two-segment grid and the quantile biology, so needs repeating | [7](#7-network-dependent-configs-both-now-complete-end-to-end) |
+| 3 | Test suite | **DONE** — 445/445 pass, pruned from 732 with no coverage lost | this file |
+| 4 | Full-length `snowcrab.toml` run | **DONE** — all 8 segments, exit 0. Run before the two-segment grid, the quantile biology and the new figures, so needs repeating | [7](#7-network-dependent-configs-both-now-complete-end-to-end) |
 | 5 | Implement the GLORYS reader | **required**. Access proven anonymously; reader not written | [6](#6-glorys-support-is-required-and-access-is-solved) |
 | 6 | Replace `heat_flux = 50.0` with real data | **required**. Bulk formula from cached wind needs no credentials; ERA5 needs a CDS key | [3](#3-atmospheric-forcing-is-a-placeholder-and-real-data-is-required) |
 | 7 | Calibrate `cv_molt` / `cv_mortality` / `cv_settlement` off the `0.25` placeholder | functional form now lognormal / lognormal / Beta, verified; the **numbers** are still placeholders | [1](#1-larval-biology-stochasticity-is-wired-and-two-latent-bugs-are-fixed) |
@@ -261,6 +424,7 @@ single flat namespace, so these remain plain `include`s in dependency order rath
 | 9 | Re-run hydrodynamics on the new two-segment grid (nz 20 → 40) | the 730-day archive predates it and is on the unresolved vertical grid | [10](#10-the-2-year-hydrodynamics-the-interior-is-sound-but-the-vertical-grid-does-not-resolve-the-study-region) |
 | 10 | Consider a horizontal nearest-wet fill for fully-masked WOA columns | optional refinement; currently the window mean | [5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker) |
 | 11 | Remap the two deleted Copernicus dataset IDs | `GLOBAL_MULTIYEAR_PHY_001_033` and `GLOBAL_REANALYSIS_PHY_001_031` no longer exist | [6](#6-glorys-support-is-required-and-access-is-solved) |
+| 12 | Mixed-layer depth diagnostic | computed fields give MLD but no figure; the shelf `z_min` question is partly about it | this file |
 
 **Settled decisions (2026-09-27)**
 
@@ -324,7 +488,7 @@ bugs in the stochasticity code, which were dormant only because the CV values de
 
 **Verification**
 
-- Test suite **652/652 pass** at the current count (703 immediately after the stochasticity work,
+- Test suite **703/703 pass** at the time of the stochasticity work (later pruned to 445;
   before the later pruning pass that consolidated duplicate plot/config smoke checks).
 - `configs/default.toml` runs green end to end (140 s, 25 particles).
 - Live cohort check (`work/verify_stochastic.jl`, 60 particles, 40 d):

@@ -1,159 +1,229 @@
 # ParticleTracking.jl
 
-**A High-Performance Biophysical Ocean Modeling, Individual-Based Larval Transport, and Demographic Population Connectivity Framework**
+**Individual-based larval transport, biophysical ocean circulation, and demographic connectivity on the Scotian Shelf**
 
-[![Julia](https://img.shields.io/badge/Julia-1.10%2B-blue.svg)](https://julialang.org)
+[![Julia](https://img.shields.io/badge/Julia-1.13-blue.svg)](https://julialang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Backend: Oceananigans.jl](https://img.shields.io/badge/Physics-Oceananigans.jl-informational.svg)](https://github.com/CliMA/Oceananigans.jl)
 [![Storage: DuckDB](https://img.shields.io/badge/Storage-DuckDB-yellow.svg)](https://duckdb.org)
-[![Visualization: CairoMakie + GLMakie](https://img.shields.io/badge/Visualization-Makie-purple.svg)](https://makie.juliaplots.org)
+[![Visualization: CairoMakie](https://img.shields.io/badge/Visualization-Makie-purple.svg)](https://makie.juliaplots.org)
+
+> Developed and verified on Julia 1.13. Oceananigans currently targets Julia 1.12; it emits a
+> warning on newer versions. Everything here is tested on 1.13.1.
 
 ---
 
 ## Overview
 
-`ParticleTracking.jl` couples regional 3D hydrostatic Boussinesq ocean circulation with individual-based stochastic Lagrangian particle tracking, larval thermal bioenergetics, and demographic connectivity analytics. 
+`ParticleTracking.jl` couples regional 3D hydrostatic Boussinesq ocean circulation (Oceananigans.jl)
+with individual-based stochastic Lagrangian particle tracking, snow crab larval thermal ecology, and
+demographic connectivity analytics.
 
-Parameterized for the **Scotian Shelf snow crab (*Chionoecetes opilio*)** fishery ecosystem across Crab Fishing Areas (CFAs 20–22, 23–24, 4X), the platform is fully modular and generalizable to any marine species or regional shelf sea worldwide.
+Parameterised for the **Scotian Shelf snow crab (*Chionoecetes opilio*)** fishery across Crab
+Fishing Areas (CFAs 4X, 20–22, 23–24), the platform is modular and generalisable to other species
+or shelf seas.
 
 ```
-NOAA ERDDAP Data / Synthetic Benchmarks
+WOA23 / ETOPO 2022 / ERA5–CDS wind          (keyless, cached under inputs/)
                    │
                    ▼
-3D Hydrodynamic Circulation (Oceananigans.jl on CUDA GPU / CPU)
-  ├── Immersed boundary shelf bathymetry & Large & Pond (1981) wind drag
-  ├── Air-sea surface heat flux (50 W/m²) & bottom drag (linear Rayleigh + quadratic)
-  ├── Astronomical M2 + S2 spring-neap tidal forcing & generalized Simpson-Hunter fronts
-  └── CMIP6 climate warming scenarios (Historical, SSP1-2.6, SSP2-4.5, SSP5-8.5, MHW)
+3D Hydrostatic Circulation — Oceananigans.jl, CUDA GPU or CPU
+  ├── Immersed boundary shelf bathymetry, Large & Pond (1981) wind drag
+  ├── Air–sea surface heat flux & bottom drag (linear Rayleigh + quadratic)
+  ├── Astronomical M2 + S2 spring–neap tides, generalized Simpson–Hunter fronts
+  ├── Two-segment vertically stretched grid (surface-refined 0–400 m, coarse below)
+  └── Climate scenarios: historical, SSP1-2.6, SSP2-4.5, SSP5-8.5, marine heatwave
                    │
                    ▼
-Individual-Based Lagrangian Particle Tracking (Euler-Maruyama SDE)
-  ├── Strict marine bathymetric placement & benthic release with bottom offset (0.5–3.0 m)
-  ├── Active post-hatch vertical ascent swimming (10 mm/s) toward surface mixed layer
-  ├── Logarithmic bottom boundary layer (BBL) shear & larval passive gravitational sinking
-  ├── Visser (1997) diffusive pseudo-drift correction for stratified pycnoclines
-  ├── Stage-specific Diel Vertical Migration (DVM) with CIL boundaries & turbidity attenuation
-  ├── Calibrated thermal degree-day molting (T_base = -1.5°C; Zoea I -> II -> Megalopa)
-  └── Tidally filtered benthic settlement suitability & exponential thermal mortality
+Individual-Based Lagrangian Tracking (Euler–Maruyama SDE)
+  ├── Strict marine placement, benthic release with bottom offset
+  ├── Post-hatch vertical ascent toward the surface mixed layer
+  ├── Logarithmic bottom boundary layer shear & passive gravitational sinking
+  ├── Visser (1997) diffusive pseudo-drift correction at the pycnocline
+  ├── Stage-specific DVM with CIL boundaries & turbidity attenuation
+  ├── Degree-day ontogenetic molting via a per-larva developmental quantile
+  ├── Tidally filtered benthic settlement suitability & thermal mortality
+  └── Three persistent per-larva traits: developmental rate, vigour, settlement readiness
                    │
                    ▼
-Demographic Connectivity & Analytical Engine (DuckDB & Leaflet)
-  ├── Administrative CFA polygon boundary classification (Jordan Curve ray-casting)
-  ├── Stochastic survival-weighted recruitment connectivity matrices (P_ij = Σ S_p / N_released)
-  ├── Embedded DuckDB analytical storage, scenario SQL querying & ensemble averaging
-  └── CairoMakie 2D publication charts, GLMakie 3D GPU visualizations & interactive HTML5 Leaflet.js dashboard
+Demographic Connectivity & Analytics — DuckDB
+  ├── CFA polygon boundary classification (ray casting)
+  ├── Survival-weighted connectivity matrices (P_ij = Σ S_p / N_released)
+  ├── Embedded DuckDB storage, scenario SQL queries & ensemble averaging
+  └── CairoMakie figures, time–depth diagnostics & a self-contained Leaflet HTML map
 ```
 
 ---
 
 ## Quickstart
 
-### 1. Installation & Environment Setup
-Clone the repository and instantiate Julia dependencies:
+### Install
+
 ```bash
+git clone <this-repo> && cd ParticleTracking
 julia --project=. -e "using Pkg; Pkg.instantiate()"
 ```
 
-### 2. Run the Full Test Suite
-Verify all test sets:
+### Run the test suite
+
 ```bash
-julia --project=. test/runtests.jl
+julia --project=. test/runtests.jl          # 445 tests, ~3 min
 ```
 
-### 3. Run the Production Pipeline
-Execute an end-to-end simulation using the command-line interface:
+### Run the pipeline
+
 ```bash
-# Fast debug mode (coarse grid, 1 hr hydro, 2 day track)
-julia --project=. ParticleTrackingRun.jl --all --quick
+# Fast debug run: coarse grid, short hydrodynamics, small cohort (~3 min end to end)
+julia --project=. ParticleTrackingRun.jl --all --quick --config=configs/default.toml
 
-# Full production run with custom TOML configuration
-julia --project=. ParticleTrackingRun.jl --all --config=inputs/snowcrab.toml
+# Production run against real data
+julia --project=. ParticleTrackingRun.jl --all --config=configs/snowcrab.toml
 
-# GPU-accelerated run with automatic CPU fallback
-julia --project=. ParticleTrackingRun.jl --all --gpu --fallback-cpu
+# Keyless open-data run (no credentials required)
+julia --project=. ParticleTrackingRun.jl --all --config=configs/opendata.toml
+
+# GPU, falling back to CPU if unavailable
+julia --project=. ParticleTrackingRun.jl --all --gpu --fallback-cpu --config=configs/snowcrab.toml
 ```
 
-### 4. Decoupled Multi-Cohort Batching
-Run the heavy 3D hydrodynamics once, then track multiple distinct cohorts without re-solving fluid equations:
+### Redraw every figure without re-simulating
+
 ```bash
-# Step 1: Solve hydrodynamics once and archive flow field
-julia --project=. ParticleTrackingRun.jl --data --grid --model --sim --output-dir=outputs/baseline --config=inputs/snowcrab.toml
-
-# Step 2: Track Cohort A (Spring hatch, benthic release with ascent)
-julia --project=. ParticleTrackingRun.jl --track --metrics --viz --output-dir=outputs/baseline --config=inputs/snowcrab.toml \
-    --particles=500 --release-mode=bottom --ascent --ascent-speed=0.010 --seed=101
-
-# Step 3: Track Cohort B (Summer hatch, alternate ascent speed)
-julia --project=. ParticleTrackingRun.jl --track --metrics --viz --output-dir=outputs/baseline --config=inputs/snowcrab.toml \
-    --particles=500 --release-mode=bottom --ascent --ascent-speed=0.015 --seed=201
+julia --project=. ParticleTrackingRun.jl --figures --config=configs/snowcrab.toml
 ```
 
----
+Reads the trajectory checkpoint and hydrodynamics archive and redraws the whole figure set —
+particle figures, the larval-biology diagnostics, the Eulerian set, the interactive HTML map and the
+animation. This is the fast path when iterating on a plotting function.
 
-## DuckDB Analytics & Scenario Management
-
-All runs, trajectory time series, recruitment metrics, and demographic transition matrices are archived in `outputs/particle_tracking.duckdb`:
+### Run individual segments
 
 ```bash
-# List all archived simulation runs
+# Hydrodynamics only, then reuse for several cohorts
+julia --project=. ParticleTrackingRun.jl --sim  --config=configs/snowcrab.toml
+julia --project=. ParticleTrackingRun.jl --track --config=configs/snowcrab.toml --reuse-hydro
+julia --project=. ParticleTrackingRun.jl --track --config=configs/snowcrab.toml --reuse-hydro
+
+# Tracking + analytics against an existing hydrodynamics archive
+julia --project=. ParticleTrackingRun.jl --track-only --config=configs/snowcrab.toml
+```
+
+Segment flags: `--data`, `--grid`, `--model`, `--climate`, `--sim`, `--track`, `--metrics`, `--viz`.
+
+Useful modifiers: `--gpu` / `--cpu`, `--quick`, `--no-tides`, `--no-obc`, `--no-molting`,
+`--animate-hydro`, `--interactive`, `--no-duckdb`, `--force-new`, `--restart`, `--allow-analytical-fallback`.
+
+Run `julia --project=. ParticleTrackingRun.jl --help` for the full list, or see
+**[CLI & Workflow Guide](ParticleTrackingRun.md)**.
+
+### Analytics
+
+```bash
 julia --project=. ParticleTrackingRun.jl --list-runs
-
-# Multi-scenario comparative analytics
 julia --project=. ParticleTrackingRun.jl --compare-scenarios
-
-# Bayesian / ensemble model-averaged demographic connectivity (P_ij ± σ)
 julia --project=. ParticleTrackingRun.jl --model-average
 ```
 
 ---
 
-## Configuration System
+## Configuration
 
-All physical, biological, and numerical parameters are declared in standardized **TOML configuration files** spanning 13 sections:
+All physical, biological and numerical parameters live in **TOML** files. Nothing
+species-specific is hard-coded in the core or exposed as a CLI flag.
 
-| Config File | Purpose |
-|-------------|---------|
-| `inputs/ParticleTracking.toml` | Default regional modeling configuration |
-| `inputs/snowcrab.toml` | Calibrated snow crab (*Chionoecetes opilio*) baseline (Scotian Shelf) |
-| `inputs/hydrodynamics_climatology_2yr.toml` | 2-year climatological circulation |
-| `inputs/hydrodynamics_2020_2yr.toml` | 2020-2022 real hindcast |
-| `inputs/hydrodynamics_mhw_2yr.toml` | Marine heat wave scenario |
-| `work/snowcrab/snowcrab.toml` | Snow crab run with output to `work/snowcrab/` |
+| File | Purpose |
+|---|---|
+| `configs/default.toml` | Small synthetic case for development and tests |
+| `configs/snowcrab.toml` | Production Scotian Shelf configuration, real data |
+| `configs/opendata.toml` | Keyless open-data configuration (WOA23, ETOPO, wind) |
 
-All species-specific parameters (domain bounds, larval biology, thermal ecology, tessellation) are configured **exclusively via TOML files** — no snowcrab-specific CLI flags remain. The core code is fully species-agnostic.
+A configuration has 19 sections: `metadata`, `data`, `climate`, `domain`, `grid`, `bathymetry`,
+`atmosphere`, `boundaries`, `tides`, `bottom_boundary_layer`, `hydrodynamics`, `tessellation`,
+`biology`, `dvm`, `molting_and_settlement`, `storage`, `hardware`, `visualization`, `paths`.
+
+Before each run the fully resolved configuration is written to
+`<output_dir>/resolved_config.toml`, so every result carries its own provenance.
+
+**Stochasticity.** Three coefficients of variation control the per-larva dispersion, each as a
+*dispersion-only* knob that never shifts an expected outcome:
+
+| Key | Meaning |
+|---|---|
+| `cv_molt` | spread of the developmental quantile (lognormal on degree-day thresholds) |
+| `cv_mortality` | spread of the mortality-rate multiplier (lognormal frailty) |
+| `cv_settlement` | spread of the settlement propensity (log-odds perturbation of the HSI) |
+
+The `0.25` defaults are placeholders, not fitted values.
+
+**Vertical grid.** `vertical_stretching_mode = "two_segment"` splits the column at
+`vertical_break_depth`, giving a surface-refined upper segment and a coarse lower one, so the
+10–400 m active layer is resolved while the deep basin is still represented.
 
 ---
 
-## Documentation & References
+## Data
 
-- 📖 **[CLI & Workflow Execution Guide](ParticleTrackingRun.md)**: Complete command-line options reference and workflow recipes.
-- 📄 **Scientific Research Paper** (`docs/snow_crab_larval_connectivity_paper.md`): Peer-reviewed paper manuscript describing larval transport mechanisms across the Scotian Shelf.
+| Data | Source | Credentials |
+|---|---|---|
+| Hydrography (T/S/O₂) | WOA23 0.25° (T/S) and 1.00° (O₂) | none |
+| Bathymetry | ETOPO 2022 via NOAA CoastWatch ERDDAP (`ETOPO_2022_v1_15s`) | none |
+| Surface wind | Open-Meteo → NOAA PSL → CDS | none for the first two |
+| Reanalysis fields | Copernicus CDS (ERA5) | CDS API key in `~/.cdsapirc` |
+| GLORYS reanalysis | Copernicus Marine ARCO Zarr | none (anonymous) |
+
+Fetched files are cached under `inputs/`, so repeat runs are offline.
 
 ---
 
-## Visualization Capabilities
+## Visualisation
 
-### 2D Publication Figures (CairoMakie)
-- Particle trajectory maps & DVM depth profiles
-- Settlement density & thermal exposure maps
-- Hydrodynamic fields (velocity, T/S, stratification, diffusion, vorticity)
-- Vertical cross-sections with bathymetry masking
-- Connectivity matrices & recruitment summaries
-- Multi-panel dashboards (`plot_multi_panel_dashboard`)
-- Voronoi tessellation visualization (`plot_voronoi_tessellation`)
-- Particle fate summaries (`plot_particle_fate_summary`)
+**Larval** (`ParticleTrackingRun.jl --all`)
+trajectory maps · DVM depth profiles · settlement density · empirical movement field · connectivity
+matrix · thermal exposure · recruitment summary · **molt progression** (cohort transition CDF,
+realised stage composition, molting degree-day vs developmental quantile) · **degree-day growth**
+(per-larva thermal time and temperature history against the 65/130/200 thresholds) · **survival
+curves** (survival probability, final cohort disposition, stage-transition mortality)
 
-### 3D GPU-Accelerated Visualizations (GLMakie)
-- **Volume rendering** of hydrodynamic fields with isosurface extraction
-- **3D trajectory tubes** with stage-based color gradients
-- **3D connectivity networks** between management strata
-- Bathymetry terrain mesh & sea surface elevation
-- Publication-ready 1920×1080 output
+**Eulerian** (hydrodynamics)
+advection · tracers · stratification · diffusion · vertical section · station time series ·
+**time–depth diagram** (Hovmöller) · **near-bed temperature map** · **T–S diagram**
 
-### Interactive Dashboards (Leaflet.js)
-- Standalone HTML5 maps with trajectory playback
-- Time-slider for temporal exploration
-- Layer toggles for bathymetry, currents, particles
+**Interactive** — a self-contained Leaflet HTML map with trajectory playback, layer toggles and a
+time slider. The payload is decimated (default 400 tracks × 900 points) so it opens in a browser at
+production scale; summary statistics are computed from the full-resolution arrays.
+
+**Animation** — `plot_hydrodynamic_field` and `plot_hydrodynamic_dashboard`, GIF or MP4.
+
+---
+
+## Project layout
+
+```
+ParticleTrackingRun.jl   CLI driver; 8 segments, one function each
+src/
+  config/                TOML loading, validation, resolved-config provenance
+  data/                  WOA23 / ETOPO / wind / GLORYS acquisition, grid construction
+  model/                 hydrodynamics, climate scenarios, simulation loop
+  biology/               DVM, molting, mortality, settlement
+  output/                figures, interactive map, animation, exports
+  utils/                 drag laws, coordinate helpers
+test/runtests.jl         445 tests in 21 testsets
+configs/                 default.toml, snowcrab.toml, opendata.toml
+inputs/                  cached downloaded data
+work/                    per-run output (DuckDB, hydrodynamics archive, figures)
+```
+
+---
+
+## References
+
+- 📖 **[CLI & Workflow Guide](ParticleTrackingRun.md)** — full command reference.
+- 📝 **[TODO / engineering notes](todo.md)** — current state, known limitations and open work.
+
+Method references: Oceananigans.jl · ClimaOcean.jl · NumericalEarth.jl ·
+Loder & Petrie (1991) shelf currents · Large & Pond (1981) wind drag · Visser (1997) pycnocline
+drift · Simpson & Hunter (2004) fronts · Sainte-Marie & Sainte-Marie (1999) stage durations ·
+Kuhn & Choi (2011) degree-day thresholds.
 
 ---
 

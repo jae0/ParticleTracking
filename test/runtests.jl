@@ -602,6 +602,68 @@ using ParticleTracking
              :density, :resolved_depth, :resolved_time))
     end
 
+    @testset "11b. Larval Biology Diagnostic Figures" begin
+        # These cover quantities the model computes that were previously only embedded in the
+        # interactive HTML payload and never drawn: cohort_molt_fraction, degree-day growth,
+        # temperature history, survival curves, stage-transition survival and final disposition.
+        rng = MersenneTwister(7)
+        larvae = initialize_larval_particles(30, lon_range = (-63.0, -61.0),
+                                             lat_range = (43.5, 44.5), rng = rng)
+        traj = track_larval_cohort(
+            larvae,
+            velocity_fn = (x, y, z, t) -> (0.05, 0.0, 0.0),
+            total_duration = 40 * 86400.0,
+            dt = 1800.0,
+            default_temperature = 4.0,
+            default_bottom_depth = -120.0,
+            t_base = -1.5,
+            enable_molting = true,
+            cv_molt = 0.25, cv_mortality = 0.25, cv_settlement = 0.25,
+            settlement_stochastic = true,
+            rng = rng
+        )
+
+        # the inputs each figure depends on must actually be present
+        @test size(traj.cohort_molt_fraction, 1) == 3
+        @test size(traj.cohort_molt_fraction, 2) == size(traj.lons, 2)
+        @test all(isfinite, traj.cohort_molt_fraction)
+        @test all(0.0 .<= traj.cohort_molt_fraction .<= 1.0)
+        @test hasproperty(traj, :molt_schedule) && traj.molt_schedule !== nothing
+        @test hasproperty(traj, :stage_survival)
+
+        # cohort fraction must be non-decreasing in time: degree-days only accumulate
+        @test all(issorted(Float64.(traj.cohort_molt_fraction[k, :])) for k in 1:3)
+
+        figs = [
+            ("molt_progression", () -> plot_molt_progression(traj, output_path = "outputs/test_molt.png")),
+            ("degree_day_growth", () -> plot_degree_day_growth(traj, output_path = "outputs/test_dd.png")),
+            ("survival_curves", () -> plot_survival_curves(traj, output_path = "outputs/test_surv.png"))
+        ]
+        for (name, f) in figs
+            try
+                f()
+                @test isfile("outputs/test_" * (name == "molt_progression" ? "molt" :
+                                                 name == "degree_day_growth" ? "dd" : "surv") * ".png")
+            catch err
+                @error "$(name) failed to render" exception = err
+                @test false
+            end
+        end
+
+        # the Eulerian additions must at least construct against a null archive
+        for (name, f) in (("hovmoller", () -> plot_hydrodynamic_hovmoller(nothing; output_path = nothing)),
+                          ("bottom_temperature_map", () -> plot_bottom_temperature_map(nothing; output_path = nothing)),
+                          ("ts_diagram", () -> plot_temperature_salinity_diagram(nothing; output_path = nothing)))
+            @test try
+                f()
+                true
+            catch err
+                @error "$(name) failed to construct" exception = err
+                false
+            end
+        end
+    end
+
     @testset "12. Architecture & Device Resolution" begin
         # CPU resolution
         @test resolve_architecture(:cpu) isa Oceananigans.Architectures.CPU

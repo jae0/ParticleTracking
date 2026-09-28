@@ -85,6 +85,7 @@ include("analysis/empirical_analysis.jl")
 include("analysis/voronoi_tessellation.jl")
 include("analysis/storage_duckdb.jl")
 include("output/visualization.jl")
+include("output/biology_diagnostics.jl")
 
 # Exported APIs
 export
@@ -270,6 +271,12 @@ export
     plot_connectivity_matrix,
     plot_thermal_exposure_map,
     plot_recruitment_summary,
+    plot_molt_progression,
+    plot_degree_day_growth,
+    plot_survival_curves,
+    plot_hydrodynamic_hovmoller,
+    plot_bottom_temperature_map,
+    plot_temperature_salinity_diagram,
     extract_hydrodynamic_dataset,
     plot_hydrodynamic_advection,
     plot_hydrodynamic_tracers,

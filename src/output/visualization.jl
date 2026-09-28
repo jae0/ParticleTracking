@@ -655,6 +655,183 @@ function plot_recruitment_summary(
 end
 
 """
+    _timeseries_value(frame::NamedTuple, i::Int, j::Int, k::Int, variable::Symbol) -> Float64
+
+Read one field of an extracted hydrodynamic frame at grid point `(i, j, k)`, normalising the
+scalars that the plots conventionally rescale (Brunt-Väisälä, diffusivity and speed are drawn in
+their scientific units of 10⁻⁴ and cm s⁻¹).
+"""
+@inline function _timeseries_value(frame::NamedTuple, i::Int, j::Int, k::Int, variable::Symbol)
+    v = if variable === :salinity || variable === :S
+        frame.salinity[i, j, k]
+    elseif variable === :stratification || variable === :N2
+        frame.stratification[i, j, k] * 1.0e4
+    elseif variable === :diffusion || variable === :kappa
+        frame.diffusion[i, j, k] * 1.0e4
+    elseif variable === :viscosity || variable === :nu
+        frame.viscosity[i, j, k] * 1.0e4
+    elseif variable === :speed
+        frame.speed[i, j, k] * 100.0
+    elseif variable === :density
+        frame.density[i, j, k]
+    elseif variable === :vorticity
+        frame.vorticity[i, j, k]
+    elseif variable === :w
+        frame.w[i, j, k]
+    else
+        frame.temperature[i, j, k]
+    end
+    return Float64(v)
+end
+
+"""
+    plot_hydrodynamic_hovmoller(
+        hydrodynamics::Any;
+        station = nothing, lon = -63.5, lat = 44.0,
+        variable = :temperature, max_frames = 240,
+        title = nothing, output_path = "outputs/hydrodynamic_hovmoller.png"
+    ) -> Figure
+
+Time–depth (Hovmöller) diagram of a hydrodynamic variable at a fixed station, built from the real
+snapshots.
+
+This is the canonical Eulerian diagnostic for a shelf model and the single most useful missing
+figure: it shows at once whether the simulation resolves the structures that matter here — the cold
+intermediate layer as a sloping isotherm band, the M2/S2 tide as horizontal banding, and any
+periodic or drifting behaviour. A time series alone cannot show which of those is present, because
+it collapses the vertical structure.
+
+# Inputs
+- `hydrodynamics`: Model output, or a path the extractor understands.
+- `station`: `(lon, lat)` tuple, or `nothing` to use `lon`/`lat`.
+- `variable`: `:temperature`, `:salinity`, `:speed`, `:w`, or `:density`.
+- `max_frames`: Cap on snapshots walked; they are evenly subsampled beyond this.
+- `output_path`: PNG path, or `nothing`.
+"""
+function plot_hydrodynamic_hovmoller(
+    hydrodynamics::Any;
+    station::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    lon::Real = -63.5,
+    lat::Real = 44.0,
+    variable::Symbol = :temperature,
+    max_frames::Int = 240,
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_hovmoller.png"
+)
+    first_frame = extract_hydrodynamic_dataset(hydrodynamics)
+    target_lon = !isnothing(station) ? Float64(station[1]) : Float64(lon)
+    target_lat = !isnothing(station) ? Float64(station[2]) : Float64(lat)
+    i_st = argmin(abs.(first_frame.lons .- target_lon))
+    j_st = argmin(abs.(first_frame.lats .- target_lat))
+
+    n_snap = isdefined(first_frame, :n_snapshots) ? first_frame.n_snapshots : length(first_frame.times)
+    idx = n_snap <= max_frames ? collect(1:n_snap) :
+          unique(round.(Int, range(1, n_snap, length = max_frames)))
+    length(idx) < 2 && (idx = [1, max(1, n_snap)])
+
+    zs = collect(Float64, first_frame.depths)
+    nz = length(zs)
+    M = fill(NaN, nz, length(idx))
+    hours = Float64[]
+    for (c, k) in enumerate(idx)
+        f = k == 1 ? first_frame :
+            extract_hydrodynamic_dataset(hydrodynamics; time_index = k)
+        push!(hours, first(f.times) / 3600.0)
+        for r in 1:nz
+            M[r, c] = _timeseries_value(f, i_st, j_st, r, variable)
+        end
+    end
+
+    var_title = uppercase(string(variable)[1:1]) * string(variable)[2:end]
+    fig = Figure(size = (980, 520), fontsize = 12)
+    ax = Axis(fig[1, 1],
+              title = something(title, "Time–Depth ($(var_title)) at " *
+                                      "($(round(first_frame.lons[i_st], digits=2))°E, " *
+                                      "$(round(first_frame.lats[j_st], digits=2))°N)"),
+              xlabel = "Simulation time (hours)", ylabel = "Depth (m)")
+    hm = heatmap!(ax, hours, zs, M; colormap = :balance,
+                   colorrange = _field_colorrange(M))
+    Colorbar(fig[1, 2], hm, label = var_title)
+    # Isobaths: shading the T–S–z space without them hides the structure this plot exists to show.
+    isotherms = variable === :temperature
+    isotherms && vlines!(ax, [12.42, 24.0], color = (:white, 0.35), linestyle = :dot,
+                         label = "M2 / S2")
+    isotherms && axislegend(ax, position = :rb)
+    isnothing(output_path) || (mkpath(dirname(output_path)); save(output_path, fig))
+    return fig
+end
+
+"""
+    plot_bottom_temperature_map(hydrodynamics; depth = nothing, output_path = ...)
+
+Map of near-bed temperature across the domain.
+
+Settlement suitability in the larval model is driven by near-bed temperature, and the recruitment
+figures report *where* larvae settled but never the temperature field that decided it. Mapping it
+next to the settlement-density figure makes it possible to see whether a recruitment pattern
+follows bottom temperature or contradicts it.
+
+Land is masked to NaN so the map shows the marine domain only.
+"""
+function plot_bottom_temperature_map(
+    hydrodynamics::Any;
+    depth::Union{Nothing, Real} = nothing,
+    domain_lon::Tuple{<:Real, <:Real} = (-71.0, -53.0),
+    domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::Union{Nothing, AbstractString} = "outputs/bottom_temperature_map.png"
+)
+    f = extract_hydrodynamic_dataset(hydrodynamics; depth = depth,
+                                    domain_lon = domain_lon, domain_lat = domain_lat)
+    zs = collect(Float64, f.depths)
+    k = isnothing(depth) ? argmax(zs) : resolve_depth_index(zs, depth, nothing)  # deepest available
+    Tbot = permutedims(f.temperature[:, :, k])
+    fig = Figure(size = (760, 520), fontsize = 12)
+    ax = Axis(fig[1, 1],
+              title = something(title, "Near-Bed Temperature (deepest resolved level, $(zs[k]) m)"),
+              xlabel = "Longitude (°E)", ylabel = "Latitude (°N)")
+    hm = heatmap!(ax, f.lons, f.lats, Tbot, colormap = :thermal;
+                   colorrange = _field_colorrange(Tbot))
+    Colorbar(fig[1, 2], hm, label = "Temperature (°C)")
+    isnothing(output_path) || (mkpath(dirname(output_path)); save(output_path, fig))
+    return fig
+end
+
+"""
+    plot_temperature_salinity_diagram(hydrodynamics; output_path = ...)
+
+Temperature–salinity (T–S) scatter of the domain, coloured by depth.
+
+The standard water-mass diagnostic. For this domain it answers whether the simulated water column
+contains the three masses the larvae and the shelf exchange depend on — cold fresh shelf water
+(Gulf of St. Lawrence), the cold intermediate layer, and warm salty slope water — and whether the
+model produces a continuous mixing line between them or an implausibly disconnected set.
+"""
+function plot_temperature_salinity_diagram(
+    hydrodynamics::Any;
+    domain_lon::Tuple{<:Real, <:Real} = (-71.0, -53.0),
+    domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::Union{Nothing, AbstractString} = "outputs/ts_diagram.png"
+)
+    f = extract_hydrodynamic_dataset(hydrodynamics; domain_lon = domain_lon, domain_lat = domain_lat)
+    zs = collect(Float64, f.depths)
+    # Scatter every (lon, lat, depth) cell, so vectorise the 3-D fields rather than reducing.
+    Sv = vec(f.salinity)
+    Tv = vec(f.temperature)
+    Zv = repeat(zs, outer = div(length(Sv), length(zs)))
+
+    fig = Figure(size = (760, 560), fontsize = 12)
+    ax = Axis(fig[1, 1], title = something(title, "Temperature–Salinity Diagram"),
+              xlabel = "Salinity (psu)", ylabel = "Temperature (°C)")
+    m = isfinite.(Tv) .& isfinite.(Sv)
+    sc = scatter!(ax, Sv[m], Tv[m]; color = Zv[m], colormap = :viridis)
+    Colorbar(fig[1, 2], sc, label = "Depth (m)")
+    isnothing(output_path) || (mkpath(dirname(output_path)); save(output_path, fig))
+    return fig
+end
+
+"""
     resolve_depth_index(
         depths::AbstractVector{<:Real},
         depth::Union{Nothing, Real},
@@ -1068,7 +1245,12 @@ function extract_hydrodynamic_dataset(
 
     # 1. JLD2 Simulation Output File
     if hydro_input isa AbstractString && isfile(hydro_input) && endswith(hydro_input, ".jld2")
+        # Everything the do-block assigns must be declared `local` here: a do-block is its own
+        # scope, and an undeclared name stays inside the closure. `native_κ_j` / `native_ν_j` were
+        # missing from this list, so `UndefVarError` was raised for every JLD2 archive at the
+        # `compute_hydrodynamic_diagnostics` call below.
         local lons_j, lats_j, deps_j, times_j, u_j, v_j, w_j, T_j, S_j, elev_j, bathymetry_j
+        local native_κ_j, native_ν_j
         jldopen(hydro_input, "r") do file
             u_group = file["timeseries/u"]
             num_keys = [k for k in keys(u_group) if tryparse(Float64, k) !== nothing]
@@ -1744,12 +1926,13 @@ function plot_hydrodynamic_advection(
     fig = Figure(size = (980, 720), fontsize = 13)
     ax = Axis(
         fig[1, 1],
-        title = "\$(title)\n[Depth: \$(depth_m) m | Time: \$(t_hr) h]",
+        title = "$(title)\n[Depth: $(depth_m) m | Time: $(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
 
-    hm = heatmap!(ax, lons, lats, spd_k, colormap = colormap)
+    hm = heatmap!(ax, lons, lats, spd_k, colormap = colormap;
+                   colorrange = _field_colorrange(spd_k))
     Colorbar(fig[1, 2], hm, label = "Current Speed (|u_h|, cm/s)")
 
     if !isnothing(bathymetry_data) && hasproperty(bathymetry_data, :elevation)
@@ -1865,21 +2048,23 @@ function plot_hydrodynamic_tracers(
     # Panel 1: Temperature
     ax1 = Axis(
         fig[1, 1],
-        title = "Seawater Temperature T (°C)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        title = "Seawater Temperature T (°C)\n[Depth: $(depth_m) m | t = $(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
-    hm1 = heatmap!(ax1, lons, lats, t_mat, colormap = :thermal)
+    hm1 = heatmap!(ax1, lons, lats, t_mat, colormap = :thermal;
+                     colorrange = _field_colorrange(t_mat))
     Colorbar(fig[1, 2], hm1, label = "Temperature (°C)")
 
     # Panel 2: Salinity
     ax2 = Axis(
         fig[1, 3],
-        title = "Practical Salinity S (PSU)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        title = "Practical Salinity S (PSU)\n[Depth: $(depth_m) m | t = $(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
-    hm2 = heatmap!(ax2, lons, lats, s_mat, colormap = :viridis)
+    hm2 = heatmap!(ax2, lons, lats, s_mat, colormap = :viridis;
+                     colorrange = _field_colorrange(s_mat))
     Colorbar(fig[1, 4], hm2, label = "Salinity (PSU)")
 
     if !isnothing(output_path)
@@ -1974,21 +2159,23 @@ function plot_hydrodynamic_stratification(
     # Panel 1: Buoyancy Frequency N²
     ax1 = Axis(
         fig[1, 1],
-        title = "Buoyancy Frequency N² (10⁻⁴ s⁻²)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        title = "Buoyancy Frequency N² (10⁻⁴ s⁻²)\n[Depth: $(depth_m) m | t = $(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
-    hm1 = heatmap!(ax1, lons, lats, n2_mat, colormap = :ice)
+    hm1 = heatmap!(ax1, lons, lats, n2_mat, colormap = :ice;
+                     colorrange = _field_colorrange(n2_mat))
     Colorbar(fig[1, 2], hm1, label = "N² (10⁻⁴ s⁻²)")
 
     # Panel 2: Practical Salinity S
     ax2 = Axis(
         fig[1, 3],
-        title = "Practical Salinity S (PSU)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        title = "Practical Salinity S (PSU)\n[Depth: $(depth_m) m | t = $(t_hr) h]",
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
-    hm2 = heatmap!(ax2, lons, lats, s_mat, colormap = :viridis)
+    hm2 = heatmap!(ax2, lons, lats, s_mat, colormap = :viridis;
+                     colorrange = _field_colorrange(s_mat))
     Colorbar(fig[1, 4], hm2, label = "Salinity (PSU)")
 
     # Panel 3: Vertical 1D Profiles at stations
@@ -2093,26 +2280,32 @@ function plot_hydrodynamic_diffusion(
     diff_mat = hydro.diffusion[:, :, k] .* 10000.0 # 10^-4 m^2/s
     visc_mat = hydro.viscosity[:, :, k] .* 10000.0
 
+    # Concatenated rather than `\$`-escaped: the previous title printed the interpolation source
+    # verbatim, leaving depth_m and t_hr computed but unused.
+    frame_note = "[Depth: $(round(depth_m, digits=1)) m | t = $(t_hr) h]"
+
     fig = Figure(size = (1500, 520), fontsize = 12)
 
     # Panel 1: Eddy Diffusivity κ_v
     ax1 = Axis(
         fig[1, 1],
-        title = "Eddy Diffusivity κ_v (10⁻⁴ m² s⁻¹)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        title = "Eddy Diffusivity κ_v (10⁻⁴ m² s⁻¹)\n" * frame_note,
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
-    hm1 = heatmap!(ax1, lons, lats, diff_mat, colormap = :plasma)
+    hm1 = heatmap!(ax1, lons, lats, diff_mat, colormap = :plasma;
+                   colorrange = _field_colorrange(diff_mat))
     Colorbar(fig[1, 2], hm1, label = "κ_v (10⁻⁴ m² s⁻¹)")
 
     # Panel 2: Eddy Viscosity ν_v
     ax2 = Axis(
         fig[1, 3],
-        title = "Eddy Viscosity ν_v (10⁻⁴ m² s⁻¹)\n[Depth: \$(depth_m) m | t = \$(t_hr) h]",
+        title = "Eddy Viscosity ν_v (10⁻⁴ m² s⁻¹)\n" * frame_note,
         xlabel = "Longitude (°E)",
         ylabel = "Latitude (°N)"
     )
-    hm2 = heatmap!(ax2, lons, lats, visc_mat, colormap = :magma)
+    hm2 = heatmap!(ax2, lons, lats, visc_mat, colormap = :magma;
+                   colorrange = _field_colorrange(visc_mat))
     Colorbar(fig[1, 4], hm2, label = "ν_v (10⁻⁴ m² s⁻¹)")
 
     # Panel 3: Vertical 1D Diffusivity Profiles
@@ -2363,6 +2556,32 @@ function plot_hydrodynamic_section(
 end
 
 """
+    _field_colorrange(A::AbstractMatrix; rel_pad = 0.05) -> Tuple{Float64, Float64}
+
+Colour limits for a hydrodynamics field, guarded against roundoff.
+
+Makie's default autoscale spans `minimum` to `maximum`. When a field is effectively constant — the
+model's fixed background diffusivity, or a level at rest — that range collapses to floating-point
+noise, and the heatmap renders that noise at full contrast. The result reads as a physical plume
+or band that is pure arithmetic: a κ field spanning 1e-8 m²/s was displayed with a dramatic
+colour ramp and a sharp diagonal "front".
+
+If the data range is negligible compared with the field's magnitude, widen the limits to a
+symmetric band around the median so the panel renders flat, which is what the data actually says.
+"""
+function _field_colorrange(A::AbstractMatrix; rel_pad::Real = 0.05)
+    v = filter(isfinite, vec(A))
+    isempty(v) && return (0.0, 1.0)
+    lo, hi = minimum(v), maximum(v)
+    if hi - lo > max(abs(lo), abs(hi), 1.0) * 1e-6     # genuine structure
+        return (lo, hi)
+    end
+    c = median(v)
+    d = max(abs(c) * rel_pad, eps(c) * 1e3, 1e-12)
+    return (c - d, c + d)
+end
+
+"""
     plot_hydrodynamic_timeseries(
         hydrodynamics::Any;
         lon::Real = -63.5,
@@ -2407,13 +2626,6 @@ function plot_hydrodynamic_timeseries(
     st_lon = round(hydro.lons[i_st], digits = 2)
     st_lat = round(hydro.lats[j_st], digits = 2)
 
-    times = hydro.times
-    t_hr = times ./ 3600.0
-    if length(t_hr) <= 1
-        # Synthesize multi-step diurnal / seasonal series for demonstration
-        t_hr = collect(range(0.0, 72.0, length = 48))
-    end
-
     fig = Figure(size = (920, 480), fontsize = 12)
     var_title = uppercase(string(variable)[1:1]) * string(variable)[2:end]
     default_title = "Hydrodynamic $(var_title) Time-Series at ($(st_lon)°E, $(st_lat)°N)"
@@ -2421,26 +2633,34 @@ function plot_hydrodynamic_timeseries(
 
     colors = [:royalblue, :forestgreen, :darkorange, :purple, :crimson]
 
+    # Walk the REAL snapshots. An earlier version took a single static value and added a
+    # synthesised M2 cosine, which produced a convincing-looking "time series" containing no
+    # simulated variation at all; when only one snapshot existed it also invented the time axis.
+    # A diagnostic that fabricates the signal it is supposed to report is worse than none, so the
+    # series is now built by re-extracting at successive time indices.
+    n_snap = isdefined(hydro, :n_snapshots) ? hydro.n_snapshots : length(hydro.times)
+    max_frames = 200
+    snap_idx = n_snap <= max_frames ? collect(1:n_snap) :
+               unique(round.(Int, range(1, n_snap, length = max_frames)))
+    length(snap_idx) < 2 && (snap_idx = [1, max(1, n_snap)])
+
+    series = [Float64[] for _ in depths]
+    frame_hours = Float64[]
+    for (si, k) in enumerate(snap_idx)
+        frame = si == 1 ? hydro :
+                extract_hydrodynamic_dataset(hydrodynamics; time_index = k)
+        push!(frame_hours, first(frame.times) / 3600.0)
+        for (d_idx, d_val) in enumerate(depths)
+            kd = resolve_depth_index(frame.depths, d_val, nothing)
+            push!(series[d_idx], _timeseries_value(frame, i_st, j_st, kd, variable))
+        end
+    end
+
     for (d_idx, d_val) in enumerate(depths)
         k = resolve_depth_index(hydro.depths, d_val, nothing)
         col = colors[mod1(d_idx, length(colors))]
-        depth_label = "$(hydro.depths[k]) m"
-
-        base_val = if variable == :salinity || variable == :S
-            hydro.salinity[i_st, j_st, k]
-        elseif variable == :stratification || variable == :N2
-            hydro.stratification[i_st, j_st, k] * 10000.0
-        elseif variable == :diffusion || variable == :kappa
-            hydro.diffusion[i_st, j_st, k] * 10000.0
-        elseif variable == :speed
-            hydro.speed[i_st, j_st, k] * 100.0
-        else
-            hydro.temperature[i_st, j_st, k]
-        end
-
-        # Temporal series with tidal / diurnal harmonic fluctuation
-        y_series = [base_val + 0.15 * base_val * cos(2.0 * π * t / 12.42) for t in t_hr]
-        lines!(ax, t_hr, y_series, color = col, linewidth = 2.2, label = "Depth $(depth_label)")
+        lines!(ax, frame_hours, series[d_idx], color = col, linewidth = 2.2,
+               label = "Depth $(hydro.depths[k]) m")
     end
 
     axislegend(ax, position = :rt)

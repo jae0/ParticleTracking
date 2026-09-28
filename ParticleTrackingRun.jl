@@ -116,6 +116,11 @@ Individual Segment Flags:
   --sim, --simulation     Run Oceananigans hydrodynamic time integration (Segment 5).
   --track, --tracking     Run Lagrangian larval particle tracking (Segment 6).
   --metrics               Compute retention, empirical diffusion & connectivity (Segment 7).
+ --figures, --regenerate-figures
+                         Redraw EVERY figure and visual (larval, biology diagnostics, Eulerian
+                         hydrodynamic set, interactive HTML, animation) from stored run results.
+                         Reads the trajectory checkpoint and hydrodynamics archive; does not
+                         re-simulate. Use after changing a plotting function.
   --viz, --visualize      Generate CairoMakie spatial figures and interactive HTML map (Segment 8).
 
 DuckDB Analytical Storage & Model Averaging:
@@ -916,7 +921,7 @@ function run_segment_simulation(;
     init_Δt  = Float64(opts.sim_dt) * 0.10
     max_Δt   = Float64(opts.max_dt)
 
-    println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt₀=$(init_Δt)s, max_Δt=$(max_Δt)s)...")
+    println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt₀=$(init_Δt)s, max_Δt=$(max_Δt)s, min_Δt=$(opts.min_dt_seconds)s)...")
     sim = setup_hydrodynamic_simulation(
         target_model,
         Δt = init_Δt,
@@ -924,6 +929,7 @@ function run_segment_simulation(;
         adaptive_time_step = opts.adaptive_cfl,
         target_cfl = opts.target_cfl,
         max_Δt = max_Δt,
+        min_Δt = opts.min_dt_seconds,
         output_dir = out_dir_target,
         output_filename = jld2_filename,
         output_schedule = 50,
@@ -1238,6 +1244,10 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         settlement_status = trajectories.settlement_status,
         settlement_age = trajectories.settlement_age,
         ascent_duration = hasproperty(trajectories, :ascent_duration) ? trajectories.ascent_duration : nothing,
+        # The cohort-level stage diagnostics are saved too, so `--viz` can redraw the
+        # progression figures from a checkpoint without re-running Segment 6.
+        cohort_molt_fraction = hasproperty(trajectories, :cohort_molt_fraction) ? trajectories.cohort_molt_fraction : nothing,
+        molt_schedule = hasproperty(trajectories, :molt_schedule) ? trajectories.molt_schedule : nothing,
         times = trajectories.times,
         ids = trajectories.ids
     )
@@ -1352,6 +1362,12 @@ function run_segment_metrics(;
                 alive = saved["alive"],
                 settlement_status = saved["settlement_status"],
                 settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
+                stage_survival = _ck_or(saved, "stage_survival", fill(1.0, n_p)),
+                ascent_duration = _ck_or(saved, "ascent_duration", fill(0.0, n_p)),
+                # Absent in checkpoints written before these were added, so the progression
+                # figures degrade to a "not recorded" panel instead of erroring.
+                cohort_molt_fraction = _ck_or(saved, "cohort_molt_fraction", zeros(3, n_t)),
+                molt_schedule = _ck_or(saved, "molt_schedule", nothing),
                 times = saved["times"],
                 ids = saved["ids"]
             )
@@ -1565,6 +1581,58 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
+    render_all_figures(; opts) -> NamedTuple
+
+Regenerate every figure and visual for an existing run, from stored results only.
+
+This is the implementation behind `--figures`: particle figures, the larval-biology diagnostics,
+the Eulerian hydrodynamic set, the interactive map, and the animation. It reads the trajectory
+checkpoint and the hydrodynamic archive rather than re-simulating, so it is the fast path to
+iterate on a plotting function.
+
+# What it draws
+- **Larval** (7): trajectories, DVM profiles, settlement density, empirical movement field,
+  connectivity matrix, thermal exposure, recruitment summary, plus the three biology diagnostics
+  (molt progression, degree-day growth, survival curves).
+- **Eulerian** (9): advection, tracers, stratification, diffusion, section, station time series,
+  time–depth diagram, near-bed temperature map, T–S diagram.
+- **Interactive**: the decimated HTML dashboard.
+- **Animation**: the field/dashboard animation, when `--animate-hydro` is set.
+
+Missing inputs are reported rather than fatal, so a run with, say, no hydrodynamic archive still
+produces the larval figures.
+"""
+function render_all_figures(; opts::HydrodynamicOptions = HydrodynamicOptions())
+    println("\n=================================================================")
+    println(" [Figures] Regenerating all figures and visuals")
+    println("=================================================================")
+    viz = run_segment_visualize(opts = opts)
+    if opts.animate_hydro
+        anim_path = if !isempty(opts.hydro_model_file) && isfile(opts.hydro_model_file)
+            render_hydrodynamic_animation_if_requested(opts, opts.hydro_model_file)
+        else
+            println("  --animate-hydro set but no hydro model file available; skipping animation.")
+            nothing
+        end
+        return merge(viz, (animation = anim_path,))
+    end
+    return viz
+end
+
+"""
+    _ck_or(saved::Dict, key::AbstractString, default)
+
+Read `key` from a loaded JLD2 checkpoint dictionary, falling back to `default` when the key is
+absent **or** stored as `nothing`.
+
+The tracking checkpoint writes optional fields as `nothing` when the trajectory lacks them, and
+older checkpoints predate several fields entirely, so a plain `get(saved, key, default)` is not
+enough — a stored `nothing` would flow into the figures as a missing value.
+"""
+_ck_or(saved, key::AbstractString, default) =
+    (haskey(saved, key) && !isnothing(saved[key])) ? saved[key] : default
+
+"""
     run_segment_visualize(;
         opts::HydrodynamicOptions,
         trajectories=nothing
@@ -1621,6 +1689,12 @@ function run_segment_visualize(;
                 alive = saved["alive"],
                 settlement_status = saved["settlement_status"],
                 settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
+                stage_survival = _ck_or(saved, "stage_survival", fill(1.0, n_p)),
+                ascent_duration = _ck_or(saved, "ascent_duration", fill(0.0, n_p)),
+                # Absent in checkpoints written before these were added, so the progression
+                # figures degrade to a "not recorded" panel instead of erroring.
+                cohort_molt_fraction = _ck_or(saved, "cohort_molt_fraction", zeros(3, n_t)),
+                molt_schedule = _ck_or(saved, "molt_schedule", nothing),
                 times = saved["times"],
                 ids = saved["ids"]
             )
@@ -1715,6 +1789,19 @@ function run_segment_visualize(;
     rec_metrics = compute_gridded_recruitment_metrics(target_trajs, lon_bins = lon_b, lat_bins = lat_b)
     plot_recruitment_summary(rec_metrics, output_path = fig7_path)
 
+    # 7b. Larval biology diagnostics: stage progression, thermal-time growth, and survival.
+    # These were previously only embedded in the interactive HTML payload and never drawn, which
+    # left the quantile/CDF stage model unverifiable from the run output.
+    fig_molt_path = joinpath(opts.output_dir, "molt_progression.png")
+    fig_dd_path = joinpath(opts.output_dir, "degree_day_growth.png")
+    fig_surv_path = joinpath(opts.output_dir, "survival_curves.png")
+    println("Rendering molt progression -> $(fig_molt_path)...")
+    plot_molt_progression(target_trajs, output_path = fig_molt_path)
+    println("Rendering degree-day growth -> $(fig_dd_path)...")
+    plot_degree_day_growth(target_trajs, output_path = fig_dd_path)
+    println("Rendering survival curves -> $(fig_surv_path)...")
+    plot_survival_curves(target_trajs, output_path = fig_surv_path)
+
     # 8. Hydrodynamic Model Eulerian Advection & Tracers Figures
     fig8_path = joinpath(opts.output_dir, "hydrodynamic_advection.png")
     fig9_path = joinpath(opts.output_dir, "hydrodynamic_tracers.png")
@@ -1757,6 +1844,58 @@ function run_segment_visualize(;
         section_type = :lat,
         output_path = fig_sec_path
     )
+
+    # 8b. Eulerian time series at a representative station. This plot function existed but was
+    # never called by the driver, so no run ever produced an Eulerian time series — the standard
+    # check that a simulation is evolving plausibly at a fixed point.
+    fig_ts_path = joinpath(opts.output_dir, "hydrodynamic_timeseries.png")
+    if !isnothing(active_hydro)
+        println("Rendering hydrodynamic station time series -> $(fig_ts_path)...")
+        try
+            plot_hydrodynamic_timeseries(
+                active_hydro,
+                station = (opts.domain_lon[1] + 0.55 * (opts.domain_lon[2] - opts.domain_lon[1]),
+                           opts.domain_lat[1] + 0.55 * (opts.domain_lat[2] - opts.domain_lat[1])),
+                variable = :temperature,
+                output_path = fig_ts_path
+            )
+        catch err
+            @warn "Station time-series plot failed (non-fatal): $(sprint(showerror, err))"
+        end
+    else
+        fig_ts_path = nothing
+    end
+
+    # 8c. Additional Eulerian diagnostics. The time series above is now built from the real
+    # snapshots; these three were absent entirely.
+    fig_hov_path = joinpath(opts.output_dir, "hydrodynamic_hovmoller.png")
+    fig_tbot_path = joinpath(opts.output_dir, "bottom_temperature_map.png")
+    fig_ts_diagram_path = joinpath(opts.output_dir, "ts_diagram.png")
+    if !isnothing(active_hydro)
+        st_lon = opts.domain_lon[1] + 0.55 * (opts.domain_lon[2] - opts.domain_lon[1])
+        st_lat = opts.domain_lat[1] + 0.55 * (opts.domain_lat[2] - opts.domain_lat[1])
+        for (label, path, f) in (
+            ("time-depth diagram", fig_hov_path,
+             () -> plot_hydrodynamic_hovmoller(active_hydro; station = (st_lon, st_lat),
+                                               variable = :temperature, output_path = fig_hov_path)),
+            ("near-bed temperature map", fig_tbot_path,
+             () -> plot_bottom_temperature_map(active_hydro; output_path = fig_tbot_path)),
+            ("temperature-salinity diagram", fig_ts_diagram_path,
+             () -> plot_temperature_salinity_diagram(active_hydro; output_path = fig_ts_diagram_path))
+        )
+            println("Rendering $label -> $(path)...")
+            try
+                f()
+            catch err
+                # A diagnostic that cannot be built from this archive must not abort the run.
+                @warn "$label failed (non-fatal): $(first(split(sprint(showerror, err), "\n")))"
+            end
+        end
+    else
+        fig_hov_path = nothing
+        fig_tbot_path = nothing
+        fig_ts_diagram_path = nothing
+    end
 
     # 9. Hydrodynamic Field & Dashboard Animation (Oceananigans / CairoMakie)
     anim_file_path = nothing
@@ -1961,8 +2100,17 @@ function run_segment_visualize(;
         fig_connectivity = fig5_path,
         fig_thermal = fig6_path,
         fig_recruitment = fig7_path,
+        # Larval biology diagnostics
+        fig_molt_progression = fig_molt_path,
+        fig_degree_day_growth = fig_dd_path,
+        fig_survival = fig_surv_path,
+        # Eulerian
         fig_hydro_advection = fig8_path,
         fig_hydro_tracers = fig9_path,
+        fig_hydro_timeseries = fig_ts_path,
+        fig_hovmoller = fig_hov_path,
+        fig_bottom_temperature = fig_tbot_path,
+        fig_ts_diagram = fig_ts_diagram_path,
         fig_comparison = fig10_path,
         fig_voronoi = fig_voronoi_path,
         interactive_map = opts.interactive_map ? html_path : nothing,
@@ -2963,6 +3111,15 @@ function main(args = ARGS)
 
     if "--viz" in args || "--visualize" in args || "--segment=viz" in args
         run_segment_visualize(opts = opts)
+        has_run = true
+    end
+
+    # Explicit "redraw every figure and visual from stored results" entry point. Distinct from
+    # --viz in intent only: it names the intent (regenerate figures) and is what a user reaches
+    # for after changing a plotting function, with no need to remember which segment owns it.
+    if "--figures" in args || "--regenerate-figures" in args
+        println("Regenerating all figures and visuals from stored run results...")
+        render_all_figures(opts = opts)
         has_run = true
     end
 

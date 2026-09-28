@@ -183,6 +183,7 @@ struct HydrodynamicOptions
     projection_year          :: Int
     sim_dt                   :: Float64
     sim_duration             :: Float64
+    min_dt_seconds           :: Float64
     adaptive_cfl             :: Bool
     target_cfl               :: Float64
     surface_heat_flux        :: Float64
@@ -284,6 +285,7 @@ function HydrodynamicOptions(;
     projection_year       :: Int = 2050,
     sim_dt                :: Real = 120.0,
     sim_duration          :: Real = 43200.0,
+    min_dt_seconds        :: Real = 2.0,
     adaptive_cfl          :: Bool = true,
     target_cfl            :: Real = 0.2,
     surface_heat_flux     :: Real = 50.0,
@@ -382,6 +384,7 @@ function HydrodynamicOptions(;
         projection_year,
         Float64(sim_dt),
         Float64(sim_duration),
+        Float64(min_dt_seconds),
         adaptive_cfl,
         Float64(target_cfl),
         Float64(surface_heat_flux),
@@ -711,6 +714,10 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
 
     sim_hours = Float64(get_val("hydrodynamics", "sim_duration_hours", 12.0))
     sim_dt    = Float64(get_val("hydrodynamics", "sim_dt_seconds", 120.0))
+    # Floor on the adaptive time step, forwarded to the simulation as `min_Δt`. The surface cell
+    # sets the admissible step (Δt ≈ target_cfl × Δz_min / w), so a floor above that value stops
+    # the wizard stabilising the surface layer.
+    min_dt_seconds = Float64(get_val("hydrodynamics", "min_dt_seconds", 2.0))
     adapt_cfl = Bool(get_val("hydrodynamics", "adaptive_cfl", true))
     tgt_cfl   = Float64(get_val("hydrodynamics", "target_cfl", 0.2))
     heat_flux = Float64(get_val("hydrodynamics", "surface_heat_flux", 50.0))
@@ -849,6 +856,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         projection_year = proj_year,
         sim_dt = sim_dt,
         sim_duration = sim_hours * 3600.0,
+        min_dt_seconds = min_dt_seconds,
         adaptive_cfl = adapt_cfl,
         target_cfl = tgt_cfl,
         surface_heat_flux = heat_flux,
@@ -990,6 +998,7 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "adaptive_cfl" => opts.adaptive_cfl,
             "target_cfl" => opts.target_cfl,
             "max_dt_seconds" => opts.max_dt,
+            "min_dt_seconds" => opts.min_dt_seconds,
             "surface_heat_flux" => opts.surface_heat_flux,
             "max_flow_snapshots" => something(opts.max_flow_snapshots, 0),
             "allow_analytical_fallback" => opts.allow_analytical_fallback,
