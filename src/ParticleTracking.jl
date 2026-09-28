@@ -75,6 +75,7 @@ include("data/open_data.jl")
 include("utils/synthetic_data.jl")
 include("utils/architecture.jl")
 include("data/grid_bathymetry.jl")
+include("data/vertical_grid.jl")
 include("model/hydrodynamic_model.jl")
 include("utils/tides.jl")
 include("model/climate_scenarios.jl")
@@ -132,6 +133,9 @@ export
     REGIONAL_COASTLINE,
     build_shelf_grid,
     load_vertical_grid_csv,
+    two_segment_z_faces,
+    scotian_shelf_z_faces,
+    stretched_tanh_z_faces,
     load_bathymetry_from_netcdf,
     get_bathymetry_interpolator,
     regrid_bathymetry_from_etopo,
@@ -196,7 +200,15 @@ export
     superpose_tidal_velocity,
     update_larval_stage,
     draw_molt_thresholds,
-    stage_from_thresholds,
+    MoltCDF,
+    molt_cdf,
+    molt_probability,
+    molt_schedule,
+    molt_stage_index,
+    cohort_molt_fraction,
+    frailty_from_quantile,
+    settlement_propensity,
+    threshold,
     lognormal_sigma,
     draw_lognormal_mean,
     draw_beta_index,

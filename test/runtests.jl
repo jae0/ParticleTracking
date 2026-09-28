@@ -1,40 +1,42 @@
 """
     test/runtests.jl
 
-Automated unit test suite for the ParticleTracking package covering:
-1. Synthetic and real data processing & drag laws
-2. Grid and immersed boundary construction
-3. Hydrodynamic model configuration & stratification
-4. Climate change scenarios, PLD models, and thermal mortality
-5. DVM swimming velocities, degree-day molting, and settlement filters
-6. Eulerian/Lagrangian particle tracking and tidal current superposition
-7. Visualization generators
-8. Coastline geometry, 0% land seeding, and CFA strata intersections
-9. Enhanced physics: air-sea heat flux, BBL shear, passive sinking,
-   spring-neap tides, Visser diffusive drift, and recruitment connectivity
+Automated test suite for ParticleTracking, in 19 numbered testsets.
+
+**Conventions**
+
+- **Prefer one aggregate assertion to a loop of many.** A `for p in 1:n; @test ...; end` block emits
+  one test *per iteration* and buries a real failure in a wall of identical ones. Write
+  `@test all(...)` instead: it reports the same information (via the failing index) in a single
+  test. Only loop when the iterations are genuinely distinct cases and per-case reporting matters.
+- Each testset is named `N. Description` and they run in order; the number is the identifier used
+  in `todo.md` and in commit messages, so append rather than renumber.
+- Assertion *counts* are not a quality metric. A testset that reports 300 tests is usually one that
+  has not been aggregated.
+
+**Runtime** is ~4 minutes, dominated by testset 4 (hydrodynamic model, ~60 s), testset 11
+(rendering, ~48 s) and testset 19 (live ETOPO/WOA23 fetches, ~32 s). Everything else is seconds.
+There is no "skip the slow ones" switch: an earlier attempt guarded only the first line of each
+testset body, so it printed "skipping" while still running everything, which is worse than not
+offering it.
 """
 
 using Test
 using Random
 using Statistics
 
-# Import necessary symbols from external packages
-  # Required external imports for tests
 using Oceananigans
 using Oceananigans.Grids: LatitudeLongitudeGrid
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid
 using Oceananigans.Architectures
 using DataFrames: DataFrame, nrow
-using DBInterface  # ← ADD THIS
+using DBInterface
 using NCDatasets
 using JLD2
- 
 
-# Load the ParticleTracking module directly
 import Pkg
 Pkg.activate(joinpath(@__DIR__, ".."), io = devnull)
 using ParticleTracking
-
 
 @testset "ParticleTracking.jl Test Suite" begin
 
@@ -171,7 +173,7 @@ using ParticleTracking
         @test suit_warm.suitable == false # too warm
     end
 
-    @testset "6b. Stochastic Biology Controls (cv_molt / cv_mortality / cv_settlement)" begin
+    @testset "6b. Stochastic Biology Controls (quantile / CDF formulation)" begin
         # Guards three defects found together:
         #
         # 1. The cv_* keys were loaded into the config and written to resolved_config.toml but
@@ -188,46 +190,105 @@ using ParticleTracking
         # the *contract* each dispersion helper must hold.
 
         # --- deterministic path is bit-exact and cv = 0 is identity --------------
-        @test draw_molt_thresholds(MersenneTwister(1); cv_molt = 0.0) == (65.0, 130.0, 200.0)
-        @test update_larval_stage(:zoea1, 64.9; cv_molt = 0.0) == :zoea1
-        @test update_larval_stage(:zoea1, 65.0; cv_molt = 0.0) == :zoea2
-        @test update_larval_stage(:zoea2, 130.0; cv_molt = 0.0) == :megalopa
-        @test update_larval_stage(:megalopa, 200.0; cv_molt = 0.0) == :instar1_settled
+        sched0 = molt_schedule(cv_molt = 0.0)
+        @test update_larval_stage(:zoea1, 64.9, sched0, 0.5) == :zoea1
+        @test update_larval_stage(:zoea1, 65.0, sched0, 0.5) == :zoea2
+        @test update_larval_stage(:zoea2, 130.0, sched0, 0.5) == :megalopa
+        @test update_larval_stage(:megalopa, 200.0, sched0, 0.5) == :instar1_settled
+        # cv = 0 makes the CDF a step at the base mean, so EVERY quantile molts at exactly 65 DD
+        @test all(update_larval_stage(:zoea1, 65.0, sched0, u) == :zoea2 for u in (0.0, 0.25, 0.5, 0.99))
+        @test all(update_larval_stage(:zoea1, 64.99, sched0, u) == :zoea1 for u in (0.0, 0.5, 1.0))
         @test lognormal_sigma(0.0) == 0.0
         @test draw_lognormal_mean(100.0, 0.0, MersenneTwister(1)) == 100.0
         @test draw_beta_index(0.4, 0.0, MersenneTwister(1)) == 0.4
-        # identical seeds give identical stages on the deterministic path
-        r1 = MersenneTwister(7); rand(r1, 50)
-        r2 = MersenneTwister(7); rand(r2, 50)
-        @test update_larval_stage(:zoea1, 70.0; cv_molt = 0.0, rng = r1) ==
-              update_larval_stage(:zoea1, 70.0; cv_molt = 0.0, rng = r2)
+        @test frailty_from_quantile(0.5, 0.0) == 1.0
+        @test settlement_propensity(0.5, 0.4, 0.0) == 0.4
 
-        # --- molt thresholds: ordered, positive, and a fixed triple is reusable --
-        # Dispersion is on the stage *increments*, so all three cumulative means are preserved
-        # and the total is automatically ordered. A fixed triple must be reusable: that is what
-        # makes the stage monotone across timesteps.
-        th_m = draw_molt_thresholds(MersenneTwister(3); cv_molt = 0.4)
-        @test th_m[1] < th_m[2] < th_m[3]
+        # --- the CDF: 0-to-1, monotone, mean-preserving -------------------------
+        for cv in (0.0, 0.25, 0.5)
+            F = molt_cdf(65.0, cv)
+            @test molt_probability(F, 0.0) == 0.0
+            @test 0.0 <= molt_probability(F, 65.0) <= 1.0
+            @test molt_probability(F, 1e12) > 0.999
+            @test issorted([molt_probability(F, dd) for dd in range(0.0, 400.0, length = 200)])
+            # u <= cdf(F, d)  <=>  d >= threshold(F, u)
+            for u in (0.1, 0.5, 0.9), d in (20.0, 65.0, 130.0, 200.0)
+                @test (u <= molt_probability(F, d)) == (d >= threshold(F, u))
+            end
+        end
+        # mean of the represented distribution is the base threshold
+        @test isapprox(mean([threshold(molt_cdf(65.0, 0.4), q) for q in range(0.001, 0.999, length = 20000)]),
+                       65.0; rtol = 0.03)
+        @test isapprox(mean([threshold(molt_cdf(200.0, 0.4), q) for q in range(0.001, 0.999, length = 20000)]),
+                       200.0; rtol = 0.03)
+
+        # --- one developmental quantile per larva, reused across all 3 stages -----
+        sched = molt_schedule(cv_molt = 0.4)
         order = Dict(:zoea1 => 0, :zoea2 => 1, :megalopa => 2, :instar1_settled => 3)
-        @test issorted(Int[order[stage_from_thresholds(dd, th_m)] for dd in 0.0:1.0:260.0])
-        @test all(dd -> update_larval_stage(:zoea1, dd; cv_molt = 0.4, thresholds = th_m,
-                                            rng = MersenneTwister(999)) ==
-                            stage_from_thresholds(dd, th_m),
-                  (0.0, 40.0, 80.0, 150.0, 210.0))
-        @test_throws ArgumentError draw_molt_thresholds(MersenneTwister(1); cv_molt = 0.25,
-                                                         dd_zoea1_to_zoea2 = 130.0,
-                                                         dd_zoea2_to_megalopa = 130.0)
+        for u in (0.05, 0.3, 0.6, 0.95)
+            ranks = Int[]
+            st = :zoea1
+            for dd in 0.0:1.0:260.0
+                st = update_larval_stage(st, dd, sched, u)
+                push!(ranks, order[st])
+            end
+            @test issorted(ranks)                      # monotone: never regresses
+        end
+        # Bounded search so a regression can never hang the suite.
+        function first_dd(pred, u; cap = 800.0)
+            d = 0.0
+            while pred(d, sched, u) && d < cap
+                d += 0.5
+            end
+            d
+        end
+        t1_of(u) = first_dd((d, s, x) -> update_larval_stage(:zoea1, d, s, x) == :zoea1, u)
+        t3_of(u) = first_dd((d, s, x) -> update_larval_stage(:megalopa, d, s, x) == :megalopa, u)
+        us = range(0.05, 0.95, length = 12)
+        # u indexes the threshold distribution, so a SMALL u is a fast developer: its molting
+        # degree-day must be lower, i.e. the sequence must increase with u.
+        @test issorted([t1_of(u) for u in us])
+        @test issorted([t3_of(u) for u in us])
+        @test t1_of(0.1) < t1_of(0.9)
+        @test t3_of(0.1) < t3_of(0.9)
+        @test all(t1_of(a) <= t1_of(b) for a in us for b in us if a <= b)
+        @test all(t3_of(a) <= t3_of(b) for a in us for b in us if a <= b)
+        # dead and settled stages are terminal
+        @test update_larval_stage(:dead, 500.0, sched, 0.5) == :dead
+        @test update_larval_stage(:instar1_settled, 500.0, sched, 0.5) == :instar1_settled
+        @test_throws ArgumentError molt_schedule(dd_zoea1_to_zoea2 = 130.0,
+                                                 dd_zoea2_to_megalopa = 130.0,
+                                                 cv_molt = 0.25)
+        @test_throws ArgumentError molt_cdf(-1.0, 0.25)
 
-        # a wider cv must widen the spread of first-transition degree-days
-        spread_for(cv) = var([begin
-                th = draw_molt_thresholds(MersenneTwister(s); cv_molt = cv)
-                dd = 0.0
-                while stage_from_thresholds(dd, th) == :zoea1 && dd < 400.0
-                    dd += 0.25
-                end
-                dd
-            end for s in 1:150])
-        @test spread_for(0.02) < spread_for(0.25) < spread_for(0.50)
+        # --- cohort fraction: 0-to-1 and monotone in degree-days -----------------
+        cf = cohort_molt_fraction(sched, 0.0)
+        @test all(==(0.0), cf)
+        cf2 = cohort_molt_fraction(sched, 1e9)
+        @test all(x -> x > 0.999, cf2)
+        @test issorted([cohort_molt_fraction(sched, dd)[1] for dd in range(0.0, 300.0, length = 100)])
+        @test all(x -> 0.0 <= x <= 1.0, cohort_molt_fraction(sched, 77.0))
+
+        # --- mortality frailty: mean 1, positive, u=0.5 neutral ----------------
+        for cv in (0.25, 0.5)
+            fr = [frailty_from_quantile(q, cv) for q in range(1e-6, 1 - 1e-6, length = 20000)]
+            @test all(>(0.0), fr)
+            @test isapprox(sum(fr) / length(fr), 1.0; rtol = 0.03)
+            @test std(fr) / mean(fr) ≈ cv rtol = 0.08
+        end
+        @test frailty_from_quantile(0.0, 0.5) < 1.0    # low quantile = vigorous
+        @test frailty_from_quantile(1.0, 0.5) > 1.0    # high quantile = weak
+
+        # --- settlement propensity: bounded, mean-preserving, monotone in u ------
+        for (hsi, cv) in ((0.5, 0.25), (0.3, 0.5))
+            pr = [settlement_propensity(q, hsi, cv) for q in range(1e-6, 1 - 1e-6, length = 20000)]
+            @test all(x -> 0.0 < x < 1.0, pr)
+            @test isapprox(sum(pr) / length(pr), hsi; rtol = 0.05)
+            @test issorted(pr)                          # higher readiness -> higher probability
+        end
+        @test settlement_propensity(0.5, 0.0, 0.5) == 0.0     # HSI gate is absolute
+        @test settlement_propensity(0.5, 1.0, 0.5) == 1.0
+        @test settlement_propensity(0.5, 0.4, 0.0) == 0.4    # cv=0 is identity
 
         # --- dispersion helpers: mean-preserving, positive, bounded, no clamp pile-up
         # (contract-level; full statistical validation lives in work/test_lognormal.jl)
@@ -238,7 +299,7 @@ using ParticleTracking
         @test all(x -> 0.0 < x < 1.0, beta)
         @test isapprox(sum(beta) / length(beta), 0.5; rtol = 0.05)
 
-        # --- settlement: index gate, and cv=0 is the plain Bernoulli on HSI --------
+        # --- settlement: the HSI gate, and the per-larva propensity applied once ---
         det = evaluate_settlement_suitability(-120.0, 3.5; stochastic = false, cv_settlement = 0.0)
         @test det.suitable == true && det.hsi == det.probability
         @test evaluate_settlement_suitability(-800.0, 2.0; stochastic = false).suitable == false
@@ -246,19 +307,26 @@ using ParticleTracking
         @test evaluate_settlement_suitability(-800.0, 2.0; stochastic = true, cv_settlement = 0.5,
                   rng = MersenneTwister(1)).suitable == false
 
-        # at a marginal site (hsi strictly in (0,1)) the realised settlement rate must track
-        # HSI to within Monte-Carlo error, and must NOT be suppressed by cv_settlement
+        # At a marginal site (hsi strictly in (0,1)) the realised settlement rate must track HSI to
+        # within Monte-Carlo error, and must NOT be suppressed by cv_settlement. The tracking loop
+        # now calls the evaluator with cv_settlement = 0 and applies the larva's own propensity, so
+        # the rate is tested through that same path.
         marginal = (-60.0, 1.0)   # s_z = 1/3, thermally optimal; hsi ~ 1/3
         hsi_marg = evaluate_settlement_suitability(marginal...; stochastic = false).hsi
         @test 0.0 < hsi_marg < 1.0
-        rate(cv) = mean([evaluate_settlement_suitability(marginal...; stochastic = true,
-                     cv_settlement = cv, rng = MersenneTwister(s)).suitable for s in 1:400])
-        @test abs(rate(0.0) - hsi_marg) < 0.15
-        @test abs(rate(0.5) - hsi_marg) < 0.15   # mean-preserving: cv does not shift the rate
-        probs = [evaluate_settlement_suitability(marginal...; stochastic = true, cv_settlement = 0.5,
-                     rng = MersenneTwister(s)).probability for s in 1:200]
-        @test length(unique(round.(probs, digits = 6))) > 1
-        @test all(0.0 .<= probs .<= 1.0)
+
+        function settle_rate(cv, n = 400)
+            s = 0
+            for seed in 1:n
+                u = rand(MersenneTwister(seed))          # the larva's fixed readiness
+                suit = evaluate_settlement_suitability(marginal...; stochastic = false, cv_settlement = 0.0)
+                p = settlement_propensity(u, suit.hsi, cv)
+                s += rand(MersenneTwister(seed + 10_000)) <= p
+            end
+            s / n
+        end
+        @test abs(settle_rate(0.0) - hsi_marg) < 0.15
+        @test abs(settle_rate(0.5) - hsi_marg) < 0.15   # mean-preserving: cv does not shift the rate
 
         # --- config plumbing: TOML -> options -> resolved dict (round-trips) ------
         cfg = get_default_configuration()
@@ -325,13 +393,14 @@ using ParticleTracking
         )
         @test length(larvae.lon) == 15
 
-        # Verify all particles are placed in marine water >= 100m deep
-        for p in 1:15
-            z_bed = bathy_interp(larvae.lon[p], larvae.lat[p])
-            @test z_bed <= -100.0 # Must be at least 100m deep
-            @test larvae.depth[p] >= z_bed # Must be above seabed
-            @test larvae.depth[p] <= -1.0  # Must be below surface
-        end
+        # Verify all particles are placed in marine water >= 100m deep.
+        # Aggregated rather than one assertion per particle per property: 15 particles x 3
+        # properties produced 45 separate tests that all reported the same thing. A single
+        # `all(...)` names the failing particle and is far easier to read.
+        z_beds = [bathy_interp(larvae.lon[p], larvae.lat[p]) for p in 1:15]
+        @test all(z -> z <= -100.0, z_beds)          # at least 100m deep
+        @test all(p -> larvae.depth[p] >= z_beds[p], 1:15)   # above the seabed
+        @test all(z -> z <= -1.0, larvae.depth)      # below the surface (depths are negative)
 
         # Test rejection error when requesting depth impossible in land domain
         land_fn(lon, lat) = 50.0 # Positive elevation = land
@@ -371,11 +440,11 @@ using ParticleTracking
         )
 
         @test size(trajs.lons) == (10, 13)
-        # Verify particles NEVER penetrated land despite eastward flow
-        for p in 1:10, s in 1:13
-            @test coastal_bathy(trajs.lons[p, s], trajs.lats[p, s]) < 0.0
-            @test trajs.lons[p, s] <= -62.0
-        end
+        # Particles must NEVER penetrate land despite a 1.5 m/s eastward flow. Asserted as one
+        # property over the whole (particle, time) array: the loop form emitted 2 x 10 x 13 = 260
+        # separate tests for what is a single invariant.
+        @test all(<=(-62.0), trajs.lons)                       # never east of the land wall
+        @test all(>(0.0), (-coastal_bathy.(vec(trajs.lons), vec(trajs.lats))))  # always over the seabed
     end
 
     @testset "8. Empirical Movement & Dispersion Analysis" begin
@@ -1246,7 +1315,7 @@ using ParticleTracking
         @test all(conn_demo.matrix .<= 1.0)
     end
 
-    @testset "Hydrodynamic Field & Dashboard Visualizations and Animations" begin
+    @testset "18. Hydrodynamic Field & Dashboard Animation" begin
         # 1. Configuration options verification. The default and custom sets, and the
         #    options <-> config round-trip, are each driven from one table so the same
         #    fields are checked through all three representations without repetition.
@@ -1282,7 +1351,8 @@ using ParticleTracking
         end
     end
 
-    @testset "10. ClimaOcean, ETOPO 2022, WOA23 & Lateral Boundary Relaxation" begin
+    @testset "19. ClimaOcean, ETOPO 2022, WOA23 & Boundary Relaxation" begin
+
         # 1. Seawater freezing temperature (UNESCO / Millero 1978)
         t_freeze_fresh = seawater_freezing_temperature(0.0)
         @test isapprox(t_freeze_fresh, 0.0, atol = 1e-6)

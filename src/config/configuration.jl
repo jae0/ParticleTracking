@@ -186,6 +186,9 @@ struct HydrodynamicOptions
     adaptive_cfl             :: Bool
     target_cfl               :: Float64
     surface_heat_flux        :: Float64
+    max_flow_snapshots       :: Int
+    allow_analytical_fallback :: Bool
+    max_current_speed        :: Union{Nothing, Float64}
     n_particles              :: Int
     track_duration           :: Float64
     track_dt                 :: Float64
@@ -221,6 +224,8 @@ struct HydrodynamicOptions
     auto_restart             :: Bool
     run_id                   :: String
     vertical_stretching_mode :: Symbol
+    nz_above :: Int
+    vertical_break_depth :: Float64
     vertical_grid_file       :: String
     resolution_scale         :: Float64
     atmospheric_source       :: Symbol
@@ -282,6 +287,9 @@ function HydrodynamicOptions(;
     adaptive_cfl          :: Bool = true,
     target_cfl            :: Real = 0.2,
     surface_heat_flux     :: Real = 50.0,
+    max_flow_snapshots    :: Int = 400,
+    allow_analytical_fallback :: Bool = false,
+    max_current_speed     :: Union{Nothing, Real} = 3.0,
     n_particles           :: Int = 100,
     track_duration        :: Real = 86400.0 * 5,
     track_dt              :: Real = 300.0,
@@ -317,6 +325,8 @@ function HydrodynamicOptions(;
     auto_restart             :: Bool = true,
     run_id                   :: AbstractString = "",
     vertical_stretching_mode :: Symbol = :tanh,
+    nz_above :: Int = 0,
+    vertical_break_depth :: Real = -400.0,
     vertical_grid_file       :: AbstractString = joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
     resolution_scale         :: Real = 1.0,
     atmospheric_source       :: Symbol = :era5,
@@ -375,6 +385,9 @@ function HydrodynamicOptions(;
         adaptive_cfl,
         Float64(target_cfl),
         Float64(surface_heat_flux),
+        Int(max_flow_snapshots),
+        allow_analytical_fallback,
+        (max_current_speed isa Real && max_current_speed > 0) ? Float64(max_current_speed) : nothing,
         n_particles,
         Float64(track_duration),
         Float64(track_dt),
@@ -410,6 +423,8 @@ function HydrodynamicOptions(;
         auto_restart,
         String(run_id),
         vertical_stretching_mode,
+        Int(nz_above),
+        Float64(vertical_break_depth),
         String(vertical_grid_file),
         Float64(resolution_scale),
         atmospheric_source,
@@ -576,6 +591,8 @@ function get_default_configuration()::Dict{String, Any}
             "divergence_velocity_limit" => 20.0,
             "coriolis_latitude" => 44.5,
             "surface_heat_flux" => 50.0,
+            "max_flow_snapshots" => 0,
+            "allow_analytical_fallback" => false,
             "turbulence_closure" => "nemotke",
             "enable_sea_ice" => true,
             "enable_oxygen" => true
@@ -697,6 +714,17 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     adapt_cfl = Bool(get_val("hydrodynamics", "adaptive_cfl", true))
     tgt_cfl   = Float64(get_val("hydrodynamics", "target_cfl", 0.2))
     heat_flux = Float64(get_val("hydrodynamics", "surface_heat_flux", 50.0))
+    # Cap on how many hydrodynamic snapshots are held in memory when building the 4D flow
+    # interpolator for particle tracking. A production run stores thousands of snapshots and
+    # materialising all of them for u, v, w and T is hundreds of gigabytes; the snapshots are
+    # evenly subsampled down to this count. `0` means "no cap" (load every snapshot).
+    max_flow_snapshots = Int(get_val("hydrodynamics", "max_flow_snapshots", 400))
+    allow_analytical_fallback = Bool(get_val("hydrodynamics", "allow_analytical_fallback", false))
+    # Cap on the background current a larva is advected by. A diverged hydrodynamics cell can
+    # otherwise teleport a particle across the domain in a single step; 3 m/s is well above any
+    # real Scotian Shelf current. Use a negative value to disable the clamp.
+    _mcs = Float64(get_val("hydrodynamics", "max_current_speed", 3.0))
+    max_current_speed = _mcs > 0 ? _mcs : nothing
 
     n_parts   = Int(get_val("biology", "n_particles", 100))
     track_days = Float64(get_val("biology", "track_duration_days", 5.0))
@@ -766,6 +794,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
 
     res_scale = Float64(get_val("grid", "resolution_scale", 1.0))
     v_mode_str = String(get_val("grid", "vertical_stretching_mode", "tanh"))
+    # Two-segment shelf grid parameters. `vertical_stretching_mode = "two_segment"` splits `nz`
+    # into a surface-refined upper segment above `vertical_break_depth` and a coarse lower segment,
+    # which is the only way to resolve the 10-400 m active layer while still reaching the deep basin.
+    # `nz_above = 0` means "derive it as 60% of nz".
+    nz_above_cfg = Int(get_val("grid", "nz_above", 0))
+    vertical_break_depth = Float64(get_val("grid", "vertical_break_depth", -400.0))
     v_mode = Symbol(lowercase(v_mode_str))
     v_file = String(get_val("grid", "vertical_grid_file",
                             joinpath("inputs", "scotian_shelf_vertical_grid.csv")))
@@ -818,6 +852,10 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         adaptive_cfl = adapt_cfl,
         target_cfl = tgt_cfl,
         surface_heat_flux = heat_flux,
+    max_flow_snapshots = max_flow_snapshots,
+    allow_analytical_fallback = allow_analytical_fallback,
+    max_current_speed = (max_current_speed isa Real && max_current_speed > 0) ?
+                        Float64(max_current_speed) : nothing,
         n_particles = n_parts,
         track_duration = track_days * 86400.0,
         track_dt = track_dt,
@@ -852,6 +890,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         auto_restart = auto_res,
         run_id = run_id_val,
         vertical_stretching_mode = v_mode,
+        nz_above = nz_above_cfg,
+        vertical_break_depth = vertical_break_depth,
         vertical_grid_file = v_file,
         resolution_scale = res_scale,
     atmospheric_source = atmo_src,
@@ -910,6 +950,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "nz" => opts.grid_size[3],
             "resolution_scale" => opts.resolution_scale,
             "vertical_stretching_mode" => string(opts.vertical_stretching_mode),
+            "nz_above" => opts.nz_above,
+            "vertical_break_depth" => opts.vertical_break_depth,
             "vertical_grid_file" => opts.vertical_grid_file
         ),
         "atmosphere" => Dict{String, Any}(
@@ -949,6 +991,9 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "target_cfl" => opts.target_cfl,
             "max_dt_seconds" => opts.max_dt,
             "surface_heat_flux" => opts.surface_heat_flux,
+            "max_flow_snapshots" => something(opts.max_flow_snapshots, 0),
+            "allow_analytical_fallback" => opts.allow_analytical_fallback,
+            "max_current_speed" => something(opts.max_current_speed, 0.0),
             "hydro_model_file" => opts.hydro_model_file,
             "hydro_only" => opts.hydro_only,
             "track_only" => opts.track_only,
@@ -1038,6 +1083,8 @@ struct HydrodynamicConfig
     domain_z                 :: Tuple{Float64, Float64}
     grid_size                :: Tuple{Int, Int, Int}
     vertical_stretching_mode :: Symbol
+    nz_above :: Int
+    vertical_break_depth :: Float64
     vertical_grid_file       :: String
     resolution_scale         :: Float64
     bathymetry_source        :: Symbol

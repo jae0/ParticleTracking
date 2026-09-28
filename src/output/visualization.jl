@@ -2614,7 +2614,9 @@ function export_interactive_tracks_html(
     recruitment_metrics::Union{Nothing, NamedTuple} = nothing,
     bathymetry::Union{Nothing, NamedTuple} = nothing,
     strata_definitions::Union{Nothing, AbstractVector} = nothing,
-    title::AbstractString = "Interactive Larval Dispersal & Demographic Connectivity Map"
+    title::AbstractString = "Interactive Larval Dispersal & Demographic Connectivity Map",
+    max_tracks::Int = 400,
+    max_points_per_track::Int = 900
 )::String
     out_dir = dirname(output_path)
     if !isempty(out_dir) && !isdir(out_dir)
@@ -2726,7 +2728,6 @@ function export_interactive_tracks_html(
         stages = trajs.stages
         times = trajs.times
         n_p, n_t = size(lons)
-        t_days = [round(t / 86400.0, digits = 3) for t in times]
 
         temps = trajs.temperatures
         dds = trajs.degree_days_timeseries
@@ -2737,15 +2738,46 @@ function export_interactive_tracks_html(
         ages = trajs.settlement_age
         ids = trajs.ids
 
+        # ── Payload decimation ────────────────────────────────────────────────
+        # The HTML embeds every array as inline JSON, so a full-resolution run is
+        # unusable in a browser: 500 larvae over a 730-day horizon at dt = 300 s is
+        # ~210 000 steps x 7 arrays, which produced a 1.7 GB file that would not open at all.
+        # Thin in time and cap the number of tracks so the page stays interactive.
+        # Traces are decimated uniformly (endpoints always retained), and the number of
+        # tracks shown is capped, but every *statistic* below is still computed from the
+        # FULL-resolution arrays, so the summary numbers are unaffected.
+        track_idx = if n_p > max_tracks
+            unique(round.(Int, range(1, n_p, length = max_tracks)))
+        else
+            collect(1:n_p)
+        end
+        time_idx = if n_t > max_points_per_track
+            unique(round.(Int, range(1, n_t, length = max_points_per_track)))
+        else
+            collect(1:n_t)
+        end
+        n_tracks_shown = length(track_idx)
+        n_points_shown = length(time_idx)
+        # Time axis must be thinned on the same indices as the per-track arrays, or the
+        # browser indexes past the end of the series.
+        t_days = [round(times[t] / 86400.0, digits = 3) for t in time_idx]
+        decimated = (n_tracks_shown < n_p) || (n_points_shown < n_t)
+        if decimated
+            @info "export_interactive_tracks_html: decimated payload to " *
+                  "$n_tracks_shown of $n_p tracks and $n_points_shown of $n_t time points " *
+                  "(inline JSON cannot hold the full $n_p x $n_t). Statistics are computed " *
+                  "from the full-resolution data and are unaffected."
+        end
+
         p_entries = String[]
-        for p in 1:n_p
-            p_lons = [round(lons[p, t], digits = 4) for t in 1:n_t]
-            p_lats = [round(lats[p, t], digits = 4) for t in 1:n_t]
-            p_depths = [round(depths[p, t], digits = 1) for t in 1:n_t]
-            p_temps = [round(temps[p, t], digits = 2) for t in 1:n_t]
-            p_dds = [round(dds[p, t], digits = 2) for t in 1:n_t]
-            p_survs = [round(survs[p, t], digits = 3) for t in 1:n_t]
-            p_stages = [string(stages[p, t]) for t in 1:n_t]
+        for p in track_idx
+            p_lons = [round(lons[p, t], digits = 4) for t in time_idx]
+            p_lats = [round(lats[p, t], digits = 4) for t in time_idx]
+            p_depths = [round(depths[p, t], digits = 0) for t in time_idx]
+            p_temps = [round(temps[p, t], digits = 1) for t in time_idx]
+            p_dds = [round(dds[p, t], digits = 1) for t in time_idx]
+            p_survs = [round(survs[p, t], digits = 3) for t in time_idx]
+            p_stages = [string(stages[p, t]) for t in time_idx]
 
             push!(p_entries, """{
                 "id": $(ids[p]),

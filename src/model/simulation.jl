@@ -1334,9 +1334,28 @@ where \$\\theta = (t - t_m) / (t_{m+1} - t_m)\$.
 # Inputs
 - `jld2_filepath::AbstractString`: Path to the simulation `.jld2` output file.
 - `variables::Tuple`: Tuple of variable symbols to load (`:u, :v, :w, :T`).
+- `t_window::Union{Nothing, Tuple{<:Real, <:Real}}`: Optional `(t_start, t_end)` in **seconds**
+  restricting which snapshots are loaded. Queries outside the window are clamped to its edges.
+  Particle tracking usually covers a small fraction of a long simulation (e.g. a 60-day larval
+  window inside a 2-year run), and loading only that window is what keeps the interpolator within
+  memory. `nothing` (the default) loads every snapshot.
+- `max_snapshots::Union{Nothing, Integer}`: Optional hard cap on the number of snapshots retained,
+  applied by evenly subsampling the selected window if the window still exceeds this many. A final
+  backstop against running out of memory on a very long or very high-cadence record.
+- `time_range_out::Union{Nothing, Vector{Float64}}`: Optional two-element output vector, resized to
+  `[t_start, t_end]` (seconds) to report the span actually retained. Use this to size a run from the
+  hydrodynamics rather than assuming a duration: queries outside the retained span are clamped to
+  the edge snapshot, so tracking past `t_end` would integrate a frozen field.
 
 # Outputs
 - `Function`: Callable `(lon, lat, z, t) -> NamedTuple` returning interpolated field values.
+
+# Memory
+A production `snowcrab` simulation stores thousands of snapshots on a 345x245x20 grid. Materialising
+all of them as `Float64` for `u, v, w, T` needs hundreds of gigabytes, so an unrestricted load
+fails with `OutOfMemoryError` and the caller silently substitutes an analytical flow — which is a
+scientifically wrong result, not a graceful degradation. Pass `t_window` (and/or `max_snapshots`) so
+the resident set matches the part of the record actually being interrogated.
 
 # References
 - Marshall, J., et al. (1997). *J. Geophys. Res. Oceans*, 102(C3), 5753-5766.
@@ -1345,7 +1364,10 @@ function create_flow_interpolator_from_jld2(
     jld2_filepath::AbstractString;
     variables::Tuple = (:u, :v, :w, :T),
     domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
-    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    t_window::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    max_snapshots::Union{Nothing, Integer} = nothing,
+    time_range_out::Union{Nothing, Vector{Float64}} = nothing
 )
     if !isfile(jld2_filepath)
         error("Simulation output file not found at: $(jld2_filepath)")
@@ -1375,10 +1397,18 @@ function create_flow_interpolator_from_jld2(
         end
         sorted_keys = sort(numeric_keys, by = k -> parse(Float64, k))
 
-        nt = length(sorted_keys)
+        nt_total = length(sorted_keys)
 
-        # Extract time vector: handle both JLD2.Group and flat Vector representations
-        t_vec = if haskey(file, "timeseries/t")
+        # Resolve the true simulation times BEFORE selecting snapshots.
+        #
+        # The snapshot *keys* are not times. They are elapsed-second stamps written by the
+        # checkpointer ("0", "50", "100", ... "227100"), while the physical time of each snapshot
+        # lives in `timeseries/t` and spans the full simulated period (here 0 -> 6.31e7 s, i.e.
+        # 730 days, at ~3.86 h spacing). Selecting on the keys therefore selects on checkpointer
+        # indices, not on the model's time axis, and a `t_window` in seconds would select the wrong
+        # snapshots -- or none. The interpolator's own temporal axis is `t_vec`, so the window must
+        # be applied to `t_vec` and the two must be kept in lockstep.
+        t_all = if haskey(file, "timeseries/t")
             t_obj = file["timeseries/t"]
             if t_obj isa JLD2.Group
                 [Float64(t_obj[k]) for k in sorted_keys]
@@ -1386,7 +1416,58 @@ function create_flow_interpolator_from_jld2(
                 collect(Float64, t_obj)
             end
         else
-            [something(tryparse(Float64, k), Float64(idx)) for (idx, k) in enumerate(sorted_keys)]
+            # No time group: fall back to the key stamps, which are at least monotonically ordered.
+            [parse(Float64, k) for k in sorted_keys]
+        end
+        length(t_all) == nt_total || (t_all = t_all[1:min(length(t_all), nt_total)])
+
+        # Restrict the retained snapshots BEFORE allocating any 4D field array. This is the only
+        # place the selection can happen cheaply: the arrays below are sized from `nt`, and their
+        # product with the grid is what exhausts memory on a long or high-cadence run.
+        t_lo, t_hi = t_all[1], t_all[end]
+
+        keep = trues(nt_total)
+        if !isnothing(t_window)
+            lo, hi = Float64(t_window[1]), Float64(t_window[2])
+            keep .= (t_all .>= lo) .& (t_all .<= hi)
+            # If the window missed every snapshot (e.g. it lies outside the simulated period),
+            # fall back to the nearest snapshot rather than producing an empty interpolator.
+            if !any(keep)
+                keep[argmin(abs.(t_all .- clamp(lo, t_lo, t_hi)))] = true
+            end
+        end
+
+        selected = findall(keep)
+        # `max_snapshots <= 0` (and `nothing`) mean "no cap": load every snapshot in the window.
+        # Without this guard a cap of 0 would subsample to zero snapshots and produce an empty
+        # interpolator, because `length(selected) > 0` holds for any non-empty selection.
+        if !isnothing(max_snapshots) && max_snapshots > 0 && length(selected) > max_snapshots
+            # Evenly subsample the selection, always keeping the first and last so the temporal
+            # extent of the requested window is preserved.
+            idx = unique!(round.(Int, range(1, length(selected), length = max_snapshots)))
+            selected = selected[idx]
+        end
+        isempty(selected) && error(
+            "No snapshots retained from $(jld2_filepath): the selection is empty " *
+            "(t_window=$(t_window), max_snapshots=$(max_snapshots)).")
+
+        sorted_keys = sorted_keys[selected]
+        t_vec = t_all[selected]
+        nt = length(sorted_keys)
+        if nt < nt_total
+            span_days = (t_vec[end] - t_vec[1]) / 86400
+            @info "create_flow_interpolator_from_jld2: retained $nt of $nt_total snapshots " *
+                  "from $(basename(jld2_filepath)) (t_window=$(t_window), " *
+                  "max_snapshots=$(max_snapshots)); covering " *
+                  "$(round(t_vec[1], digits=1)) .. $(round(t_vec[end], digits=1)) s " *
+                  "($(round(span_days, digits=2)) days)"
+        end
+        # Report the retained span to the caller, so a run can be sized from the hydrodynamics
+        # rather than from an assumed duration.
+        if !isnothing(time_range_out)
+            resize!(time_range_out, 2)
+            time_range_out[1] = t_vec[1]
+            time_range_out[2] = t_vec[end]
         end
 
         # Grid coordinates come from the sidecar written alongside the simulation

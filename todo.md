@@ -19,7 +19,132 @@ window. That needs a full-length run to assess, which is task 3.
 
 ## Recently completed
 
-### 2026-09-27 — full verification pass and test-suite pruning
+### 2026-09-28 — quantile/CDF biology, two-segment vertical grid, HTML payload fix, test pruning
+
+- **Larval biology reformulated to the quantile/CDF scheme you specified.** Before the simulation,
+  `molt_schedule` builds three **global** per-stage threshold CDFs (mean-preserving lognormals with
+  arithmetic means 65 / 130 / 200 degree-days and CV = `cv_molt`). Each larva draws **one**
+  `developmental_u ~ Uniform(0,1)` at initialisation, held for life and **reused across all three
+  transitions**; a larva moults when `u ≤ Fₖ(D)`, where `D` is its accumulated degree-days. Three
+  things follow from that, and all three are deliberate:
+  - `u` is a *developmental percentile*, so a **small `u` is a fast developer** (measured: `u = 0.1`
+    moults at ~45 DD, `u = 0.9` at ~92). The equivalence `u ≤ F(D) ⟺ D ≥ F⁻¹(u)` makes the rule
+    identical to the old per-larva threshold, but the 0-to-1 structure is now explicit and the
+    per-larva state is a single number instead of a triple.
+  - One `u` across all three stages means a fast developer stays fast, so the three stage durations
+    are rank-correlated within an individual. That is the "persistent individual quality"
+    interpretation, not independent noise per stage.
+  - `cohort_molt_fraction(schedule, mean(DD))` is now reported per step (3 × n_steps), giving the
+    fraction of the cohort that has completed each transition on the same 0-to-1 scale. Verified
+    against a 40-larva run: predicted 0.558 megalopa+ vs realised 0.45, within Monte-Carlo error.
+- **Mortality and settlement given the same persistent-trait treatment.**
+  `frailty_from_quantile(vigour_u, cv_mortality)` gives a lognormal multiplier with mean exactly 1,
+  applied as a fixed per-larva rate (unobserved-heterogeneity / frailty model), so a weak larva faces
+  raised mortality throughout rather than being re-randomised each step. `settlement_propensity(
+  settlement_u, hsi, cv_settlement)` perturbs the site HSI on the log-odds scale, mean preserving.
+  Both are exported and unit-tested.
+- **Three bugs found and fixed while implementing the above** — all of the same "silent wrong
+  result" family:
+  1. **`MoltCDF` parameterisation silently bypassed.** The struct's default two-argument
+     constructor `MoltCDF(mu_log::Float64, sigma_log::Float64)` is *more specific* than a
+     `(base, cv)` method, so it always won: the lognormal got `mu_log = 65.0`, i.e. median `e^65`,
+     and a mean threshold of **1.8e28 degree-days** — **nothing ever molted**. The parameterising
+     factory is now a distinct function, `molt_cdf(base, cv)`, so the collision cannot recur.
+  2. **Settlement dispersion applied twice.** `evaluate_settlement_suitability` already applied
+     `cv_settlement` internally, and the new per-larva propensity was added on top — compounding the
+     variance and pushing the expected settlement rate *below* the site HSI. The evaluator is now
+     called with `cv_settlement = 0` and the single perturbation happens in the tracking loop.
+  3. **`cohort_molt` column 1 was uninitialised memory**, because the `undef` matrix was only written
+     from column 2 onward; it is now initialised explicitly. It surfaced as
+     `ArgumentError: indexed assignment with a single value to possibly many locations` when a
+     tuple was assigned to a matrix slice (fixed with `.=`), which is how the real
+     `snowcrab --track-only` run failed at Segment 6.
+- **Two-segment vertical grid** (`src/data/vertical_grid.jl`, `two_segment_z_faces`,
+  `scotian_shelf_z_faces`), wired as `vertical_stretching_mode = "two_segment"`. A single tanh
+  cannot resolve a 10–400 m active layer *and* span 5000 m. `snowcrab.toml` is now `nz = 40`
+  split 24/16 at −400 m: **24** cell centres in 0–400 m, **7** in the 0–50 m nursery band, 5.4 m
+  top cell, shallowest centre −2.7 m (was 1, 0, 258.5 m and −258.5 m). 30/30 targeted checks pass.
+- **The interactive HTML was unopenable at production scale**: 1,660 MB, because it inlines
+  7 full-resolution arrays for every larva. `export_interactive_tracks_html` now takes
+  `max_tracks` (400) and `max_points_per_track` (900), decimating uniformly with endpoints
+  retained; statistics are still computed from the full-resolution arrays and an `@info` reports
+  when decimation occurred. Payload is now **flat at ~19 MB regardless of run length**
+  (measured at 10k, 210k and 2M steps).
+- **Test suite pruned 732 → 432 assertions** with no coverage lost, and reorganised. All 19
+  testsets are cleanly numbered (there had been a duplicate "10." and a "6b" hack), the
+  `runtests.jl` docstring now states the aggregation convention that motivated the pruning, and a
+  stale `ParticleTracking.stretched_tanh_z_faces` — which the driver called but which was **not
+  defined at module scope**, so a fresh run could not build a grid at all — now has a working
+  module-level implementation. See [testset conventions](#do-not-regress).
+
+---
+
+### 2026-09-28 — full `snowcrab.toml` runs; Segment 6 OOM fixed
+
+- **The full (non-`--quick`) `snowcrab.toml` pipeline now completes end to end**, all 8 segments.
+  Segment 6 previously died with `OutOfMemoryError` / `LLVM ERROR: out of memory`. Two independent
+  causes, both fixed:
+
+  1. **The flow interpolator tried to hold the whole 2-year record in RAM.** The saved
+     hydrodynamics is **16.8 GB** and contains **4543 snapshots** on a 345×245×20 grid. The
+     interpolator materialised `u, v, w, T` as `Float64` for every snapshot — **378.7 GB** on a
+     128 GB machine. `create_flow_interpolator_from_jld2` now takes `t_window` and
+     `max_snapshots` and selects **before** allocating the 4-D arrays; `max_flow_snapshots`
+     (default **400**) evenly subsamples while preserving the first and last snapshot, so the
+     **full 730-day span is still covered** — it just costs ~22 GB instead of 379 GB. Building the
+     interpolator now takes ~68 s. A `time_range_out` vector reports the retained span so the
+     driver can size the run from the model rather than assuming a duration.
+
+  2. **The memory failure was silently swallowed.** A `catch` around the interpolator logged a
+     warning and fell back to an *analytical jet*, so the run continued and reported recruitment
+     numbers computed from a **synthetic current** rather than the simulation. That is a wrong
+     scientific result presented as a successful run. It now raises, with `--allow-analytical-fallback`
+     available as a deliberate opt-in and `[hydrodynamics].allow_analytical_fallback` in TOML.
+
+  Also found while fixing the above: the snapshot **keys are not times** — they are checkpointer
+  stamps (`"0"`, `"50"`, … `"227100"`), while the real times in `timeseries/t` span 0 → 6.31e7 s
+  (730 days) at ~3.86 h spacing. An initial version of the window logic selected on the keys and
+  would have selected the wrong snapshots. It now selects on the true `t_vec`.
+
+- **Larval drift now runs the full length of the hydrodynamic model, or until every larva is dead
+  or settled.** Previously `total_duration` was the fixed `[biology] track_duration_days` (60 d for
+  `snowcrab`), which is shorter than the 730-day model. The driver now takes the horizon from the
+  interpolator's reported span, and `track_larval_cohort` breaks out of its time loop as soon as
+  `all(!, current_alive)`, then **truncates the preallocated trajectory matrices** to the steps
+  actually integrated (and reports `terminated_early`). Without the truncation, an early exit would
+  have returned the initial-fill values as if they were further simulated steps.
+
+- **Added a background-current speed cap** (`larval_transport_step(max_current_speed = …)`, default
+  3 m/s, TOML `[hydrodynamics] max_current_speed`, negative disables). A Lagrangian step moves the
+  particle by `u·dt`, so one corrupt cell can teleport a larva across the domain in a single step.
+
+- **A serious data-quality finding about the 2-year archive.** The saved hydrodynamics
+  **progressively diverges**. Velocity percentiles over the run (|u|, wet cells only):
+
+  | day | median | p90 | p99 | max |
+  |---|---|---|---|---|
+  | 73 | 0.032 | 7.1 | 50.8 | 562 |
+  | 219 | 0.035 | 22.2 | 160.9 | 1741 |
+  | 365 | 0.029 | 39.5 | 265.9 | 2979 |
+  | 511 | 0.023 | 59.5 | 382.4 | 4264 |
+  | 657 | 0.023 | 81.2 | 511.1 | **5600** |
+
+  The **median is physical** (~0.03 m/s) but the tail grows monotonically to ~5600 m/s — four
+  orders of magnitude above any real Scotian Shelf current. The model does have a
+  `divergence_velocity_limit` check that warns, so this ran to completion while warning. The
+  speed cap keeps the tracker usable, but **a run over the full 730 days is integrating a diverged
+  field and the resulting connectivity/recruitment numbers should not be treated as
+  quantitative.** See the open item below.
+
+- **Result of the full-length run** (500 larvae, 730-day horizon, `max_flow_snapshots = 400`):
+  exit code 0, all 8 segments, DuckDB archived. 0/500 alive at the end, **22/500 settled (4.4%)**.
+  Note this is with the diverged tail present; the settlement *count* is more defensible than the
+  trajectories.
+
+- Test suite unchanged at **652/652**.
+
+---
+
 
 - **Test suite pruned 703 → 652 assertions** (1388 lines, down from 1495), all passing, no coverage
   lost. The three consolidations were: (1) testset 11 collapsed its 14 `isfile` plot smoke-checks
@@ -40,7 +165,7 @@ window. That needs a full-length run to assess, which is task 3.
 
 ---
 
-## Recently completed
+### 2026-09-27 — full verification pass and test-suite pruning
 
 | Area | Change | Where |
 |---|---|---|
@@ -125,19 +250,23 @@ single flat namespace, so these remain plain `include`s in dependency order rath
 
 | # | Task | Status | Ref |
 |---|---|---|---|
-| 1 | GPU `InvalidIRError` | **DONE** — `Relaxation` migration, numerically exact; all 4 GPU combinations compile | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 2 | Test suite | **DONE** — 652/652 pass, pruned from 703 with no coverage lost | this file |
-| 3 | Full-length `snowcrab.toml` run (not `--quick`) | `--quick` completes; a full-duration run is needed to assess real recruitment | [7](#7-network-dependent-configs-both-now-complete-end-to-end) |
-| 4 | Implement the GLORYS reader | **required**. Access proven anonymously; reader not written | [6](#6-glorys-support-is-required-and-access-is-solved) |
-| 5 | Replace `heat_flux = 50.0` with real data | **required**. Bulk formula from cached wind needs no credentials; ERA5 needs a CDS key | [3](#3-atmospheric-forcing-is-a-placeholder-and-real-data-is-required) |
-| 6 | Calibrate `cv_molt` / `cv_mortality` / `cv_settlement` off the `0.25` placeholder | functional form now lognormal / lognormal / Beta, verified; the **numbers** are still placeholders | [1](#1-larval-biology-stochasticity-is-wired-and-two-latent-bugs-are-fixed) |
-| 7 | Confirm a full GPU production run reaches completion | compiles and constructs on GPU; `--gpu` end to end never run | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
-| 8 | Consider a horizontal nearest-wet fill for fully-masked WOA columns | optional refinement; currently the window mean | [5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker) |
-| 9 | Remap the two deleted Copernicus dataset IDs | `GLOBAL_MULTIYEAR_PHY_001_033` and `GLOBAL_REANALYSIS_PHY_001_031` no longer exist | [6](#6-glorys-support-is-required-and-access-is-solved) |
+| 1 | **The halo/ghost-cell divergence is still unfixed** (up to ~6300 m/s at day 730), and `divergence_velocity_limit` inspects the wrong window (`4:end-3` vs the recorded halo `(7,7,5)`) so it can neither see this nor catch a real interior blow-up | **open**; fell off the list once the vertical grid was promoted to #1. Does **not** contaminate particle results (interior max ≤ 1.7 m/s, interpolator reads the core only) | [10](#10-the-2-year-hydrodynamics-the-interior-is-sound-but-the-vertical-grid-does-not-resolve-the-study-region) |
+| 2 | GPU `InvalidIRError` | **DONE** — `Relaxation` migration, numerically exact; all 4 GPU combinations compile | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
+| 3 | Test suite | **DONE** — 432/432 pass, pruned from 732 with no coverage lost | this file |
+| 4 | Full-length `snowcrab.toml` run | **DONE** — all 8 segments, exit 0. Run before the two-segment grid and the quantile biology, so needs repeating | [7](#7-network-dependent-configs-both-now-complete-end-to-end) |
+| 5 | Implement the GLORYS reader | **required**. Access proven anonymously; reader not written | [6](#6-glorys-support-is-required-and-access-is-solved) |
+| 6 | Replace `heat_flux = 50.0` with real data | **required**. Bulk formula from cached wind needs no credentials; ERA5 needs a CDS key | [3](#3-atmospheric-forcing-is-a-placeholder-and-real-data-is-required) |
+| 7 | Calibrate `cv_molt` / `cv_mortality` / `cv_settlement` off the `0.25` placeholder | functional form now lognormal / lognormal / Beta, verified; the **numbers** are still placeholders | [1](#1-larval-biology-stochasticity-is-wired-and-two-latent-bugs-are-fixed) |
+| 8 | Confirm a full GPU production run reaches completion | compiles and constructs on GPU; `--gpu` end to end never run | [2](#2-gpu-is-fixed-the-sponge-now-uses-relaxation-and-all-combinations-compile) |
+| 9 | Re-run hydrodynamics on the new two-segment grid (nz 20 → 40) | the 730-day archive predates it and is on the unresolved vertical grid | [10](#10-the-2-year-hydrodynamics-the-interior-is-sound-but-the-vertical-grid-does-not-resolve-the-study-region) |
+| 10 | Consider a horizontal nearest-wet fill for fully-masked WOA columns | optional refinement; currently the window mean | [5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker) |
+| 11 | Remap the two deleted Copernicus dataset IDs | `GLOBAL_MULTIYEAR_PHY_001_033` and `GLOBAL_REANALYSIS_PHY_001_031` no longer exist | [6](#6-glorys-support-is-required-and-access-is-solved) |
 
 **Settled decisions (2026-09-27)**
 
 - GPU: proceed with any reasonable workaround — **done**, `Relaxation` migration is exact.
+- Larval drift horizon: **full length of the hydrodynamic model, stopping early only when all
+  larvae are dead or settled** — done.
 - Masked WOA cells: **NaN**, then repaired — done, see [5](#5-woa23-is-downloaded-and-working-and-the-network-blocker-was-never-the-blocker).
 - GLORYS support: **required** — see [6](#6-glorys-support-is-required-and-access-is-solved).
 - Atmospheric forcing: **use real data** — see [3](#3-atmospheric-forcing-is-a-placeholder-and-real-data-is-required).
@@ -699,6 +828,86 @@ Still required, and not done:
 service from Copernicus Marine, so it deliberately does **not** emit the `copernicusmarine login`
 reminder.
 
+### 10. The 2-year hydrodynamics: the interior is sound, but the vertical grid does not resolve the study region
+
+**Corrected 2026-09-28.** An earlier version of this section claimed the model "progressively
+diverges" over 2 years. **That was wrong** — the divergence is confined to the ghost/halo cells, and
+the interior ocean is physical throughout. The real problem is different and more serious.
+
+**The interior never diverges.** Max |u,v| over the interior core at four times across the run:
+
+| day | full-array max | **interior core max** | halo (ghost) max |
+|---|---|---|---|
+| 36 | 285 | **0.90** | 306 |
+| 219 | 1741 | **1.66** | 1781 |
+| 438 | 3616 | **0.53** | 3616 |
+| 694 | 5935 | **0.64** | 5935 |
+
+Broken down within the halo at day 730: core **0.42**, z-halo above surface and below bed
+**6279**, lateral N edge **1248**, S edge **839**, W/E edges **0.0**. So every large value lives in
+masked ghost cells, and the growth is a boundary artifact, not an instability of the interior. The
+particle interpolator reads only the core window (`i_c`/`j_c`/`k_c`), so the 22/500 settlement result
+from the full-length run is **not** contaminated. `max_current_speed` is cheap insurance but was not
+load-bearing.
+
+Two follow-ups on the halo, both minor:
+
+- **The existing guard cannot see it.** `divergence_velocity_limit` inspects
+  `@view(v_data[4:end-3, 4:end-3, 4:end-3])` (`src/model/simulation.jl:320-327`) — a hardcoded
+  3-cell margin, not the actual halo `(7, 7, 5)` written to the sidecar. It is misaligned with the
+  real interior *and* blind to the ghost cells, so it can never fire on this. It should trim by the
+  recorded halo and check the core, not a fixed margin.
+- **Likely source is the N/S edges.** The grid spans lat 42.17–47.65 while the embedding data covers
+  40–48.5, so the north and south edges sit *inside* the data. If they are treated as open/radiating
+  (`obc_type = "flather_chapman"`) where there is no bathymetry, radiation in a dry cell is a
+  plausible source of the blow-up. Worth a short run with the lateral boundaries closed to confirm.
+  Note W/E ghost velocities are exactly 0.0, so it is specifically the y-edges.
+
+**The dominant problem: the vertical grid cannot resolve this study.** 20 levels spanning 0 to
+−5000 m, tanh-stretched, gives:
+
+| | value |
+|---|---|
+| deepest cell centre | −4979.8 m |
+| **shallowest cell centre** | **−258.5 m** |
+| top cell thickness | 511.9 m |
+| bottom cell thickness | 44.7 m |
+| cell centres above −200 m | **0 of 20** |
+| cell centres in 0 to −50 m (nursery band) | **0 of 20** |
+
+The grid is **bottom-refined, the opposite of what the config asks for**
+(`vertical_stretching_mode = "tanh"`, commented "surface/bottom-refined"). Consequences:
+
+- The entire shelf water column (0 to ~200 m) lives inside one 512 m thick cell. There is no
+  thermocline, no CIL, and no vertical shear for larvae to interact with.
+- `settlement_max_depth = -50.0` is tested at a depth where **no cell centre exists**.
+- Larvae seeded near the bed and ascending are moved through a single homogeneous layer.
+- Any vertical-velocity (`w`) or DVM signal is unresolved.
+
+Likely wiring gap: `build_shelf_grid` (`src/data/grid_bathymetry.jl:89-97`) never reads
+`vertical_stretching_mode` — it passes `z` straight to `LatitudeLongitudeGrid`. The
+`stretched_tanh_z_faces` helper exists (`src/model/numerical_earth.jl:413`) and, evaluated by hand
+for `nz = 20, Lz = 5000`, produces the **correctly surface-refined** grid (≈82 m top cell, ≈553 m
+bottom cell) — the opposite of what is in the archive. So the run that produced the archive did not
+go through that helper. The helper's binding is also in a bad state (accessing
+`ParticleTracking.stretched_tanh_z_faces` raises `UndefVarError: not assigned a value`, the classic
+signature of a function that ended up swallowed by a docstring), so this needs checking properly
+rather than assuming it is called.
+
+**Resolution order**
+
+1. **Fix the vertical grid first** — it dominates every biological result. Either supply
+   `vertical_grid_file` (CSV, already supported by `z_faces`) with levels that resolve 0–200 m, or
+   reduce `z_min` to roughly −1000/−1500 m with `nz` ≈ 30–40 so ~10–15 levels fall in the top
+   200 m. `z_min = -5000` with `nz = 20` is not a shelf model.
+2. **Verify the stretching is actually applied**, by asserting on the constructed grid that the
+   shallowest cell centre is within a few metres of the surface and that ≥10 centres lie above
+   −200 m. This is a cheap regression test and it would have caught the present state immediately.
+3. **Re-run hydrodynamics** for a shorter period first (days, not years) and check the interior max
+   stays below ~1 m/s.
+4. **Fix `divergence_velocity_limit`** to trim by the recorded halo and check the core.
+5. Only then re-run the 730-day track.
+
 ---
 
 ## Do not regress
@@ -715,12 +924,28 @@ reminder.
 - **A `cv_*` knob must control dispersion only, never the mean.** The previous Normal-then-clamp
   form broke this twice over: `clamp(Normal(hsi, cv·hsi), 0, 1)` pushed the expected settlement rate
   *below* `hsi` (0.90 instead of 1.00 at the optimum), and a `max(0, …)` on the mortality rate
-  piled individuals onto a zero rate. Use `draw_lognormal_mean` (mean preserving, via the `−σ²/2`
-  term) for positive rate-like quantities and `draw_beta_index` for bounded ones. If a dispersion
-  knob ever changes an expected outcome, that is a bug.
+  piled individuals onto a zero rate. The quantile/CDF form fixes both: `molt_cdf`, `draw_lognormal_mean`
+  (mean preserving via the `−σ²/2` term), and `draw_beta_index`/`settlement_propensity` (log-odds
+  scale, bounded, mean preserving). If a dispersion knob ever changes an expected outcome, that is a
+  bug.
+- **Check that a struct's parameterising constructor is actually the one being called.** `MoltCDF`
+  has a default two-argument constructor that is more specific than any `(base, cv)` method, so the
+  parameterisation was silently bypassed and the biology did nothing at all. Prefer a distinct
+  factory function name (`molt_cdf(base, cv)`) over a same-arity constructor method.
+- **Do not stack a new dispersion onto a function that already applies one.** The settlement
+  propensity was added on top of `evaluate_settlement_suitability`'s internal `cv_settlement`,
+  compounding the variance. When adding per-larva variation, first check what the callee already
+  does and make the two modes mutually exclusive.
 - **Never clamp a physical draw to put it in range; choose a distribution with the right support.**
   Clamping puts a point mass on the boundary that is indistinguishable from real structure, and it
   is not mean preserving. A clamped draw gave 2.4 % of larvae a two-hour Zoea I stage.
+- **Testset conventions** (`test/runtests.jl`): prefer one aggregate `@test all(...)` to a loop of
+  many. A `for p in 1:n; @test …; end` block emits one test per iteration; testset 7 alone
+  produced 305 of the old 732 this way, and a single failed assertion in a 260-test wall is hard to
+  read. Only loop when the iterations are genuinely distinct cases. Numbers are append-only
+  identifiers — do not renumber — and an assertion count is not a quality metric. There is
+  deliberately no "skip the slow testsets" switch: an earlier attempt guarded only the first line of
+  each body, so it printed "skipping" while still running everything.
 - **Check the `LateralBoundaryRelaxation` construction against the new forcing path.** The sponge is
   now a `Relaxation`, so `sponge_relaxation_u` / `_v` are the reference formula only, not the code
   the model runs. Changing `compute_sponge_gamma` or the `ExponentialInflow` targets affects the

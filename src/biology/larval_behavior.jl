@@ -556,76 +556,256 @@ function draw_molt_thresholds(
 end
 
 """
-    stage_from_thresholds(degree_days, thresholds) -> Symbol
+    MoltCDF
 
-Map a cumulative degree-day total onto a developmental stage using a fixed threshold triple
-`(t1, t2, t3)`.
+A cumulative distribution over cumulative thermal degree-days describing **when a larva reaches a
+developmental threshold**, parameterised by a base mean and a coefficient of variation.
 
-Because degree-days are non-decreasing in time and the thresholds are fixed, the returned stage is
-monotone non-decreasing for a fixed `thresholds` argument.
+The distribution is a **mean-preserving lognormal**: its arithmetic mean is exactly `base`
+degree-days and its coefficient of variation is exactly `cv`, so `cv` is a pure dispersion knob
+and raising it never changes the expected development rate. The log-scale parameters are
+
+```math
+\\sigma_{\\log} = \\sqrt{\\log(1 + c^2)}, \\qquad
+\\mu_{\\log} = \\ln(m) - \\tfrac{1}{2}\\sigma_{\\log}^2
+```
+
+`c → 0` degenerates continuously to the deterministic point mass at `base`, so the fully
+deterministic path is the exact limit of the stochastic one.
+
+# Fields
+- `mu_log::Float64`: log-scale location.
+- `sigma_log::Float64`: log-scale shape, `≥ 0`.
 """
-@inline function stage_from_thresholds(degree_days::Real, thresholds::NTuple{3, <:Real})
-    t1, t2, t3 = thresholds
-    if degree_days < t1
-        return :zoea1
-    elseif degree_days < t2
-        return :zoea2
-    elseif degree_days < t3
-        return :megalopa
-    else
-        return :instar1_settled
-    end
+struct MoltCDF
+    mu_log::Float64
+    sigma_log::Float64
 end
 
 """
-    update_larval_stage(
-        current_stage::Symbol,
-        degree_days::Real;
-        dd_zoea1_to_zoea2::Real = 65.0,
-        dd_zoea2_to_megalopa::Real = 130.0,
-        dd_megalopa_to_settle::Real = 200.0,
-        cv_molt::Real = 0.0,
-        thresholds::Union{Nothing, NTuple{3, <:Real}} = nothing,
-        rng::AbstractRNG = Random.default_rng()
-    )
+    molt_cdf(base::Real, cv::Real) -> MoltCDF
 
-Determine the current ontogenetic development stage based on cumulative thermal degree-days.
+Build the mean-preserving lognormal threshold distribution with arithmetic mean `base`
+degree-days and coefficient of variation `cv`.
 
-# Mathematical Formulation
-Degree-days (\$DD = \\int \\max(0, T - T_0) dt\$) accumulate in situ. Molting occurs
-at stage-specific thermal thresholds calibrated from rearing experiments at 2°C
-(Kuhn & Choi, 2011; Sainte-Marie & Sainte-Marie, 1999):
-- \$0 \\le DD < 65\$: **Zoea I** (~32 days at T=2°C)
-- \$65 \\le DD < 130\$: **Zoea II** (~65 days cumulative)
-- \$130 \\le DD < 200\$: **Megalopa** (~100 days cumulative)
-- \$DD \\ge 200\$: **Instar I (Settled)** (~130 days cumulative)
+!!! warning "Use `molt_cdf`, not the struct constructor, to parameterise"
+    `MoltCDF` also has a two-argument *default* constructor `MoltCDF(mu_log, sigma_log)`, which is
+    more specific than any `(base, cv)` method for `Float64` arguments and would silently win.
+    Calling `MoltCDF(65.0, 0.25)` would therefore set `mu_log = 65.0`, giving a threshold
+    distribution with median `e^65` instead of 65 degree-days — and nothing would ever moult. The
+    parameterising factory is kept as a distinct function so that mistake cannot recur.
+"""
+function molt_cdf(base::Real, cv::Real)
+    m = Float64(base)
+    m > 0 || throw(ArgumentError("molt_cdf base must be positive, got $m"))
+    σ = lognormal_sigma(cv)
+    return MoltCDF(log(m) - 0.5 * σ * σ, σ)
+end
 
-When `cv_molt > 0`, each particle's molt thresholds are drawn from a normal distribution
-with mean = base threshold and sd = cv_molt * base threshold. This introduces individual
-variability in developmental timing.
+"""
+    molt_probability(F::MoltCDF, degree_days::Real) -> Float64
 
-!!! warning "Draw thresholds once per particle, not once per call"
-    A developmental threshold is a fixed property of the individual larva. Calling this function
-    repeatedly with `cv_molt > 0` and no `thresholds` argument redraws a *new* threshold on every
-    call, so the stage can regress between steps (`:zoea2` back to `:zoea1`) and settlement
-    competence can flicker. In a time-stepping loop, draw once per particle with
-    [`draw_molt_thresholds`](@ref) and pass the result back via `thresholds`.
+Fraction of the cohort that has reached the developmental threshold by `degree_days`, on a 0-to-1
+scale: 0 at zero degree-days, approaching 1 for large `degree_days`.
+
+This is the quantity compared against a larva's developmental quantile, and — evaluated at the
+**cohort mean** degree-days — is directly interpretable as "the proportion of the cohort that has
+completed molting by now". Returned strictly inside `(0, 1)` except at the degenerate `cv = 0`
+limit, where it is the step function at `base`.
+
+Named `molt_probability` rather than `cdf` to avoid shadowing `Distributions.cdf`, which is in
+scope here; the evaluation still goes through the normal CDF for accuracy.
+"""
+@inline function molt_probability(F::MoltCDF, degree_days::Real)
+    d = Float64(degree_days)
+    d <= 0 && return 0.0
+    F.sigma_log <= 0 && return (d >= exp(F.mu_log) ? 1.0 : 0.0)
+    return cdf(Normal(F.mu_log, F.sigma_log), log(d))
+end
+
+"""
+    threshold(F::MoltCDF, u::Real) -> Float64
+
+Inverse CDF: the degree-day threshold reached by a larva whose developmental quantile is `u`.
+`u = 0` is the slowest possible developer, `u = 1` the fastest, and `threshold(F, 0) = 0`,
+`threshold(F, 1) = ∞` in the limit.
+
+For a monotone CDF, `u ≤ cdf(F, d)` is exactly equivalent to `d ≥ threshold(F, u)`, so the
+tracking loop can use whichever form is cheaper.
+"""
+@inline function threshold(F::MoltCDF, u::Real)
+    q = clamp(Float64(u), 0.0, 1.0)
+    F.sigma_log <= 0 && return exp(F.mu_log)
+    return exp(F.mu_log + F.sigma_log * _probit(q))
+end
+
+"""
+    _probit(p::Real) -> Float64
+
+Inverse standard-normal CDF, `Φ⁻¹(p)`, clamped to `(0, 1)` before evaluation. Needed once per
+larva at initialisation, never in the integration loop.
+"""
+function _probit(p::Real)
+    q = clamp(Float64(p), 1e-12, 1 - 1e-12)
+    return quantile(Normal(0.0, 1.0), q)
+end
+
+"""
+    frailty_from_quantile(u::Real, cv::Real) -> Float64
+
+Map a fixed per-larva **vigour quantile** `u ∈ [0, 1]` to a mortality-rate multiplier with mean
+exactly 1 and coefficient of variation exactly `cv`.
+
+This is the mortality analogue of the developmental quantile: one draw per larva, held for life, so
+a weak larva faces a raised mortality rate *throughout* its pelagic period rather than being
+randomised independently at every timestep. It is the standard **unobserved heterogeneity
+(frailty)** model for individual survival: proportional hazards `μ_i = μ · ω_i` with
+`ω ~ lognormal`.
+
+`u` near 0 gives a vigorous larva (multiplier < 1, i.e. it outlives the cohort expectation) and
+`u` near 1 a weak one. `cv = 0` gives exactly 1.0, so the deterministic mean-field path is the
+exact limit.
 
 # Inputs
-- `current_stage::Symbol`: Present developmental stage.
-- `degree_days::Real`: Accumulated degree-days (°C · days).
-- `dd_zoea1_to_zoea2::Real`: Base degree-day threshold for Zoea I -> Zoea II.
-- `dd_zoea2_to_megalopa::Real`: Base degree-day threshold for Zoea II -> Megalopa.
-- `dd_megalopa_to_settle::Real`: Base degree-day threshold for Megalopa -> Instar I.
-- `cv_molt::Real`: Coefficient of variation for molt thresholds (default 0.0 = deterministic).
-  Only consulted when `thresholds` is `nothing`.
-- `thresholds`: Optional fixed `(t1, t2, t3)` triple for this particle. When supplied, `cv_molt`
-  and `rng` are ignored, so repeated calls are reproducible in the threshold.
-- `rng::AbstractRNG`: Random number generator for stochastic thresholds.
+- `u::Real`: Vigour quantile in `[0, 1]`, drawn once per larva.
+- `cv::Real`: Coefficient of variation of the multiplier.
 
 # Outputs
-- `Symbol`: Updated stage (`:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`).
+- `Float64`: Strictly positive multiplier, mean 1.
 """
+@inline function frailty_from_quantile(u::Real, cv::Real)
+    σ = lognormal_sigma(cv)
+    σ <= 0 && return 1.0
+    return exp(σ * _probit(u) - 0.5 * σ * σ)
+end
+
+"""
+    settlement_propensity(u::Real, hsi::Real, cv::Real) -> Float64
+
+Map a fixed per-larva **settlement quantile** `u ∈ [0, 1]` and a site habitat-suitability index
+`hsi ∈ [0, 1]` to that larva's probability of settling there, with mean exactly `hsi` and
+coefficient of variation exactly `cv` — the settlement analogue of the developmental and vigour
+quantiles, so some larvae are ready to settle sooner and at more marginal sites than others.
+
+The perturbation is applied on the log-odds scale (see [`draw_beta_index`](@ref)), so the result
+stays in `[0, 1]` and never pushes the expected settlement rate below `hsi`. `cv` is a pure
+dispersion knob: the *average* larva settles at exactly the site's suitability.
+
+`u` is drawn once per larva and reused at every candidate site, which is what makes it a persistent
+individual propensity rather than fresh noise per evaluation.
+
+# Inputs
+- `u::Real`: Settlement quantile in `[0, 1]`.
+- `hsi::Real`: Site habitat-suitability index in `[0, 1]`.
+- `cv::Real`: Coefficient of variation of the per-larva dispersion.
+
+# Outputs
+- `Float64`: Per-larva settlement probability in `[0, 1]`.
+"""
+@inline function settlement_propensity(u::Real, hsi::Real, cv::Real)
+    h = Float64(hsi)
+    (h <= 0.0) && return 0.0
+    (h >= 1.0) && return 1.0
+    c = abs(Float64(cv))
+    (c > 0) || return h
+    lo = clamp(h, 1e-6, 1.0 - 1e-6)
+    z = log(lo / (1.0 - lo)) + c * _probit(u)
+    return z >= 0 ? 1.0 / (1.0 + exp(-z)) : exp(z) / (1.0 + exp(z))
+end
+
+"""
+    molt_schedule(; dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
+                     dd_megalopa_to_settle = 200.0, cv_molt = 0.0) -> NTuple{3, MoltCDF}
+
+Build the three per-stage threshold distributions as a single immutable *global template*, computed
+once before the simulation rather than per larva and per step.
+
+Each stage is described by its own lognormal with the **cumulative** base mean it needs
+(65 / 130 / 200 degree-days by default), so the three are independent templates rather than
+dispersed increments. Individual variability enters only through each larva's single
+developmental quantile.
+
+# Inputs
+- `dd_zoea1_to_zoea2`, `dd_zoea2_to_megalopa`, `dd_megalopa_to_settle`: Cumulative base
+  degree-day thresholds, strictly increasing.
+- `cv_molt`: Coefficient of variation shared by the three distributions.
+
+# Outputs
+- `NTuple{3, MoltCDF}`: `(zoea1_to_zoea2, zoea2_to_megalopa, megalopa_to_settle)`.
+"""
+function molt_schedule(;
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0,
+    cv_molt::Real = 0.0
+)
+    b = (Float64(dd_zoea1_to_zoea2), Float64(dd_zoea2_to_megalopa), Float64(dd_megalopa_to_settle))
+    (b[1] > 0 && b[1] < b[2] < b[3]) || throw(ArgumentError(
+        "molt_schedule requires 0 < dd_zoea1_to_zoea2 < dd_zoea2_to_megalopa < dd_megalopa_to_settle, " *
+        "got $(b)"))
+    return (molt_cdf(b[1], cv_molt), molt_cdf(b[2], cv_molt), molt_cdf(b[3], cv_molt))
+end
+
+# Which stage index a symbol occupies: :zoea1 = 1 (needs t1), :zoea2 = 2 (t2), :megalopa = 3 (t3).
+@inline molt_stage_index(stage::Symbol) =
+    stage === :zoea1 ? 1 : stage === :zoea2 ? 2 : stage === :megalopa ? 3 : 0
+
+"""
+    update_larval_stage(current_stage::Symbol, degree_days::Real, schedule, developmental_u::Real)
+
+Advance a larva's ontogenetic stage from its accumulated thermal degree-days, a **global
+per-stage threshold schedule**, and the larva's **developmental quantile**.
+
+A larva moults once the cohort-wide probability of having reached the threshold,
+`cdf(schedule[k], degree_days)`, passes its own fixed quantile `developmental_u`. Because
+`developmental_u ∈ [0, 1]` is constant and degree-days are non-decreasing, the returned stage is
+monotone non-decreasing: a larva can never regress.
+
+`developmental_u` is a **developmental percentile** — a fixed draw from `Uniform(0, 1)` per larva,
+reused for all three transitions, so a fast developer stays a fast developer. This models
+developmental rate as an individual quality rather than as independent noise at each stage, and
+makes the three stage durations rank-correlated for an individual.
+
+!!! note "Direction of the quantile: small `u` is a FAST developer"
+    Because a larva moults once the cohort CDF `F(D)` has risen past its own percentile, a **small**
+    `u` is a **fast** developer (it moults early) and a **large** `u` is a **slow** one. In the
+    default `cv_molt = 0.25` case `u = 0.1` moults at roughly 45 degree-days and `u = 0.9` at
+    roughly 92. This is the standard inverse-transform construction: `u` indexes the *threshold*
+    distribution, so a high percentile is a high requirement. If you want the opposite sense
+    (large `u` = fast), draw `1 - rand()` instead; the two are equivalent.
+
+For a monotone CDF this rule is identical to the per-larva threshold rule
+(`u ≤ F(d)` ⟺ `d ≥ F⁻¹(u)`); the CDF form is used because it makes the 0-to-1
+probability structure explicit and the threshold implicit.
+
+# Inputs
+- `current_stage::Symbol`: Present stage.
+- `degree_days::Real`: Accumulated degree-days (°C · days).
+- `schedule`: `NTuple{3, MoltCDF}` from [`molt_schedule`](@ref).
+- `developmental_u::Real`: The larva's fixed developmental quantile in `[0, 1]`.
+
+# Outputs
+- `Symbol`: `:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`, or the input stage if `:dead`.
+"""
+function update_larval_stage(
+    current_stage::Symbol,
+    degree_days::Real,
+    schedule::NTuple{3, MoltCDF},
+    developmental_u::Real
+)
+    (current_stage === :dead || current_stage === :instar1_settled) && return current_stage
+    k = molt_stage_index(current_stage)
+    k == 0 && return current_stage
+    p = molt_probability(schedule[k], degree_days)
+    # Guard on p > 0 as well as u <= p: at the deterministic limit p is exactly 0 below the base
+    # threshold, and `0.0 <= 0.0` would otherwise let a larva whose quantile is exactly 0 molt
+    # before it had accumulated any degree-days at all.
+    (p > 0.0 && developmental_u <= p) || return current_stage
+    return k == 1 ? :zoea2 : k == 2 ? :megalopa : :instar1_settled
+end
+
+# Backwards-compatible keyword form: builds the schedule per call. Prefer passing a prebuilt
+# schedule plus a fixed quantile in time-stepping loops.
 function update_larval_stage(
     current_stage::Symbol,
     degree_days::Real;
@@ -633,24 +813,34 @@ function update_larval_stage(
     dd_zoea2_to_megalopa::Real = 130.0,
     dd_megalopa_to_settle::Real = 200.0,
     cv_molt::Real = 0.0,
-    thresholds::Union{Nothing, NTuple{3, <:Real}} = nothing,
+    developmental_u::Real = 0.0,
     rng::AbstractRNG = Random.default_rng()
 )
-    if current_stage == :dead || current_stage == :instar1_settled
-        return current_stage
+    if cv_molt > 0 && developmental_u == 0.0
+        @warn "update_larval_stage called with cv_molt = $(cv_molt) and the default " *
+              "developmental_u = 0.0, so every larva is the slowest possible developer. Draw " *
+              "developmental_u = rand(rng) once per larva and pass it explicitly."
     end
+    sched = molt_schedule(dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
+                          dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
+                          dd_megalopa_to_settle = dd_megalopa_to_settle,
+                          cv_molt = cv_molt)
+    return update_larval_stage(current_stage, degree_days, sched, developmental_u)
+end
 
-    # Prefer a caller-supplied fixed threshold triple (drawn once per particle by
-    # `draw_molt_thresholds`); only draw here when called standalone.
-    th = isnothing(thresholds) ?
-         draw_molt_thresholds(rng;
-             dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
-             dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
-             dd_megalopa_to_settle = dd_megalopa_to_settle,
-             cv_molt = cv_molt) :
-         thresholds
+"""
+    cohort_molt_fraction(schedule, mean_degree_days) -> NTuple{3, Float64}
 
-    return stage_from_thresholds(degree_days, th)
+Fraction of a cohort expected to have completed each transition, from the **cohort mean**
+accumulated degree-days: `(F₁(D̄), F₂(D̄), F₃(D̄))`.
+
+This is the direct cohort-level readout of the 0-to-1 probability scale the per-larva quantiles are
+compared against, and is reported per step so the stage progression can be checked directly.
+"""
+@inline function cohort_molt_fraction(schedule::NTuple{3, MoltCDF}, mean_degree_days::Real)
+    return (molt_probability(schedule[1], mean_degree_days),
+            molt_probability(schedule[2], mean_degree_days),
+            molt_probability(schedule[3], mean_degree_days))
 end
 
 """
@@ -864,11 +1054,31 @@ function larval_transport_step(
     is_ascending::Bool = false,
     ascent_speed::Real = 0.010,
     surface_target::Real = -10.0,
+    max_current_speed::Union{Nothing, Real} = 3.0,
     rng::AbstractRNG = Random.default_rng()
 )
     # If settled on bottom or dead, particle remains at seabed
     if stage == :instar1_settled
         return (Float64(x), Float64(y), Float64(z_bottom))
+    end
+
+    # 0. Guard against a non-physical background current.
+    #
+    # A Lagrangian integrator moves the particle by `u*dt`, so a single corrupt or diverged
+    # velocity cell can teleport a larva across the entire domain in one step. Long
+    # hydrodynamics runs do diverge locally -- the two-year Scotian Shelf archive reaches
+    # ~5600 m/s in its tail, even though its median stays near 0.03 m/s -- and without this
+    # clamp the cohort disperses to nonsense positions and no longer settles on the nursery.
+    # `max_current_speed` is the largest horizontal speed admitted; the direction is preserved
+    # and only the magnitude is capped. Pass `nothing` to disable.
+    if !isnothing(max_current_speed)
+        spd = hypot(u, v)
+        cap = Float64(max_current_speed)
+        if isfinite(spd) && spd > cap
+            s = cap / spd
+            u = u * s
+            v = v * s
+        end
     end
 
     # 1. Logarithmic Bottom Boundary Layer (BBL) velocity attenuation (law of the wall)
@@ -1301,6 +1511,7 @@ function track_larval_cohort(
     ascent_speed::Real = 0.010,
     ascent_target_depth::Real = -10.0,
     max_ascent_duration::Real = 86400.0,
+    max_current_speed::Union{Nothing, Real} = 3.0,
     cv_molt::Real = 0.0,
     cv_mortality::Real = 0.0,
     cv_settlement::Real = 0.0,
@@ -1328,19 +1539,38 @@ function track_larval_cohort(
     current_settlement_age = fill(Float64(total_duration), n_particles)
     competence_onset_step  = fill(-1, n_particles)
     t_bed_filtered = zeros(Float64, n_particles)
+    # Number of steps actually integrated. The loop stops early once every larva has terminated
+    # (settled or dead), and the trajectory matrices are truncated to this many columns so the
+    # caller never sees trailing copies of the final state.
+    steps_done = 1
     stage_survival = fill(1.0, n_particles)
     ascent_complete = Vector{Bool}(undef, n_particles)
     ascent_duration = fill(0.0, n_particles)
 
-    # Per-particle molt thresholds, drawn ONCE here and reused for the whole run. Drawing inside
-    # the time loop would resample each larva's developmental rate every step, letting a stage
-    # regress and making settlement competence flicker. With fixed thresholds and non-decreasing
-    # degree-days the stage sequence is monotone by construction.
-    molt_thresholds = [draw_molt_thresholds(rng;
-                          dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
-                          dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
-                          dd_megalopa_to_settle = dd_megalopa_to_settle,
-                          cv_molt = cv_molt) for _ in 1:n_particles]
+    # Global molt schedule: three per-stage threshold CDFs, built ONCE before the time loop.
+    molt_sched = molt_schedule(dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
+                               dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
+                               dd_megalopa_to_settle = dd_megalopa_to_settle,
+                               cv_molt = cv_molt)
+
+    # Three PERSISTENT per-larva traits, each a single Uniform(0,1) quantile drawn ONCE here and
+    # held for the larva's whole life. These are individual qualities, not per-step noise:
+    #   developmental_u  - fast vs slow developer (reused across all three stage transitions, so a
+    #                      fast developer stays a fast developer)
+    #   vigour_u         - weakness vs vigour; scales the mortality rate via a lognormal frailty
+    #   settlement_u     - how readily the larva settles; perturbs the site HSI
+    # Redrawing any of these inside the time loop would resample the individual each step, which
+    # was the original stage-regression bug.
+    developmental_u = rand(rng, n_particles)
+    vigour_u        = rand(rng, n_particles)
+    settlement_u    = rand(rng, n_particles)
+
+    # Mortality frailty multiplier per larva (mean 1, CV cv_mortality), fixed for life.
+    frailty = [frailty_from_quantile(vigour_u[p], cv_mortality) for p in 1:n_particles]
+
+    # Cohort-level molt fraction per step, from the cohort MEAN degree-days: the direct 0-to-1
+    # readout of how much of the cohort has completed each transition.
+    cohort_molt = Matrix{Float64}(undef, 3, n_steps)
 
     # Set initial states at t = 0
     traj_lon[:, 1] = copy(larvae.lon)
@@ -1365,8 +1595,19 @@ function track_larval_cohort(
                             temperature_fn(traj_lon[p, 1], traj_lat[p, 1], init_bed, 0.0)
     end
 
+    # Initialise cohort_molt column 1 explicitly. The matrix is `undef`, and the loop only writes
+    # column `s+1`, so leaving column 1 untouched would ship uninitialised memory as a reported
+    # cohort fraction.
+    if enable_molting
+        dd0 = sum(current_degree_days) / n_particles
+        cohort_molt[:, 1] .= cohort_molt_fraction(molt_sched, dd0)
+    end
+
     for s in 1:(n_steps - 1)
         t_current = times[s]
+        # Every larva has terminated: nothing further can change, so stop and truncate rather
+        # than integrating the remaining steps for a cohort that is entirely dead or settled.
+        all(!, current_alive) && break
         for p in 1:n_particles
             if !current_alive[p]
                 traj_lon[p, s + 1] = traj_lon[p, s]
@@ -1426,14 +1667,13 @@ function track_larval_cohort(
             # because the mean-field decay would remove survival that the Bernoulli draw removes
             # a second time.
             if cv_mortality > 0.0 && current_alive[p]
-                # Stochastic: draw an individual mortality rate from a mean-preserving lognormal
-                # with CV `cv_mortality`, then apply a Bernoulli death. The lognormal is
-                # positive by construction, so unlike the previous `max(0, Normal(μ, cv·μ))` there
-                # is no pile-up of zero-rate individuals, and the `−σ²/2` shift keeps the expected
-                # rate at `mort_rate` so `cv_mortality` controls dispersion only.
-                # `traj_surv` holds its previous value until death, so the recorded survival is an
-                # outcome rather than an expectation.
-                individual_mort_rate = draw_lognormal_mean(mort_rate, cv_mortality, rng)
+                # Individual mortality rate = the cohort rate scaled by this larva's FIXED lognormal
+                # frailty multiplier (mean 1, CV cv_mortality). Because the multiplier is drawn once
+                # and held for life, a weak larva faces a raised rate throughout rather than being
+                # re-randomised every step -- the unobserved-heterogeneity (frailty) formulation of
+                # individual survival. `traj_surv` holds its previous value until death, so the
+                # recorded survival is an outcome rather than an expectation.
+                individual_mort_rate = mort_rate * frailty[p]
                 p_survive = exp(-individual_mort_rate * dt_days)
                 if rand(rng) > p_survive
                     current_alive[p] = false
@@ -1454,7 +1694,8 @@ function track_larval_cohort(
                 new_stage = update_larval_stage(
                     cur_stage,
                     current_degree_days[p],
-                    thresholds = molt_thresholds[p]
+                    molt_sched,
+                    developmental_u[p]
                 )
 
                 if new_stage != cur_stage
@@ -1463,10 +1704,11 @@ function track_larval_cohort(
                 end
 
                 # Settlement evaluation for competent larvae
-                # Competence uses this particle's own megalopa->settle threshold so it stays
+                # Competence uses this larva's own megalopa->settle quantile, so it stays
                 # consistent with the stage assigned just above.
                 is_competent = (new_stage == :instar1_settled) ||
-                               (cur_stage == :megalopa && current_degree_days[p] >= molt_thresholds[p][3])
+                               (cur_stage == :megalopa &&
+                                developmental_u[p] <= molt_probability(molt_sched[3], current_degree_days[p]))
 
                 if is_competent
                     if competence_onset_step[p] < 0
@@ -1475,16 +1717,30 @@ function track_larval_cohort(
                     days_competent = (s - competence_onset_step[p]) * dt_days
 
                     # Evaluate settlement suitability against tidally filtered benthic temperature
+                    # Compute the site HSI and its hard gate only. The stochastic acceptance is
+                    # applied here rather than inside the evaluator, because the per-larva
+                    # propensity is a *fixed trait*: passing cv_settlement through would draw a
+                    # fresh Beta perturbation at every candidate site and then compound it with
+                    # this larva's own dispersion, applying the same variance twice and lowering
+                    # the expected settlement rate.
                     suit = evaluate_settlement_suitability(
                         z_bed,
                         t_bed_filtered[p],
                         min_depth = settlement_min_depth,
                         max_depth = settlement_max_depth,
                         max_bottom_temp = settlement_max_temp,
-                        stochastic = settlement_stochastic,
-                        cv_settlement = cv_settlement,
+                        stochastic = false,
+                        cv_settlement = 0.0,
                         rng = rng
                     )
+
+                    if suit.suitable && settlement_stochastic
+                        # One perturbation, one draw: this larva's persistent settlement
+                        # readiness applied to the site HSI.
+                        p_accept = settlement_propensity(settlement_u[p], suit.hsi, cv_settlement)
+                        suit = merge(suit, (probability = p_accept,
+                                            suitable = rand(rng) <= p_accept))
+                    end
 
                     if suit.suitable
                         current_settlement[p] = :settled_successful
@@ -1530,6 +1786,7 @@ function track_larval_cohort(
                 z_bottom = z_bed,
                 is_lat_lon = is_lat_lon,
                 coastline = coastline,
+                max_current_speed = max_current_speed,
                 enable_bbl = enable_bbl,
                 h_bbl = h_bbl,
                 z0 = z0,
@@ -1570,7 +1827,30 @@ function track_larval_cohort(
                 current_alive[p] = false
             end
         end
+
+        # Cohort-level molt fraction from the cohort MEAN degree-days: (F1, F2, F3) at this step.
+        # This is the 0-to-1 probability scale the per-larva developmental quantiles are compared
+        # against, reported directly so stage progression can be checked at a glance.
+        if enable_molting
+            dd_mean = sum(view(current_degree_days, 1:n_particles)) / n_particles
+            cohort_molt[:, s + 1] .= cohort_molt_fraction(molt_sched, dd_mean)
+        end
+        steps_done = s + 1
     end
+
+    # Truncate the preallocated matrices to the steps actually integrated. When the cohort
+    # terminated early, columns beyond `steps_done` hold stale values from the initial fill and
+    # would misrepresent the trajectory as continuing to the full `total_duration`.
+    n_out = min(steps_done, n_steps)
+    traj_lon   = traj_lon[:,   1:n_out]
+    traj_lat   = traj_lat[:,   1:n_out]
+    traj_depth = traj_depth[:, 1:n_out]
+    traj_temp  = traj_temp[:,  1:n_out]
+    traj_dd    = traj_dd[:,     1:n_out]
+    traj_surv  = traj_surv[:,   1:n_out]
+    traj_stage = traj_stage[:, 1:n_out]
+    times_used = collect(times[1:n_out])
+    cohort_molt_out = cohort_molt[:, 1:n_out]
 
     return (
         lons = traj_lon,
@@ -1586,7 +1866,12 @@ function track_larval_cohort(
         settlement_status = current_settlement,
         settlement_age = current_settlement_age,
         ascent_duration = ascent_duration,
-        times = collect(times),
+        times = times_used,
+        terminated_early = steps_done < n_steps,
+        # Cohort-level probability of having completed each transition, from the cohort mean
+        # degree-days: rows are (:zoea1→:zoea2, :zoea2→:megalopa, :megalopa→:instar1).
+        cohort_molt_fraction = cohort_molt_out,
+        molt_schedule = molt_sched,
         ids = larvae.id
     )
 end

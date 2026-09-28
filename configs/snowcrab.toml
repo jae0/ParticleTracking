@@ -67,10 +67,27 @@ embedding_lat_max = 48.5
 # vertical_grid_file: custom vertical coordinate file when mode="csv" (depth in meters, negative=down)
 nx = 345
 ny = 245
-nz = 20
+nz = 40
 resolution_scale = 2.5
-vertical_stretching_mode = "tanh"  # Hyperbolic tangent vertical layer stretching (surface/bottom-refined)
-vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"
+
+# Two-segment vertical grid.
+#
+# A single tanh over 0 to -5000 m puts its COARSEST cell at the surface: with nz = 20 the
+# shallowest cell centre sat at -258 m, giving 0 cell centres above -200 m and none at all in the
+# 0-50 m nursery settlement band, so the cold intermediate layer, the thermocline and
+# settlement_max_depth = -50 m were all unresolved.
+#
+# "two_segment" splits the column at vertical_break_depth: a surface-refined upper segment that
+# resolves the 10-400 m active layer, plus a coarse lower segment that still spans the Laurentian
+# Fan (22% of this domain is deeper than 400 m, reaching ~4850 m). nz is the TOTAL; nz_above = 0
+# derives the split as 60% of nz, so nz = 40 -> 24 levels in 0-400 m and 16 below.
+#
+# Resulting resolution (nz = 40): top cell 5.4 m, 7 cell centres in 0-50 m, 11 in 0-100 m,
+# 24 in 0-400 m, shallowest centre -2.7 m.
+vertical_stretching_mode = "two_segment"
+nz_above = 24                            # levels above vertical_break_depth; 0 = 60% of nz
+vertical_break_depth = -400.0            # segment boundary (m, negative down)
+vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"   # used only by mode = "csv"
 
 [bathymetry]
 # Best available bathymetry sources (in order of preference)

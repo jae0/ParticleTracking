@@ -497,6 +497,23 @@ function run_segment_grid(;
             Lz;
             csv_path = opts.vertical_grid_file
         )
+    elseif opts.vertical_stretching_mode in (:two_segment, :shelf)
+        # Two-segment grid: a surface-refined upper segment that actually resolves the shallow
+        # active layer, plus a coarse lower segment so the deep basin is still represented.
+        # A single tanh over 0 to -5000 m puts its *coarsest* cell at the surface, which left the
+        # shallowest cell centre at -258 m and no cell centre at all in the 0-50 m nursery band.
+        Lz = abs(opts.domain_z[1] - opts.domain_z[2])
+        nz_tot = opts.grid_size[3]
+        nz_above = opts.nz_above > 0 ? opts.nz_above : round(Int, 0.6 * nz_tot)
+        nz_below = nz_tot - nz_above
+        nz_below < 1 && error(
+            "vertical grid split leaves nz_below = $nz_below; need nz_above < nz = $nz_tot.")
+        z_break = opts.vertical_break_depth < 0.0 ? opts.vertical_break_depth : -400.0
+        println("Applying two-segment vertical coordinates (break=$(z_break)m, " *
+                "nz_above=$nz_above, nz_below=$nz_below, Lz=$(Lz)m)...")
+        two_segment_z_faces(z_break = z_break, z_min = -Lz,
+                            nz_above = nz_above, nz_below = nz_below,
+                            scaling_above = 2.0, scaling_below = 0.0)
     else
         nothing
     end
@@ -1046,14 +1063,48 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         joinpath("outputs", "simulation_flow.jld2")
     ])
     sim_jld2_path = findfirst(isfile, sim_jld2_candidates)
+    # Span, in seconds, of the hydrodynamic record the cohort will be advected through. The cohort
+    # is tracked for this whole span and stops early only once every larva is dead or settled, so
+    # the drift is never shorter than the model it is driven by.
+    hydro_span = [0.0, 0.0]
+
     flow_interpolator = if !isnothing(sim_jld2_path)
         actual_path = sim_jld2_candidates[sim_jld2_path]
         println("Loading 4D simulated hydrodynamic fields from $(actual_path)...")
         try
-            create_flow_interpolator_from_jld2(actual_path)
+            # A production run stores thousands of snapshots; materialising all of them as Float64
+            # for u, v, w and T is hundreds of gigabytes and exhausts memory, which previously made
+            # this silently fall through to the analytical jet below -- producing recruitment numbers
+            # from a synthetic flow rather than the simulated one. So: keep the full record's time
+            # span, but bound how many snapshots are held resident via `max_flow_snapshots`
+            # (evenly subsampled, endpoints preserved), and report the retained span back.
+            interp = create_flow_interpolator_from_jld2(actual_path;
+                                                        t_window = nothing,
+                                                        max_snapshots = opts.max_flow_snapshots,
+                                                        time_range_out = hydro_span)
+            println("  retained span: $(round(hydro_span[1], digits=1)) .. " *
+                    "$(round(hydro_span[2], digits=1)) s " *
+                    "($(round((hydro_span[2] - hydro_span[1]) / 86400, digits=2)) days)")
+            interp
         catch err
-            @warn "Failed to create JLD2 flow interpolator from $(actual_path): $(err). Using analytical jet."
-            nothing
+            # Falling back to an analytical current here would silently replace the simulated
+            # hydrodynamics with a synthetic jet, turning a memory limit into a wrong scientific
+            # result. Make the failure explicit and actionable instead.
+            if opts.allow_analytical_fallback
+                @warn "Failed to build the flow interpolator from $(actual_path): " *
+                      "$(sprint(showerror, err)). Falling back to the analytical jet because " *
+                      "allow_analytical_fallback is set -- results will NOT reflect the simulation."
+                nothing
+            else
+                error(
+                    "Failed to build the flow interpolator from $(actual_path):\n  " *
+                    sprint(showerror, err) * "\n\n" *
+                    "Tracking needs the simulated fields; substituting an analytical current would " *
+                    "silently change the science. To proceed deliberately with a synthetic flow, " *
+                    "re-run with --allow-analytical-fallback. To reduce memory, lower " *
+                    "[hydrodynamics].max_flow_snapshots (currently $(opts.max_flow_snapshots))."
+                )
+            end
         end
     else
         nothing
@@ -1121,14 +1172,25 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
     coastline_path = joinpath(opts.input_dir, "coastline.dat")
     coast_polys = isfile(coastline_path) ? load_coastline_polygons(coastline_path) : nothing
 
-    println("Tracking cohort over $(opts.track_duration / 86400.0) days (dt=$(opts.track_dt)s)...")
+    # Track over the full span of the hydrodynamic record. The cohort stops early by itself once
+    # every larva is dead or settled, so this is an upper bound the run only reaches if larvae
+    # persist. When there is no hydro file (analytical fallback or synthetic quick run) the
+    # configured pelagic larval duration is the only sensible horizon.
+    track_horizon = if !isnothing(flow_interpolator) && hydro_span[2] > hydro_span[1]
+        hydro_span[2] - hydro_span[1]
+    else
+        opts.track_duration
+    end
+    println("Tracking cohort over up to $(track_horizon / 86400.0) days " *
+            "(dt=$(opts.track_dt)s, stops early when all larvae are dead or settled)...")
     trajectories = track_larval_cohort(
         larvae,
         velocity_fn = flow_field_fn,
         temperature_fn = temp_field_fn,
         bathymetry_fn = bathy_field_fn,
-        total_duration = opts.track_duration,
+        total_duration = track_horizon,
         dt = opts.track_dt,
+        max_current_speed = opts.max_current_speed,
         κ_h = opts.diffusivity_h,
         κ_v = opts.diffusivity_v,
         is_lat_lon = true,
@@ -2279,6 +2341,7 @@ function main(args = ARGS)
     hydro_only = base_opts.hydro_only
     track_only = base_opts.track_only
     reuse_hydro = base_opts.reuse_hydro
+    allow_analytical_fallback = base_opts.allow_analytical_fallback
     run_id_val = base_opts.run_id
     n_parts = base_opts.n_particles
     track_dur = base_opts.track_duration
@@ -2435,6 +2498,9 @@ function main(args = ARGS)
     end
     if "--track-only" in args
         track_only = true
+    end
+    if "--allow-analytical-fallback" in args
+        allow_analytical_fallback = true
     end
     if "--reuse-hydro" in args
         reuse_hydro = true
@@ -2647,8 +2713,9 @@ function main(args = ARGS)
         surface_heat_flux = surface_heat_flux,
         hydro_model_file = hydro_model_file,
         hydro_only = hydro_only,
-        track_only = track_only,
-        reuse_hydro = reuse_hydro,
+    track_only = track_only,
+    reuse_hydro = reuse_hydro,
+    allow_analytical_fallback = allow_analytical_fallback,
         run_id = run_id_val,
         n_particles = n_parts,
         track_duration = track_dur,
