@@ -421,17 +421,26 @@ function woa23_regridded_tracers(
     lo_x, hi_x = Float64(first(lon_src)), Float64(last(lon_src))
 
     # `interpolate` indexes by *index* coordinates (1..n along each axis), not by the
-    # physical values stored in the axes, so the query is converted here. Passing
-    # physical lon/lat/depth straight through is silently wrong and throws a BoundsError
-    # whose reported index is the physical value, which makes the mistake easy to misread.
-    span(v) = begin
-        d = last(v) - first(v)
-        d == 0 ? (t -> 1.0) : (t -> (t - Float64(first(v))) / d + 1.0)
-    end
-    to_ix, to_iy, to_iz = span(lon_src), span(lat_src), span(dep_src)
+    # physical values stored in the axes, so the query is converted here. Passing physical
+    # lon/lat/depth straight through is silently wrong and throws a BoundsError whose
+    # reported index is the physical value, which makes the mistake easy to misread.
+    #
+    # The conversion is a table lookup, not a linear rescale. The previous version computed
+    # `(x - first) / (last - first) + 1`, which maps the axis onto [1, 2] rather than [1, n] --
+    # so every query, at every location and depth, sampled the FIRST column of the global
+    # file. It did not throw; it returned confident nonsense. A linear rescale would also be
+    # wrong for the depth axis specifically, which is strongly non-uniform (0, 5, 10, ... 5500).
+    to_index(v) = t -> clamp(searchsortedlast(v, Float64(t)), 1, length(v))
+    to_ix, to_iy, to_iz = to_index(lon_src), to_index(lat_src), to_index(dep_src)
 
+    # `read_woa_variable` returns a POSITIVE-down depth axis (it normalises whatever
+    # convention the file used), while the model grid's `z` is NEGATIVE-down: 0 at the
+    # surface and falling. The query is negated before clamping. Clamping a negative `z`
+    # against a positive-down range would pin every query to the surface layer and quietly
+    # return the same temperature and salinity at all depths -- a whole-column field that
+    # looks well-formed and destroys the stratification the model is built on.
     query(itp) = (x, y, z) -> itp(
-        to_iz(clamp(Float64(z), lo_z, hi_z)),
+        to_iz(clamp(-Float64(z), lo_z, hi_z)),
         to_iy(clamp(Float64(y), lo_y, hi_y)),
         to_ix(clamp(Float64(x), lo_x, hi_x))
     )

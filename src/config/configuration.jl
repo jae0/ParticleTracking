@@ -285,6 +285,7 @@ struct HydrodynamicOptions
     vertical_depths          :: Vector{Float64}
     resolution_scale         :: Float64
     atmospheric_source :: Symbol
+    ocean_boundary_source :: Symbol
     # Where each piece of the model's outside world comes from.
     #
     # The model is a window cut out of the ocean, so three of its edges are not real coastline
