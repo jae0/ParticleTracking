@@ -57,22 +57,22 @@ using Oceananigans
 # Source layout
 #
 # The package is a single flat namespace, so these are plain `include`s in
-# dependency order rather than submodules — the files share one scope and
+# dependency order rather than submodules: the files share one scope and
 # redefine each other's helpers freely.
 #
-#   utils/    architecture, tides, synthetic data generators
+#   utils/    architecture, tides
 #   data/     open-data downloads, grid construction, bathymetry, coastline
 #   model/    forcing + boundary crafts, model build, climate scenarios,
 #             simulation drivers, native diagnostics
-#   config/   TOML → options → provenance
+#   config/   TOML options, and provenance
 #   biology/  larval transport, DVM, molting, mortality, settlement
 #   analysis/ Voronoi units, empirical metrics, DuckDB storage
 #   output/   plots, animations, interactive maps
 # ============================================================================
 include("model/numerical_earth.jl")
 include("config/configuration.jl")
+include("data/manifest.jl")
 include("data/open_data.jl")
-include("utils/synthetic_data.jl")
 include("utils/architecture.jl")
 include("data/grid_bathymetry.jl")
 include("data/vertical_grid.jl")
@@ -107,13 +107,28 @@ export
     # Architecture and device resolution
     resolve_architecture,
 
+    # Provenance registry for every physical input (keyless source first)
+    DATA_SOURCES,
+    DataSource,
+    data_source,
+    describe_data_sources,
+    data_provenance,
+    file_digest,
+    input_dir,
+    fetch_input,
+
     # Open real-world data and regridding
     fetch_open_bathymetry,
     fetch_etopo2022_bathymetry,
-    fetch_era5_atmospheric_forcing,
     fetch_open_surface_winds,
+    fetch_surface_winds,
+    fetch_bathymetry,
     fetch_open_meteo_surface_winds,
+    fetch_natural_earth_coastline,
+    read_wind_stress,
+    build_bulk_surface_flux,
     fetch_open_woa_climatology,
+    fetch_hycom_boundary,
     fetch_woa23_hydrography,
     fetch_copernicus_surface_winds,
     fetch_copernicus_physics_subset,
@@ -123,12 +138,6 @@ export
     copernicus_login_reminder,
     wind_speed_to_kinematic_stress,
     regrid_2d_field,
-
-    # Synthetic data generation and inspection
-    download_sample_data,
-    inspect_netcdf,
-    generate_synthetic_bathymetry,
-    generate_synthetic_forcing,
 
     # Grid, bathymetry & coastline geometry
     REGIONAL_COASTLINE,
@@ -161,7 +170,6 @@ export
     woa23_regridded_tracers,
     read_woa_variable,
     build_woa_interpolator,
-    WENOVectorInvariant,
     set_initial_stratification!,
     set_initial_conditions!,
     LateralBoundaryRelaxation,
@@ -169,6 +177,23 @@ export
 
     # Tidal forcing & harmonic synthesis
     get_tidal_frequency,
+    read_tidal_harmonics,
+    tidal_velocity,
+    TidalHarmonics,
+    read_tidal_elevation_harmonics,
+    tidal_elevation,
+    tidal_elevation_amplitude,
+    tpxo_constituent_file,
+    TidalElevationHarmonics,
+    read_tidal_velocity_harmonics,
+    tidal_velocity_at,
+    tidal_velocity_speed,
+    nearest_water,
+    boundary_tidal_forcing,
+    TidalCoefficientGrid,
+    tidal_forcing_coefficients,
+    edge_tidal_velocity,
+    TidalVelocityHarmonics,
     build_tidal_body_forcing,
     tidal_velocity_vector,
     simpson_hunter_parameter,

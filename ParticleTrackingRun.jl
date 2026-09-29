@@ -95,6 +95,10 @@ Execution Modes:
 Decoupled Hydrodynamics & Multi-Cohort Tracking:
   --hydro-model=<path>    Target hydrodynamic JLD2 model file (output or input).
                           Default: outputs/hydrodynamics_<scenario>_<year>.jld2.
+  --data=manifest        Print the provenance registry for every physical input the run
+                          consumes: product, keyless source, licence, cache path, and the
+                          other acceptable sources with their access requirements. Exits
+                          without running. Use this to regenerate the same inputs elsewhere.
   --hydro-only            Run hydrodynamics only (Segments 1-5) and save to --hydro-model.
   --track-only            Run larval tracking only (Segments 6-8) using --hydro-model.
   --reuse-hydro           Reuse existing --hydro-model flow file if completed; else simulate.
@@ -156,7 +160,9 @@ Ecosystem & Species Configurations:
 Computational Architecture:
   --gpu, --cuda           Enable NVIDIA CUDA GPU acceleration for hydrodynamics.
   --cpu                   Execute on multi-threaded CPU (default).
-  --fallback-cpu          Automatically fall back to CPU if CUDA GPU is not functional.
+  --fallback-cpu          Allow a GPU request to degrade to CPU if CUDA is not functional.
+                          Off by default: without it, such a run aborts rather than quietly
+                          executing somewhere other than --gpu said.
 
 Visualization & Hydrodynamic Animation Options:
   --interactive           Export standalone interactive HTML5 Leaflet map (default).
@@ -196,8 +202,9 @@ Environmental Data & Forcing:
   --no-tides              Disable tidal body forcing.
   --tidal-u=<val>         Semi-major tidal current amplitude in m/s (default: 0.25).
   --tidal-v=<val>         Semi-minor tidal current amplitude in m/s (default: 0.12).
-  --era5-forcing          Enable NumericalEarth ERA5 atmospheric surface forcing.
-  --no-era5               Use analytical wind stress forcing.
+  --wind-source=<name>    Atmospheric forcing source, matching [atmosphere] source in the TOML:
+                          era5, era5_climatology, mhw. An empty value, or false/none/off,
+                          disables atmospheric surface forcing.
   --obc                   Enable NumericalEarth GLORYS12V1 open boundary conditions.
   --no-obc                Disable open boundary conditions.
 
@@ -340,87 +347,61 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
     println(" [Segment 1/8] Environmental Data Ingestion & Drag Processing")
     println("=================================================================")
     mkpath(opts.input_dir)
+
+    # The coastline is a fetched input like any other, and is listed in the provenance
+    # registry, so it is acquired rather than seeded from a file in this repository. A stale
+    # repository copy would let two scenarios mask against different land.
+    coastline_file = joinpath(opts.input_dir, "coastline.dat")
+    if !isfile(coastline_file)
+        src = opts.coastline_source
+        println("Retrieving coastline ($(src))...")
+        fetch_natural_earth_coastline(
+            lon_range = opts.domain_lon,
+            lat_range = opts.domain_lat,
+            resolution = replace(src, "natural_earth_" => ""),
+            output_path = coastline_file
+        )
+    end
+
     bathy_file = joinpath(opts.input_dir, "bathymetry_active.nc")
     wind_file  = joinpath(opts.input_dir, "wind_active.nc")
 
-    if opts.data_mode == :real
-        if !isfile(bathy_file)
-            println("Retrieving real bathymetry from NOAA ERDDAP (etopo180)...")
-            try
-                fetch_open_bathymetry(
-                    lon_range = opts.domain_lon, 
-                    lat_range = opts.domain_lat, 
-                    output_path = bathy_file
-                )
-            catch err
-                @warn "Primary NOAA ERDDAP bathymetry download failed: $(err). Trying alternate mirror..."
-                try
-                    # Secondary backup endpoint for topography
-                    backup_bathy_url = "https://www.ncei.noaa.gov/erddap/griddap/etopo190.nc?altitude[($(opts.domain_lat[1])):(($(opts.domain_lat[2]))][($(opts.domain_lon[1])):(($(opts.domain_lon[2]))]"
-                    Downloads.download(backup_bathy_url, bathy_file)
-                catch backup_err
-                    @warn "All live bathymetry sources failed. Falling back to synthetic topography."
-                    generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
-                end
-            end
-        else
-            println("Using existing real bathymetry file: $bathy_file")
-        end
-
-        if !isfile(wind_file)
-            println("Retrieving real surface winds from NOAA ERDDAP / NCEP Reanalysis...")
-            try
-                fetch_open_surface_winds(
-                    lon_range = opts.domain_lon, 
-                    lat_range = opts.domain_lat, 
-                    time_iso = "2023-06-01T00:00:00Z", 
-                    output_path = wind_file
-                )
-            catch err
-                @warn "NOAA CoastWatch wind server timed out: $(err). Trying NCEP/NCAR reanalysis fallback..."
-                try
-                    # Alternative reanalysis wind endpoint
-                    backup_wind_url = "https://psl.noaa.gov/thredds/fileServer/Datasets/ncep.reanalysis/surface/uwnd.10m.gauss.2023.nc"
-                    Downloads.download(backup_wind_url, wind_file)
-                catch backup_err
-                    @warn "Live wind servers unreachable. Falling back to synthetic wind forcing."
-                    generate_synthetic_forcing(wind_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2])
-                end
-            end
-        else
-            println("Using existing real surface winds file: $wind_file")
-        end
+    # Data acquisition always reads observed products. There is no "synthetic mode": the product
+    # is named directly by `[data] bathy_source` / `wind_source` in the TOML, and a failed
+    # download aborts the run rather than substituting an analytic field, because a run must
+    # never claim a dataset-forced state it did not read.
+    if !isfile(bathy_file)
+        println("Retrieving bathymetry ($(opts.bathy_source))...")
+        # One named source, no mirror swap, no analytic substitute. `fetch_bathymetry` stops
+        # with a message listing the sources this project can actually retrieve.
+        fetch_bathymetry(opts.bathy_source; lon_range = opts.domain_lon,
+                         lat_range = opts.domain_lat, output_path = bathy_file)
     else
-        if !isfile(bathy_file)
-            println("Generating synthetic Scotian Shelf bathymetry...")
-            generate_synthetic_bathymetry(bathy_file, lon_range = opts.domain_lon, lat_range = opts.domain_lat, n_lon = opts.grid_size[1], n_lat = opts.grid_size[2], inshore_depth = -100.0, shelf_slope = 600.0 )
-        else
-            println("Using existing synthetic bathymetry file: $bathy_file")
-        end
-        if !isfile(wind_file)
-            println("Generating synthetic surface wind forcing...")
-            generate_synthetic_forcing(
-                wind_file,
-                lon_range = opts.domain_lon,
-                lat_range = opts.domain_lat,
-                time_range = (0.0, opts.sim_duration),
-                n_lon = opts.grid_size[1],
-                n_lat = opts.grid_size[2],
-                n_time = 24,
-                tau_x_amplitude = 1e-4,
-                tau_y_amplitude = 2e-5
-            )
-        else
-            println("Using existing synthetic surface wind file: $wind_file")
-        end
+        println("Using existing real bathymetry file: $bathy_file")
     end
 
-    bathy_info = inspect_netcdf(bathy_file, verbose = true)
-    u10_ref, v10_ref = 8.5, 3.2 
-    tau_x, tau_y = wind_speed_to_kinematic_stress(u10_ref, v10_ref)
-    println("Calculated Large & Pond (1981) kinematic wind stress:")
-    println("  Reference 10m wind: u = $(u10_ref) m/s, v = $(v10_ref) m/s")
-    println("  Kinematic stress:   tau_x = $(round(tau_x, digits=6)), tau_y = $(round(tau_y, digits=6)) m^2/s^2")
+    if !isfile(wind_file)
+        println("Retrieving surface winds ($(opts.wind_source)) for $(opts.wind_time_iso)...")
+        # One named source, no mirror swap, no synthetic substitute. `fetch_surface_winds`
+        # stops with a message listing the sources this project can actually retrieve.
+        fetch_surface_winds(opts.wind_source; lon_range = opts.domain_lon,
+                            lat_range = opts.domain_lat, time_iso = opts.wind_time_iso,
+                            output_path = wind_file)
+    else
+        println("Using existing real surface winds file: $wind_file")
+    end
+
+    # The stress is read back out of the file that was actually fetched. Deriving it from
+    # hard-coded reference winds would make the fetch decorative: the numbers driving the
+    # model would not come from the ingested product at all.
+    w = read_wind_stress(wind_file)
+    tau_x, tau_y = w.tau_x, w.tau_y
+    bathy_info = (file = bathy_file, exists = true)
+    println("Large & Pond (1981) kinematic wind stress, read from $(basename(wind_file)):")
+    println("  Domain-mean 10m wind speed: $(round(w.speed10_rms, digits=2)) m/s")
+    println("  Domain-mean stress:   tau_x = $(round(tau_x, digits=8)), " *
+            "tau_y = $(round(tau_y, digits=8)) m^2/s^2")
+    println("  Peak stress magnitude: $(round(w.tau_max, digits=8)) m^2/s^2")
     return (bathy_file = bathy_file, wind_file = wind_file, tau_x = tau_x, tau_y = tau_y, bathy_info = bathy_info)
 end
 
@@ -463,20 +444,29 @@ function run_segment_grid(;
     arch_label = opts.use_gpu ? "GPU (CUDA)" : "CPU"
     println("Building base spherical grid on $(arch_label): $(opts.grid_size) cells...")
 
-    z_faces = if opts.vertical_stretching_mode in (:tanh, :csv, :stretched)
+    z_faces = if !isempty(opts.vertical_depths)
+        # `[grid] depths` is written positive-downward from the surface (0, 10, 20, ...);
+        # Oceananigans wants z faces negative and ascending, so negate and reverse. The config
+        # layer has already checked monotonicity, the 0 m surface, and the nz+1 face count.
+        f = sort(-Float64.(opts.vertical_depths))
+        println("Using $(length(f)) vertical faces from [grid] depths " *
+                "(shallowest dz=$(round(f[end] - f[end-1], digits=1))m, " *
+                "deepest dz=$(round(f[2] - f[1], digits=1))m)...")
+        f
+    elseif !isempty(opts.vertical_grid_file)
+        # A named `vertical_grid_file` is the operator's own file. `configuration_to_options`
+        # already resolved it to a copy inside this run's input directory and refused to
+        # proceed if it was missing, so reaching here means the file is present and staged.
         Lz = abs(opts.domain_z[1] - opts.domain_z[2])
-        println("Applying stretched vertical coordinates ($(opts.vertical_stretching_mode), Lz=$(Lz)m)...")
-        # `strict` when the config *asks* for a CSV: silently substituting a generated tanh grid
-        # would run the whole simulation on a vertical grid the operator did not choose, and the
-        # resulting field looks plausible enough that nobody would notice. A missing or malformed
-        # file must stop the run instead.
-        stretched_tanh_z_faces(
-            opts.grid_size[3],
-            Lz;
-            csv_path = opts.vertical_grid_file,
-            strict = (opts.vertical_stretching_mode === :csv) || !isempty(opts.vertical_grid_file)
+        println("Using vertical layer faces from $(basename(opts.vertical_grid_file)) (Lz=$(Lz)m)...")
+        stretched_tanh_z_faces(opts.grid_size[3], Lz; csv_path = opts.vertical_grid_file, strict = true)
+    elseif opts.vertical_stretching_mode === :csv
+        error(
+            "[grid] vertical_stretching_mode = \"csv\" but neither vertical_grid_file nor " *
+            "depths is set. Name a file, give a depth list, or use a mode that derives faces " *
+            "from the depth range."
         )
-    elseif opts.vertical_stretching_mode in (:two_segment, :shelf)
+    elseif opts.vertical_stretching_mode in (:tanh, :stretched)
         # Two-segment grid: a surface-refined upper segment that actually resolves the shallow
         # active layer, plus a coarse lower segment so the deep basin is still represented.
         # A single tanh over 0 to -5000 m puts its *coarsest* cell at the surface, which left the
@@ -519,7 +509,10 @@ function run_segment_grid(;
     println("  Latitude:  $(opts.domain_lat[1])°N to $(opts.domain_lat[2])°N (Ny=$(opts.grid_size[2]))")
     println("  Depth:     $(opts.domain_z[1]) m to $(opts.domain_z[2]) m (Nz=$(opts.grid_size[3]))")
     if !isnothing(z_faces)
-        println("  Vertical:  Stretched tanh/CSV (surface dz=$(round(z_faces[end]-z_faces[end-1], digits=1))m, bed dz=$(round(z_faces[2]-z_faces[1], digits=1))m)")
+        src = isempty(opts.vertical_grid_file) ? "stretched" : basename(opts.vertical_grid_file)
+        println("  Vertical:  $src (surface dz=$(round(z_faces[end]-z_faces[end-1], digits=1))m, bed dz=$(round(z_faces[2]-z_faces[1], digits=1))m)")
+    else
+        println("  Vertical:  Oceananigans default (nz=$(opts.grid_size[3]) evenly spaced faces)")
     end
 
     return (base_grid = base_grid, immersed_grid = immersed_grid)
@@ -565,46 +558,162 @@ function run_segment_model(;
     println(" [Segment 3/8] Hydrodynamic Model & Tidal Forcing Setup")
     println("=================================================================")
 
+    # Astronomical tides, read from the global TPXO9 solution rather than imposed as a uniform
+    # oscillation. The previous form applied `tidal_u_amp` (0.25 m/s) uniformly in x, y AND z;
+    # on this shelf that configuration diverged to 8-13 m/s within six simulated hours, and
+    # disabling tides returned the same setup to 0.4 m/s. The amplitudes in [tides] are
+    # therefore no longer used to scale a body force: they describe a uniform tide that is not
+    # what the shelf actually experiences, and the real field varies from 0.006 m/s on the
+    # southern boundary to 0.713 m/s in the Bay of Fundy.
+    #
+    # The atlas is read from this run's containerised inputs directory; see `fetch_input` and
+    # the :tides entry in DATA_SOURCES for how to obtain it and what the alternatives are.
     tidal_forcing = if opts.enable_tides
-        println("Configuring astronomical tidal body forcing (M2 + S2 spring-neap envelope)...")
-        u_amps = Dict(:M2 => opts.tidal_u_amp, :S2 => opts.s2_u_amp)
-        v_amps = Dict(:M2 => opts.tidal_v_amp, :S2 => opts.s2_v_amp)
-        build_tidal_body_forcing(
-            constituents = [:M2, :S2],
-            u_amplitudes = u_amps,
-            v_amplitudes = v_amps
+        tides_file = replace(data_source(:tides).cache, "<output_dir>" => opts.output_dir)
+        if !isfile(tides_file)
+            error(
+                "[hydrodynamics] enable_tides is true but the tidal solution is missing:\n" *
+                "  $(tides_file)\n" *
+                "Obtain it with `fetch_input(:tides, \"$(opts.output_dir)\")`, or set " *
+                "enable_tides = false. There is deliberately no fallback to a uniform " *
+                "body-force approximation: that was what made this configuration diverge, and " *
+                "a run that silently used a different tidal solution than its provenance " *
+                "file records is the failure this project is trying to prevent.")
+        end
+        # Honour `[tides] constituents`. An empty list in a config that disables tides is not an
+        # error; it simply means no constituents were requested, and the branch that reads
+        # harmonics is not reached.
+        cons = opts.tidal_constituents
+        println("Reading tidal harmonics from $(basename(tides_file)) " *
+                "(constituents: $(join(cons, ", ")))...")
+        h = read_tidal_velocity_harmonics(
+            tides_file;
+            constituents = cons,
+            lon_range = opts.domain_lon,
+            lat_range = opts.domain_lat,
         )
+        # The forcing is reduced to a small `isbits` coefficient grid BEFORE it reaches the
+        # model. A closure that searches the atlas arrays at call time is not GPU-safe and
+        # fails to compile in gpu_compute_hydrostatic_free_surface_Gu!.
+        # Grid size is bounded by GPU kernel *parameter* memory: the coefficient tuple is
+        # passed by value into every invocation, so 16x12x2x4 doubles (12 KB) is rejected
+        # with "Kernel invocation uses too much parameter memory". 6x4 gives 192 doubles
+        # (~1.5 KB), which fits comfortably. The tidal field varies on scales of degrees and
+        # the domain is ~18 deg across, so 3 deg spacing still resolves the 0.007 m/s southern
+        # boundary from the 0.45 m/s Fundy -- the contrast that caused the original blowup.
+        coeff = TidalCoefficientGrid(h, (opts.domain_lon[1], opts.domain_lon[2]),
+                                     (opts.domain_lat[1], opts.domain_lat[2]);
+                                     nx = 6, ny = 4)
+        f = tidal_forcing_coefficients(coeff)
+        edge = boundary_tidal_forcing(h; edges = (:east, :south, :west), sample_stride = 4)
+        amps = vcat(edge[:east].uamp[1, :], edge[:south].uamp[1, :], edge[:west].uamp[1, :])
+        println("  M2 boundary speed amplitude: ", round(minimum(amps), digits = 4), " - ",
+                round(maximum(amps), digits = 4), " m/s")
+        f
     else
         nothing
     end
 
     coriolis_lat = 0.5 * (opts.domain_lat[1] + opts.domain_lat[2])
 
-    # Configure open boundary conditions (lateral sponge) if requested
-    obc_craft = if opts.ocean_boundary_source in (:glorys12v1, :glorys_climatology)
-        is_clim = opts.scenario == :climatology ||
-                  opts.ocean_boundary_source == :glorys_climatology
-        println("Enabling lateral boundary relaxation (configured from TOML, default inflow values)...")
-        true  # Enable lateral boundary relaxation with default inflow values
+"""
+    fetch_boundary_tracers(source::Symbol, opts, cfg) -> NamedTuple
+
+Thin wrapper binding a configured source to the bounding box and month from the TOML.
+
+Everything else -- acquisition, caching, which file holds which variable, what units the
+temperature is in, and whether the file is actually usable data -- lives in
+`fetch_boundary_hydrography`. The driver deliberately does not know how any source is
+packaged, because that knowledge is what made two WOA23 readers, a truncated boundary file
+and a units error possible in the first place.
+
+The bounding box is the `[boundaries] embedding_*` region rather than the study domain. It
+has to be larger: the model needs the water just *outside* its own edges, and a subset cut
+to the study domain would put the interpolation's edge exactly on the sponge.
+"""
+function fetch_boundary_tracers(source::Symbol, opts, cfg)
+    emb = embedding_domain_ranges(cfg)
+    return fetch_boundary_hydrography(source;
+        lon_range = emb.lon, lat_range = emb.lat,
+        input_dir = joinpath(pwd(), "inputs"),
+        month = opts.hydrography_month)
+end
+
+# Configure open boundary conditions (lateral sponge) if requested.
+    #
+    # Two independent things are decided here and they were previously conflated into one
+    # boolean:
+    #
+    #   * whether the sponge band is active at all, and
+    #   * whether observed boundary temperature and salinity are available to relax toward.
+    #
+    # The second is what the source name actually selects. Previously *any* non-GLORYS value
+    # fell through to `nothing`, which meant a keyless config asking for observed boundary
+    # hydrography silently got an unconstrained edge -- the request was accepted and ignored.
+    # That is the worst possible failure for this input, because an unconstrained edge still
+    # produces plausible-looking output.
+    obc_src = opts.ocean_boundary_source
+    boundary_tracer_data = nothing
+    if obc_src in (:woa23, :glorys12v1, :glorys_climatology, :hycom)
+        boundary_tracer_data = fetch_boundary_tracers(obc_src, opts, cfg)
+        println("Boundary hydrography: observed temperature and salinity from $(obc_src).")
+        println("  This constrains what the incoming water IS, not how fast it is GOING -- " *
+                "the inflow speed still comes from [boundaries] u_inflow/v_inflow.")
+    elseif obc_src == :synthetic
+        println("Boundary hydrography: none. The open edges are unconstrained.")
+    else
+        error(
+            "Unknown [boundaries] ocean_boundary_source \"$(obc_src)\". Choose \"synthetic\" " *
+            "(unconstrained edges), \"woa23\" (keyless climatology, no currents), " *
+            "\"glorys12v1\" (reanalysis with currents; needs a Copernicus Marine account), " *
+            "or \"hycom\" (keyless with currents, but its server currently refuses data " *
+            "requests). Nothing was substituted."
+        )
+    end
+
+    obc_craft = if obc_src in (:glorys12v1, :glorys_climatology, :woa23, :hycom)
+        println("Enabling lateral boundary relaxation...")
+        true
     else
         nothing
     end
 
-    # Configure atmospheric forcing (simplified - no data download for now)
+    # Atmospheric surface forcing, computed from the ingested ERA5 surface state rather than
+    # carried as a constant. `surface_heat_flux` in the config is what decides whether the
+    # flux is applied; the stress is always applied, since without it there is no momentum
+    # input at all.
     atmo_craft = if opts.atmospheric_source in (:era5, :era5_climatology, :mhw)
-        is_clim = opts.scenario == :climatology ||
-                  opts.atmospheric_source == :era5_climatology
-        println("Attaching atmospheric surface fluxes (simplified, no data download)...")
-        # Use constant wind stress from opts and typical summer heat flux
-        # Full ERA5 integration requires data download and CDS API credentials
-        (stress_x = tau_x, stress_y = tau_y, heat_flux = 50.0)
+        sx, sy, hx = build_bulk_surface_flux(wind_file)
+        if isnothing(sx)
+            error(
+                "Atmospheric forcing is requested but $(basename(wind_file)) has no bulk " *
+                "flux inputs. Re-fetch the wind file so the surface state is included.")
+        end
+        want_flux = opts.surface_heat_flux
+        if want_flux && isnothing(hx)
+            error(
+                "[atmosphere] bulk heat flux is enabled but the ingested surface state is " *
+                "unavailable, so the flux cannot be computed. Disable surface_heat_flux or " *
+                "re-fetch the wind file.")
+        end
+        if want_flux
+            println("Atmospheric forcing: time-varying stress from ERA5 surface state, " *
+                    "with a bulk net heat flux.")
+        else
+            println("Atmospheric forcing: time-varying stress from ERA5; heat flux disabled.")
+        end
+        (stress_x = sx, stress_y = sy, heat_flux = hx)
     else
         nothing
     end
 
-    wind_x = isnothing(atmo_craft) ? tau_x : atmo_craft[1]
-    wind_y = isnothing(atmo_craft) ? tau_y : atmo_craft[2]
-    surface_heat_flux_val = isnothing(atmo_craft) ? 0.0 : atmo_craft[3]
+    wind_x = isnothing(atmo_craft) ? tau_x : atmo_craft.stress_x
+    wind_y = isnothing(atmo_craft) ? tau_y : atmo_craft.stress_y
+    surface_heat_flux_val = if isnothing(atmo_craft) || isnothing(atmo_craft.heat_flux)
+        0.0
+    else
+        atmo_craft.heat_flux
+    end
 
     println("Building HydrostaticFreeSurfaceModel (Coriolis at $(coriolis_lat)°N, summer surface heat flux)...")
     free_surf = ImplicitFreeSurface(maxiter = 2000, reltol = 1e-6)
@@ -629,6 +738,7 @@ function run_segment_model(;
         sponge_tau = opts.sponge_timescale,
         u_inflow = opts.u_inflow,
         v_inflow = opts.v_inflow,
+        boundary_tracers = boundary_tracer_data,
         closure = closure_choice in (:nemotke, :catke) ? :catke : nothing,
         ν = 1e-2,
         κ = 1e-2,
@@ -1177,9 +1287,20 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         enable_tides = opts.enable_tides,
         tidal_u_amp = opts.tidal_u_amp,
         tidal_v_amp = opts.tidal_v_amp,
-        tidal_constituents = [:M2, :S2],
-        tidal_u_amplitudes = Dict(:M2 => opts.tidal_u_amp, :S2 => 0.44 * opts.tidal_u_amp),
-        tidal_v_amplitudes = Dict(:M2 => opts.tidal_v_amp, :S2 => 0.42 * opts.tidal_v_amp),
+        # The constituents and their amplitude ratios come from the TOML via `opts`. Hardcoding
+        # them here would run the tides on a set the operator did not choose, which is the
+        # same class of silent substitution the data path was changed to avoid.
+        tidal_constituents = opts.tidal_constituents,
+        tidal_u_amplitudes = Dict(:M2 => opts.tidal_u_amp,
+                                  :S2 => 0.44 * opts.tidal_u_amp,
+                                  :N2 => 0.19 * opts.tidal_u_amp,
+                                  :K1 => 0.18 * opts.tidal_u_amp,
+                                  :O1 => 0.15 * opts.tidal_u_amp),
+        tidal_v_amplitudes = Dict(:M2 => opts.tidal_v_amp,
+                                  :S2 => 0.42 * opts.tidal_v_amp,
+                                  :N2 => 0.19 * opts.tidal_v_amp,
+                                  :K1 => 0.18 * opts.tidal_v_amp,
+                                  :O1 => 0.15 * opts.tidal_v_amp),
         enable_molting = opts.enable_molting,
         # Stochasticity controls. These must be passed explicitly: `track_larval_cohort` defaults
         # all three coefficients of variation to 0.0, i.e. a fully deterministic cohort. Loading
@@ -1407,7 +1528,13 @@ function run_segment_metrics(;
             min_res_core_km = opts.voronoi_min_res_core_km,
             min_res_shallow_km = opts.voronoi_min_res_shallow_km,
             min_res_deep_km = opts.voronoi_min_res_deep_km,
-            slope_weighting = true,
+            # The TOML states band edges as positive depths below the surface; the tessellator
+            # bins on signed z, so the deeper edge gets the sign.
+            core_depth_range = (-opts.voronoi_core_depth_max, -opts.voronoi_core_depth_min),
+            shallow_depth_range = (-opts.voronoi_shallow_depth_max, -opts.voronoi_shallow_depth_min),
+            deep_depth_range = (-opts.voronoi_deep_depth_max, -opts.voronoi_deep_depth_min),
+            slope_weighting = opts.voronoi_slope_weighting,
+            slope_factor = opts.voronoi_slope_factor,
             seed = opts.seed
         )
         println("Generated $(length(v_tess.units)) Voronoi units across depth strata.")
@@ -2046,6 +2173,12 @@ function run_segment_visualize(;
                 min_res_core_km = opts.voronoi_min_res_core_km,
                 min_res_shallow_km = opts.voronoi_min_res_shallow_km,
                 min_res_deep_km = opts.voronoi_min_res_deep_km,
+                # TOML band edges are positive depths; the tessellator bins on signed z.
+                core_depth_range = (-opts.voronoi_core_depth_max, -opts.voronoi_core_depth_min),
+                shallow_depth_range = (-opts.voronoi_shallow_depth_max, -opts.voronoi_shallow_depth_min),
+                deep_depth_range = (-opts.voronoi_deep_depth_max, -opts.voronoi_deep_depth_min),
+                slope_weighting = opts.voronoi_slope_weighting,
+                slope_factor = opts.voronoi_slope_factor,
                 seed = opts.seed
             )
             fig_v = CairoMakie.Figure(size = (1000, 750), fontsize = 13)
@@ -2412,6 +2545,14 @@ function main(args = ARGS)
         return
     end
 
+    # `--data=manifest` is a query, not a run: it prints the provenance registry that names
+    # every physical input, its keyless source, and the alternatives. Handled before anything
+    # is loaded so it works with no network and no config.
+    if any(a -> a == "--data=manifest" || a == "--data-manifest", args)
+        describe_data_sources()
+        return
+    end
+
     # 1. Resolve configuration file path and load centralized configuration
     is_snowcrab_tesselated = "--tesselated" in args || "--snowcrab-tesselated" in args ||
                              "--tessellated" in args || "--snowcrab-tessellated" in args
@@ -2445,7 +2586,15 @@ function main(args = ARGS)
     depth_range = base_opts.domain_z
     buffer_km = base_opts.buffer_km
     grid_dim = base_opts.grid_size
-    is_real = base_opts.data_mode == :real
+    bathy_source = base_opts.bathy_source
+    coastline_source = base_opts.coastline_source
+    wind_source = base_opts.wind_source
+    wind_time_iso = base_opts.wind_time_iso
+    tides_source = base_opts.tides_source
+    tidal_constituents = base_opts.tidal_constituents
+    vertical_depths = base_opts.vertical_depths
+    inshore_depth = base_opts.inshore_depth
+    shelf_slope = base_opts.shelf_slope
     enable_tides = base_opts.enable_tides
     tidal_u = Float64(base_opts.tidal_u_amp)
     tidal_v = Float64(base_opts.tidal_v_amp)
@@ -2495,6 +2644,7 @@ function main(args = ARGS)
         cp_prefix = cp_prefix_default
     end
     cp_sched = base_opts.checkpoint_schedule
+    out_sched = base_opts.output_schedule_seconds
     cp_dir = String(base_opts.checkpoint_dir)
     cp_clean = base_opts.checkpoint_cleanup
     auto_res = base_opts.auto_restart
@@ -2526,6 +2676,14 @@ function main(args = ARGS)
     voronoi_min_core = base_opts.voronoi_min_res_core_km
     voronoi_min_shallow = base_opts.voronoi_min_res_shallow_km
     voronoi_min_deep = base_opts.voronoi_min_res_deep_km
+    voronoi_core_min = base_opts.voronoi_core_depth_min
+    voronoi_core_max = base_opts.voronoi_core_depth_max
+    voronoi_shallow_min = base_opts.voronoi_shallow_depth_min
+    voronoi_shallow_max = base_opts.voronoi_shallow_depth_max
+    voronoi_deep_min = base_opts.voronoi_deep_depth_min
+    voronoi_deep_max = base_opts.voronoi_deep_depth_max
+    voronoi_slope_wt = base_opts.voronoi_slope_weighting
+    voronoi_slope_fac = base_opts.voronoi_slope_factor
 
     # Visualization and animation defaults
     anim_hydro = base_opts.animate_hydro
@@ -2538,11 +2696,6 @@ function main(args = ARGS)
 
     # 3. Parse modifier flags that override config defaults
     is_quick = "--quick" in args || "-q" in args
-    if "--real" in args
-        is_real = true
-    elseif "--synthetic" in args
-        is_real = false
-    end
     if "--gpu" in args || "--cuda" in args
         use_gpu = true
     elseif "--cpu" in args
@@ -2561,10 +2714,15 @@ function main(args = ARGS)
     elseif "--no-obc" in args
         obc_src = :none
     end
-    if "--era5-forcing" in args || "--era5" in args
-        atmo_src = :era5
-    elseif "--no-era5" in args
-        atmo_src = :synthetic
+    # Atmospheric forcing source, named after `[atmosphere] source` so the flag and the TOML key
+    # say the same thing. An empty value, or `false`/`none`/`off`, means no atmospheric forcing.
+    # The driver decides whether to attach fluxes by testing membership of the list of sources
+    # that produce them (see the `atmo_craft` branch), so "off" is a source that is not in it.
+    for a in args
+        if startswith(a, "--wind-source=")
+            raw = lowercase(strip(String(split(a, "=", limit = 2)[2])))
+            atmo_src = raw in ("", "false", "none", "off", "no") ? :none : Symbol(raw)
+        end
     end
     if "--interactive" in args
         interactive = true
@@ -2646,7 +2804,6 @@ function main(args = ARGS)
     if "--real-5yr" in args
         scenario = :historical
         proj_year = 2020
-        is_real = true
         sim_dur = is_quick ? 432000.0 : 157788000.0
         if isempty(run_id_val)
             run_id_val = "snowcrab_real_5yr"
@@ -2657,7 +2814,6 @@ function main(args = ARGS)
     elseif "--climatology-2yr" in args
         scenario = :climatology
         proj_year = 2022
-        is_real = true
         sim_dur = is_quick ? 172800.0 : 63115200.0
         if isempty(run_id_val)
             run_id_val = "snowcrab_climatology_2yr"
@@ -2668,7 +2824,6 @@ function main(args = ARGS)
     elseif "--climatology-1.5yr" in args || "--climatology-18mo" in args
         scenario = :climatology
         proj_year = 2022
-        is_real = true
         sim_dur = is_quick ? 172800.0 : 47336400.0
         if isempty(run_id_val)
             run_id_val = "snowcrab_climatology_1.5yr"
@@ -2820,7 +2975,15 @@ function main(args = ARGS)
         domain_lat = lat_range,
         domain_z = depth_range,
         grid_size = grid_dim,
-        data_mode = is_real ? :real : :synthetic,
+        bathy_source = bathy_source,
+        coastline_source = coastline_source,
+        wind_source = wind_source,
+        wind_time_iso = wind_time_iso,
+        tides_source = tides_source,
+        tidal_constituents = tidal_constituents,
+        vertical_depths = vertical_depths,
+        inshore_depth = inshore_depth,
+        shelf_slope = shelf_slope,
         enable_tides = enable_tides,
         tidal_u_amp = tidal_u,
         tidal_v_amp = tidal_v,
@@ -2882,6 +3045,7 @@ function main(args = ARGS)
         enable_checkpoint = enable_cp,
         checkpoint_prefix = cp_prefix,
         checkpoint_schedule = cp_sched,
+        output_schedule_seconds = out_sched,
         checkpoint_dir = cp_dir,
         checkpoint_cleanup = cp_clean,
         auto_restart = auto_res,
@@ -2907,6 +3071,14 @@ function main(args = ARGS)
         voronoi_min_res_core_km = voronoi_min_core,
         voronoi_min_res_shallow_km = voronoi_min_shallow,
         voronoi_min_res_deep_km = voronoi_min_deep,
+        voronoi_core_depth_min = voronoi_core_min,
+        voronoi_core_depth_max = voronoi_core_max,
+        voronoi_shallow_depth_min = voronoi_shallow_min,
+        voronoi_shallow_depth_max = voronoi_shallow_max,
+        voronoi_deep_depth_min = voronoi_deep_min,
+        voronoi_deep_depth_max = voronoi_deep_max,
+        voronoi_slope_weighting = voronoi_slope_wt,
+        voronoi_slope_factor = voronoi_slope_fac,
         animate_hydro = anim_hydro,
         anim_variable = anim_var,
         anim_fps = anim_fps,
@@ -2991,6 +3163,29 @@ function main(args = ARGS)
     catch err
         @warn "Could not write resolved configuration to $(resolved_path): " *
               "$(typeof(err).name.name)"
+    end
+
+    # Record which physical inputs actually backed this run.
+    #
+    # `resolved_config.toml` above records what was *asked for*; this records what was
+    # *actually read*, with the cached file's size and SHA-256. Keeping the two separate is
+    # deliberate: a run that degraded to analytic forcing, or that reused a stale cache, will
+    # show up as a divergence between them, and that divergence is the thing worth seeing.
+    if any(a -> startswith(a, "--data="), args) || opts.enable_checkpoint
+        try
+            prov_path = data_provenance(
+                opts.output_dir;
+                config_path = config_file,
+                extra = Dict{String, Any}(
+                    "scenario" => string(opts.scenario),
+                    "projection_year" => opts.projection_year,
+                    "seed" => opts.seed,
+                ),
+            )
+            println("Data provenance written to: $(prov_path)")
+        catch err
+            @warn "Could not write data provenance: $(err)"
+        end
     end
 
     # Segment dispatch

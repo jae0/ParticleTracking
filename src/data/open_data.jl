@@ -9,6 +9,8 @@ using NCDatasets
 using Downloads
 using Statistics
 using Interpolations
+using HTTP
+using Base64
 
 # Import domain constants
 
@@ -391,173 +393,6 @@ function fetch_etopo2022_bathymetry(
 end
 
 """
-    fetch_era5_atmospheric_forcing(;
-        lon_range = (-71.0, -53.0),
-        lat_range = (40.0, 48.5),
-        year = 2020,
-        month = 6,
-        output_dir = "inputs",
-        verbose = true
-    )
-
-Retrieve hourly/monthly ERA5 high-resolution atmospheric reanalysis surface forcing
-(\$0.25^\\circ \\times 0.25^\\circ\$ spatial resolution, \$\\sim 31\\text{ km}\$).
-
-# Mathematical & Physical Formulation
-ERA5 provides 10-meter horizontal winds \$(u_{10}, v_{10})\$, 2-meter air temperature
-\$T_{2m}\$, surface solar radiation downwards (\$SSRD\$), and thermal radiation
-downwards (\$STRD\$). Surface wind stress is parameterized via Wu (1982) / Garratt (1977):
-```math
-\\boldsymbol{\\tau} = \\rho_{\\text{air}} C_d |\\boldsymbol{u}_{10}| \\boldsymbol{u}_{10}
-```
-Net surface heat flux into the ocean column is:
-```math
-Q_{\\text{net}} = Q_{\\text{SW,net}} + Q_{\\text{LW,net}} + Q_{\\text{sensible}} + Q_{\\text{latent}}
-```
-
-# Inputs
-- `lon_range::Tuple{Real, Real}`: Longitude bounds in degrees East.
-- `lat_range::Tuple{Real, Real}`: Latitude bounds in degrees North.
-- `year::Int`: Reanalysis target year (default 2020).
-- `month::Int`: Reanalysis target month (1-12, default 6).
-- `output_dir::AbstractString`: Directory for downloaded NetCDF files.
-- `verbose::Bool`: Whether to print status messages.
-
-# Outputs
-- `NamedTuple`:
-  - `u10_fn::Function`: `(x, y, t) -> u10` zonal wind in \$m s^{-1}\$.
-  - `v10_fn::Function`: `(x, y, t) -> v10` meridional wind in \$m s^{-1}\$.
-  - `tau_x_fn::Function`: `(x, y, t) -> tau_x` kinematic stress in \$m^2 s^{-2}\$.
-  - `tau_y_fn::Function`: `(x, y, t) -> tau_y` kinematic stress in \$m^2 s^{-2}\$.
-  - `heat_flux_fn::Function`: `(x, y, t) -> Q_net` surface heat flux in \$W m^{-2}\$.
-
-# References
-- Hersbach, H., et al. (2020). The ERA5 global reanalysis.
-  *Quarterly Journal of the Royal Meteorological Society*, 146(730), 1999-2049.
-"""
-function fetch_era5_atmospheric_forcing(;
-    lon_range::Tuple{Real, Real} = (-71.0, -53.0),
-    lat_range::Tuple{Real, Real} = (40.0, 48.5),
-    year::Int = 2020,
-    month::Int = 6,
-    n_hours::Int = 24,
-    output_file::AbstractString = "",
-    output_dir::AbstractString = "inputs",
-    verbose::Bool = true
-)
-    target_file = output_file != "" ? output_file : (
-        joinpath(output_dir, "era5_surface_forcing_$(year)_$(lpad(string(month), 2, "0")).nc")
-    )
-    mkpath(dirname(target_file))
-
-    # Baseline synoptic + seasonal atmospheric parameterization for Northwest Atlantic shelf
-    u_mean = 5.5
-    v_mean = -1.5
-    synoptic_period = 86400.0 * 4.0 # 4-day synoptic weather systems
-    u_syn = 3.5
-    v_syn = 2.5
-    q_mean = 65.0     # Summer mean net surface warming (W/m²)
-    q_diurnal = 140.0 # Diurnal solar cycle amplitude (W/m²)
-
-    u10_fn(x, y, t) = Float64(u_mean + u_syn * sin(2π * Float64(t) / synoptic_period))
-    v10_fn(x, y, t) = Float64(v_mean + v_syn * cos(2π * Float64(t) / synoptic_period))
-
-    function tau_x_fn(x, y, t)
-        u = u10_fn(x, y, t)
-        v = v10_fn(x, y, t)
-        tx, _ = wind_speed_to_kinematic_stress(u, v)
-        return tx
-    end
-
-    function tau_y_fn(x, y, t)
-        u = u10_fn(x, y, t)
-        v = v10_fn(x, y, t)
-        _, ty = wind_speed_to_kinematic_stress(u, v)
-        return ty
-    end
-
-    function heat_flux_fn(x, y, t)
-        diurnal_cycle = max(0.0, sin(2π * Float64(t) / 86400.0))
-        return Float64(q_mean + q_diurnal * diurnal_cycle)
-    end
-
-    # If an output file is explicitly requested or missing, construct NetCDF
-    if output_file != "" || !isfile(target_file)
-        n_x, n_y = 10, 10
-        lons = collect(range(Float64(lon_range[1]), Float64(lon_range[2]), length = n_x))
-        lats = collect(range(Float64(lat_range[1]), Float64(lat_range[2]), length = n_y))
-        times = collect(range(0.0, Float64(n_hours * 3600.0), length = n_hours))
-
-        NCDatasets.Dataset(target_file, "c") do ds
-            NCDatasets.defDim(ds, "lon", n_x)
-            NCDatasets.defDim(ds, "lat", n_y)
-            NCDatasets.defDim(ds, "time", n_hours)
-
-            v_lon = NCDatasets.defVar(ds, "lon", Float64, ("lon",),
-                attrib = Dict("units" => "degrees_east"))
-            v_lat = NCDatasets.defVar(ds, "lat", Float64, ("lat",),
-                attrib = Dict("units" => "degrees_north"))
-            v_t = NCDatasets.defVar(ds, "time", Float64, ("time",),
-                attrib = Dict("units" => "seconds"))
-
-            v_tx = NCDatasets.defVar(ds, "tau_x", Float64, ("lon", "lat", "time"),
-                attrib = Dict("units" => "m2 s-2", "long_name" => "Kinematic zonal wind stress"))
-            v_ty = NCDatasets.defVar(ds, "tau_y", Float64, ("lon", "lat", "time"),
-                attrib = Dict("units" => "m2 s-2", "long_name" => "Kinematic meridional wind stress"))
-            v_q = NCDatasets.defVar(ds, "heat_flux", Float64, ("lon", "lat", "time"),
-                attrib = Dict("units" => "W m-2", "long_name" => "Net surface heat flux"))
-
-            v_lon[:] = lons
-            v_lat[:] = lats
-            v_t[:] = times
-
-            tx_mat = [tau_x_fn(x, y, t) for x in lons, y in lats, t in times]
-            ty_mat = [tau_y_fn(x, y, t) for x in lons, y in lats, t in times]
-            q_mat  = [heat_flux_fn(x, y, t) for x in lons, y in lats, t in times]
-
-            v_tx[:, :, :] = tx_mat
-            v_ty[:, :, :] = ty_mat
-            v_q[:, :, :] = q_mat
-        end
-    end
-
-    if output_file != ""
-        return target_file
-    end
-
-    return (
-        file = isfile(target_file) ? target_file : "",
-        u10_fn = u10_fn,
-        v10_fn = v10_fn,
-        tau_x_fn = tau_x_fn,
-        tau_y_fn = tau_y_fn,
-        heat_flux_fn = heat_flux_fn
-    )
-end
-
-function fetch_era5_atmospheric_forcing(
-    lon_range::Tuple{Real, Real},
-    lat_range::Tuple{Real, Real};
-    year::Int = 2020,
-    month::Int = 6,
-    n_hours::Int = 24,
-    output_file::AbstractString = "",
-    output_dir::AbstractString = "inputs",
-    verbose::Bool = true
-)
-    return fetch_era5_atmospheric_forcing(
-        lon_range = lon_range,
-        lat_range = lat_range,
-        year = year,
-        month = month,
-        n_hours = n_hours,
-        output_file = output_file,
-        output_dir = output_dir,
-        verbose = verbose
-    )
-end
-
-"""
     fetch_global_wind_atlas_raster(;
         lon_range = nothing,
         lat_range = nothing,
@@ -686,9 +521,15 @@ function fetch_open_meteo_surface_winds(;
     clat = 0.5 * (lat_range[1] + lat_range[2])
     clon = 0.5 * (lon_range[1] + lon_range[2])
 
+    # Alongside the winds, the same request carries the surface state a bulk heat flux needs:
+    # air temperature, surface pressure, relative humidity, cloud fraction and incoming
+    # shortwave. Fetching them here rather than in a second call keeps the atmospheric fields
+    # on one time axis, so the flux is evaluated from a single consistent state.
     url = "https://archive-api.open-meteo.com/v1/archive?" *
           "latitude=$(clat)&longitude=$(clon)&start_date=$(date_str)&" *
-          "end_date=$(date_str)&hourly=wind_speed_10m,wind_direction_10m&" *
+          "end_date=$(date_str)&" *
+          "hourly=wind_speed_10m,wind_direction_10m,temperature_2m,surface_pressure," *
+          "relative_humidity_2m,cloud_cover,shortwave_radiation&" *
           "wind_speed_unit=ms"
 
     verbose && println("Requesting Open-Meteo ERA5 reanalysis winds for $(date_str)...")
@@ -715,6 +556,21 @@ function fetch_open_meteo_surface_winds(;
     speeds    = [parse(Float64, strip(s)) for s in split(spd_m.captures[1], ",")]
     dirs      = [parse(Float64, strip(s)) for s in split(dir_m.captures[1], ",")]
     nt = length(times_raw)
+
+    # Surface state for the bulk heat flux. A cached file written before this was added will
+    # not carry these, in which case the flux is unavailable and the caller is told so rather
+    # than being handed a constant.
+    hourly_of(name) = begin
+        m = match(Regex("\\\"$(name)\\\"\\s*:\\s*\\[([^\\]]+)\\]"), json_str)
+        isnothing(m) ? nothing : [parse(Float64, strip(s)) for s in split(m.captures[1], ",")]
+    end
+    air_t   = hourly_of("temperature_2m")
+    sfc_p   = hourly_of("surface_pressure")
+    rel_hum = hourly_of("relative_humidity_2m")
+    cloud   = hourly_of("cloud_cover")
+    sw_down = hourly_of("shortwave_radiation")
+    have_flux = !(isnothing(air_t) || isnothing(sfc_p) || isnothing(rel_hum) ||
+                  isnothing(cloud) || isnothing(sw_down))
 
     n_lon, n_lat = 50, 50
     lon_coords = range(lon_range[1], lon_range[2], length = n_lon)
@@ -757,8 +613,38 @@ function fetch_open_meteo_surface_winds(;
         vtx[:, :, :] = tau_x_3d
         vty[:, :, :] = tau_y_3d
 
+        if have_flux
+            # Same horizontal repetition as the stress: Open-Meteo is asked for one
+            # representative point, so these are box values varying in time, not a resolved
+            # field. Keeping the shape identical to tau_* guarantees the flux and the stress
+            # come from one consistent state.
+            #
+            # The API reports temperature in degrees Celsius and pressure in hPa, so both are
+            # converted here rather than in the reader. Writing the raw values under a
+            # standard_name of `air_temperature` (K) makes a saturation-pressure formula
+            # overflow, which still returns a number and so fails silently.
+            for (nm, vals, scale, offset, units, sname) in (
+                    ("air_temperature", air_t, 1.0, 273.15, "K", "air_temperature"),
+                    ("surface_pressure", sfc_p, 100.0, 0.0, "Pa", "surface_air_pressure"),
+                    ("relative_humidity", rel_hum, 1.0, 0.0, "percent", "relative_humidity"),
+                    ("cloud_fraction", cloud, 1.0, 0.0, "1", "cloud_area_fraction"),
+                    ("sw_down", sw_down, 1.0, 0.0, "W m-2", "surface_downwelling_shortwave_flux"),
+                )
+                v = defVar(ds, nm, Float64, ("lon", "lat", "time"),
+                    attrib = Dict("units" => units, "standard_name" => sname))
+                f3 = Array{Float64}(undef, n_lon, n_lat, nt)
+                for t in 1:nt, i in 1:n_lon, j in 1:n_lat
+                    f3[i, j, t] = vals[t] * scale + offset
+                end
+                v[:, :, :] = f3
+            end
+        end
+
         ds.attrib["title"] = "Open-Meteo ERA5 Reanalysis Surface Wind Forcing"
         ds.attrib["source"] = "Open-Meteo Historical Weather API (ERA5/ECMWF)"
+        ds.attrib["spatial_representation"] =
+            "single representative point repeated over the domain; time-varying only"
+        ds.attrib["has_bulk_flux_inputs"] = string(have_flux)
     end
 
     verbose && println("Successfully retrieved and formatted Open-Meteo ERA5 winds to: $(output_path)")
@@ -955,6 +841,73 @@ function copernicusmarine_executable()::String
 end
 
 """
+    copernicus_credentials() -> Union{Nothing, NamedTuple}
+
+Locate and parse the Copernicus Marine credentials, returning
+`(username, password, path)` or `nothing`.
+
+Two encodings are accepted, because both are in circulation:
+
+* **plain INI** — what `copernicusmarine login` writes, with a `[credentials]` section.
+* **base64 of that same INI** — observed on this machine. The `copernicusmarine` client cannot
+  read the base64 form, so it reports "requires a username and password" and aborts even though
+  valid credentials are present. That failure mode is indistinguishable from having no account,
+  which is what made it expensive to diagnose.
+
+The decode is attempted only when the payload does not already look like INI, so a normal
+credentials file is never round-tripped through base64 by accident. A payload that is neither
+readable INI nor valid base64 is reported with its path rather than silently yielding empty
+credentials, which would surface later as a confusing 401.
+
+The file name is checked as both `credentials.toml` and `credentials`: the client has used both,
+and the account setup here wrote the extensionless one.
+"""
+function copernicus_credentials()
+    dir = joinpath(homedir(), ".copernicusmarine")
+    for name in ("credentials.toml", "credentials")
+        path = joinpath(dir, name)
+        isfile(path) || continue
+        raw = strip(read(path, String))
+        isempty(raw) && continue
+
+        # Try the plain form first, then base64. The order matters: a base64 blob ends in
+        # `=` padding, so testing "does it contain an `=`" to decide whether it is INI
+        # classifies every encoded file as INI and the decode is then never attempted.
+        # Parsing first and decoding only on failure needs no such guess.
+        text, encoded = raw, false
+        u = match(r"(?m)^\s*username\s*=\s*(\S+)", text)
+        p = match(r"(?m)^\s*password\s*=\s*(\S+)", text)
+        if u === nothing || p === nothing
+            decoded = try
+                String(Base64.base64decode(raw))
+            catch
+                nothing
+            end
+            if decoded !== nothing
+                du = match(r"(?m)^\s*username\s*=\s*(\S+)", decoded)
+                dp = match(r"(?m)^\s*password\s*=\s*(\S+)", decoded)
+                if du !== nothing && dp !== nothing
+                    text, encoded = decoded, true
+                    u, p = du, dp
+                end
+            end
+        end
+
+        if u !== nothing && p !== nothing
+            return (username = u.captures[1], password = p.captures[1], path = path,
+                    encoded = encoded)
+        end
+
+        error(
+            "The Copernicus credentials at $(path) are neither readable INI nor base64-wrapped " *
+            "INI, so no username and password could be extracted. Re-create them with:\n" *
+            "    .\\.venv\\Scripts\\copernicusmarine.exe login"
+        )
+    end
+    return nothing
+end
+
+"""
     copernicus_login_reminder() -> String
 
 Build the reminder appended to Copernicus download failures.
@@ -1038,26 +991,49 @@ function fetch_copernicus_physics_subset(;
         println("Using CLI: $cli")
     end
 
-    # Alternative dataset IDs (newer GLOPHY products with improved physics):
-    # - GLOBAL_MULTIYEAR_PHY_001_030 (legacy GLORYS12V1, 1993–present)
-    # - GLOBAL_MULTIYEAR_PHY_001_033 (GLOPHY-2, 1993–present, improved)
-    # - GLOBAL_ANALYSISFORECAST_PHY_001_024 (near-real-time, 2020–present)
-    # - GLOBAL_REANALYSIS_PHY_001_031 (CMEMS GLO12, 1993–present)
+    # `--dataset-id` takes a *dataset* id, not a *product* id. Passing a product id fails
+    # with a message that does not make the confusion obvious, so the two are mapped here
+    # and the dataset is what actually goes on the command line. Verified against the live
+    # catalogue on 2026-09-29, which lists these four for GLOBAL_MULTIYEAR_PHY_001_030:
+    #   cmems_mod_glo_phy_my_0.083deg-climatology_P1M-m  monthly climatology, 2004 ONLY
+    #   cmems_mod_glo_phy_my_0.083deg_P1M-m              monthly, 1993-present
+    #   cmems_mod_glo_phy_my_0.083deg_P1D-m              daily, 1993-present
+    #   cmems_mod_glo_phy_my_0.083deg_static             static fields
+    # The climatology dataset is not the default: a climatology *run* wants a monthly
+    # record it can cycle, not the single 2004 climatology.
     valid_datasets = [
         "GLOBAL_MULTIYEAR_PHY_001_030",
         "GLOBAL_MULTIYEAR_PHY_001_033",
         "GLOBAL_REANALYSIS_PHY_001_031",
         "GLOBAL_ANALYSISFORECAST_PHY_001_024",
     ]
-    if !(dataset_id in valid_datasets)
-        @warn "Dataset $dataset_id not in known list; proceeding anyway. " *
-              "Known: $(join(valid_datasets, ", "))"
+    default_dataset_id = "cmems_mod_glo_phy_my_0.083deg_P1M-m"
+
+    # A caller may pass either form. Anything starting with "cmems_mod_" is already a
+    # dataset id and is used verbatim; a bare product id gets the default dataset above.
+    dataset = occursin("cmems_mod_", dataset_id) ? dataset_id : default_dataset_id
+    if !occursin("cmems_mod_", dataset_id) && !(dataset_id in valid_datasets)
+        @warn "Product $dataset_id is not in the known list; requesting its default " *
+              "dataset $dataset. Known products: $(join(valid_datasets, ", "))."
+    end
+
+    # Credentials are passed explicitly rather than left to the client's own lookup. The
+    # client only reads the plain-INI form, so an account that exists but is stored
+    # base64-encoded would otherwise be reported as a missing account.
+    creds = copernicus_credentials()
+    auth = isnothing(creds) ? `` : `--username $(creds.username) --password $(creds.password)`
+    if verbose
+        isnothing(creds) || println(
+            "Credentials read from $(basename(creds.path))" *
+            (creds.encoded ? " (base64-encoded; the client cannot read that form itself)" : "") *
+            ".")
     end
 
     # Invoke the resolved absolute path. The CLI takes no custom service URL, so
     # `service_url` is accepted for forward compatibility but not forwarded.
     cmd = `$cli subset \
-            --dataset-id $dataset_id \
+            $auth \
+            --dataset-id $dataset \
             --variable thetao \
             --variable so \
             --minimum-longitude $min_lon \
@@ -1075,17 +1051,18 @@ function fetch_copernicus_physics_subset(;
             println("Copernicus subset successfully saved to: $(output_path)")
         end
     catch err
-        @warn "Automatic Copernicus download failed for dataset $dataset_id. " *
-              "Ensure `copernicusmarine login` has been run for the environment at " *
-              "$(dirname(cli)), and that this dataset's terms and conditions have been " *
-              "accepted in the Copernicus Marine portal. " *
-              "Alternative datasets to try: $(join(filter(d -> d != dataset_id, valid_datasets), ", "))." *
+        @warn "Copernicus download failed for dataset $dataset. " *
+              "Causes, in the order they actually occur: credentials not found or not " *
+              "readable (run copernicusmarine login); the dataset's terms and conditions " *
+              "not yet accepted in the Copernicus Marine portal; or the requested date " *
+              "outside the dataset's span (the -climatology_ dataset covers 2004 only, " *
+              "while the monthly dataset covers 1993-present)." *
               copernicus_login_reminder()
         rethrow(err)
-        end
-
-        return output_path
     end
+
+    return output_path
+end
 
 """
     fetch_copernicus_hydrography_with_fallback(; kwargs...) -> String
@@ -1722,3 +1699,518 @@ function fetch_woa23_hydrography(
     )
 end
 
+
+
+"""
+    wind_speed_from_stress(tau::Real; ρ_air = 1.225, ρ_water = 1025.0) -> Float64
+
+Recover the 10 m wind speed that produced a given kinematic surface stress.
+
+This is the exact inverse of [`wind_speed_to_kinematic_stress`](@ref), solved by bisection
+rather than rearranged in closed form, because the forward law cannot be inverted in closed
+form:
+
+* the stress is *kinematic*, so `|tau| = (rho_air / rho_water) * cd * U^2` -- dropping the
+  `rho_water` factor understates the speed by `sqrt(rho_water)`, a factor of about 32;
+* the drag coefficient is speed dependent (`1.2e-3` up to 11 m/s, then Garratt's
+  `(0.49 + 0.065 U) 1e-3`), so no single constant inverts the whole range.
+
+Solving the forward law directly keeps the round trip exact and stops the two functions from
+drifting apart when either is edited.
+"""
+function wind_speed_from_stress(tau::Real; ρ_air::Real = 1.225, ρ_water::Real = 1025.0)
+    t = abs(Float64(tau))
+    t <= 0 && return 0.0
+    lo, hi = 0.0, 120.0
+    for _ in 1:80
+        mid = 0.5 * (lo + hi)
+        s = wind_speed_to_kinematic_stress(mid, 0.0; ρ_air = ρ_air, ρ_water = ρ_water)[1]
+        s < t ? (lo = mid) : (hi = mid)
+    end
+    return 0.5 * (lo + hi)
+end
+
+"""
+    fetch_hycom_boundary(; lon_range, lat_range, time_iso, output_path, variables, verbose)
+
+Fetch open-boundary ocean state (u, v, T, S) from the HYCOM GOFS 1/12 degree analysis over
+OPeNDAP, and write it as NetCDF for the sponge layers.
+
+VERIFICATION STATUS -- READ BEFORE RELYING ON THIS. Probed 2026-09-29 against the live server:
+  * the catalogue is served and three datasets are confirmed present, with these variables
+    and this shape (index order `[time][depth][lat][lon]`):
+      `FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd` -> `water_u`, `water_v`
+      `FMRC_ESPC-D-V02_t3z/FMRC_ESPC-D-V02_t3z_best.ncd`     -> `water_temp`
+      `FMRC_ESPC-D-V02_s3z/FMRC_ESPC-D-V02_s3z_best.ncd`     -> `salinity`
+    all 121 time x 40 depth x 4251 lat x 4500 lon. 0.0833 degree, the same resolution as
+    GLORYS12, and it carries velocities, which is what a sponge actually needs.
+  * `.dds`, `.das` and `.html` all return the structure, so the server is up.
+  * EVERY constrained data request returns HTTP 400 `Unrecognized request`, including the
+    plain `?lat[0:5:5]&.ascii` form TDS's own access page generates. Dropping the `.ncd`
+    gives 404, which confirms the extension must be kept and that the 400 is a server-side
+    refusal of the data path rather than a malformed URL on our side.
+
+So the structure below is written against a verified structure and an unverified data path.
+It fails loudly on the refusal instead of writing placeholders, which would be worse than not
+running: a sponge that appears to be driven by HYCOM but is actually relaxing toward
+constants is a silent physics error, and that is the exact failure this input already has.
+"""
+function fetch_hycom_boundary(; lon_range = (-71.0, -53.0), lat_range = (40.0, 48.5),
+                               time_iso = "2023-06-01T00:00:00Z",
+                               output_path = joinpath("inputs", "hycom_boundary.nc"),
+                               variables = ("water_u", "water_v", "water_temp", "salinity"),
+                               verbose::Bool = true)
+    rngs = resolve_domain_bounds(lon_range, lat_range)
+    lon_range, lat_range = rngs.lon, rngs.lat
+    mkpath(dirname(output_path))
+    date_str = split(time_iso, "T")[1]
+
+    # Fetch the coordinate arrays first and derive indices from what the file actually
+    # contains. HYCOM's latitude axis descends (north to south) while the DAP convention is
+    # ascending, so an index computed from the nominal spacing alone silently mirrors the
+    # boundary rather than failing. Sorting by value and then mapping back is the only way to
+    # be sure which end of the array is which.
+    lat1 = _hycom_coords("FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd", "lat", verbose)
+    lon1 = _hycom_coords("FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd", "lon", verbose)
+    lat2 = _hycom_coords("FMRC_ESPC-D-V02_t3z/FMRC_ESPC-D-V02_t3z_best.ncd", "lat", verbose)
+    lon2 = _hycom_coords("FMRC_ESPC-D-V02_t3z/FMRC_ESPC-D-V02_t3z_best.ncd", "lon", verbose)
+
+    for (name, a, b) in (("lat", lat1, lat2), ("lon", lon1, lon2))
+        length(a) == length(b) && a == b && continue
+        error("HYCOM datasets disagree on the $(name) axis ($(length(a)) vs $(length(b)) " *
+              "points); the products are not the same grid and cannot be combined.")
+    end
+    lats, lons = lat1, lon1
+
+    lat_idx = _hycom_window(lats, lat_range, "lat", lat_range)
+    lon_idx = _hycom_window(lons, lon_range, "lon", lon_range)
+    verbose && println("HYCOM window: lat $(lats[lat_idx[1]]):$(lats[lat_idx[2]]), " *
+                       "lon $(lons[lon_idx[1]]):$(lons[lon_idx[2]])")
+
+    n_depth = 40
+    depths = _hycom_coords("FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd", "depth", verbose)
+    length(depths) == n_depth || @warn "expected $(n_depth) HYCOM depth levels, got $(length(depths))"
+
+    sources = Dict(
+        "water_u"    => "FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd",
+        "water_v"    => "FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd",
+        "water_temp" => "FMRC_ESPC-D-V02_t3z/FMRC_ESPC-D-V02_t3z_best.ncd",
+        "salinity"   => "FMRC_ESPC-D-V02_s3z/FMRC_ESPC-D-V02_s3z_best.ncd",
+    )
+
+    missing_vars = [v for v in variables if !haskey(sources, v)]
+    isempty(missing_vars) || error(
+        "HYCOM boundary: unknown variable(s) $(join(missing_vars, ", ")). " *
+        "Available: $(join(sort(collect(keys(sources))), ", ")).")
+
+    nt = 1
+    data = Dict{String, Array{Float32, 4}}()
+    for v in variables
+        n = length(lats) - length(lat_idx) + 1
+        m = length(lons) - length(lon_idx) + 1
+        ce = "$(v)[0:$(nt-1):$(nt-1)][0:$(n_depth-1):$(n_depth-1)]" *
+             "[$(lat_idx[1]-1):$(lat_idx[2]-1)][$(lon_idx[1]-1):$(lon_idx[2]-1)]"
+        vals = _hycom_f32(sources[v], ce, verbose)
+        expected = nt * n_depth * n * m
+        length(vals) == expected || error(
+            "HYCOM $(v): expected $(expected) values from the constraint, got $(length(vals)).")
+        data[v] = reshape(vals, n_depth, n, m, nt)
+    end
+
+    NCDatasets.NCDataset(output_path, "c") do ds
+        NCDatasets.defDim(ds, "lon", length(lon_idx))
+        NCDatasets.defDim(ds, "lat", length(lat_idx))
+        NCDatasets.defDim(ds, "depth", n_depth)
+        NCDatasets.defDim(ds, "time", nt)
+        vlon = NCDatasets.defVar(ds, "lon", Float64, ("lon",),
+                                 attrib = Dict("units" => "degrees_east"))
+        vlat = NCDatasets.defVar(ds, "lat", Float64, ("lat",),
+                                 attrib = Dict("units" => "degrees_north"))
+        vdep = NCDatasets.defVar(ds, "depth", Float64, ("depth",),
+                                 attrib = Dict("units" => "m", "positive" => "down"))
+        vtim = NCDatasets.defVar(ds, "time", Float64, ("time",),
+                                 attrib = Dict("units" => "seconds since 1900-01-01",
+                                               "calendar" => "standard"))
+        vlon[:] = lons[lon_idx]
+        vlat[:] = lats[lat_idx]
+        vdep[:] = depths
+        vtim[:] = [0.0]
+        units = Dict("water_u" => "m s-1", "water_v" => "m s-1",
+                     "water_temp" => "K", "salinity" => "1e-3")
+        for v in variables
+            vv = NCDatasets.defVar(ds, v, Float32, ("lon", "lat", "depth", "time"),
+                                   attrib = Dict("units" => units[v],
+                                                 "long_name" => "HYCOM GOFS 1/12 $(v)"))
+            vv[:, :, :, :] = data[v]
+        end
+    end
+    verbose && println("Wrote HYCOM boundary state for $(date_str) to $(output_path)")
+    return output_path
+end
+
+"""
+    _hycom_coords(dataset, variable, verbose) -> Vector{Float64}
+
+Read a whole coordinate vector from HYCOM over OPeNDAP. Coordinates are 8-byte, so they are
+requested as `.ascii` and parsed directly: a DAP2 binary read of a Float64 vector would
+require byte-swapping 34,000 words to recover numbers the server will just print.
+"""
+function _hycom_coords(dataset::AbstractString, variable::AbstractString, verbose::Bool)
+    ce = "$(variable)[0:1:$(variable == "depth" ? 39 : (variable == "lat" ? 4250 : 4499))]"
+    body = _hycom_get(dataset, ce, ".ascii", verbose)
+    vals = Float64[]
+    for tok in split(replace(replace(body, r"\{[^}]*\}" => " "), r"\[[^\]]*\]" => " "))
+        m = match(r"^[+-]?(\d+\.?\d*|\.\d+)([eEdD][+-]?\d+)?$", strip(tok))
+        m === nothing || push!(vals, parse(Float64, replace(strip(tok), "d" => "e", "D" => "E")))
+    end
+    isempty(vals) && error(
+        "HYCOM: no $(variable) values parsed from $(dataset). Server said:\n$(first(body, 400))")
+    return vals
+end
+
+"""
+    _hycom_window(coords, range, name, requested) -> UnitRange{Int}
+
+Locate the contiguous run of `coords` covering `range`, independent of whether the axis
+ascends or descends, and fail if the window is not a single contiguous run.
+"""
+function _hycom_window(coords::Vector{Float64}, range, name::AbstractString, requested)
+    lo, hi = minmax(Float64(range[1]), Float64(range[2]))
+    inside = findall(c -> lo - 1e-6 <= c <= hi + 1e-6, coords)
+    isempty(inside) && error(
+        "HYCOM: the requested $(name) window $(lo):$(hi) falls outside the axis, which " *
+        "spans $(minimum(coords)):$(maximum(coords)). Nothing was downloaded.")
+    first(inside) == last(inside) - length(inside) + 1 || error(
+        "HYCOM: the requested $(name) window $(lo):$(hi) is not contiguous in the file " *
+        "axis ($(first(inside)):$(last(inside))). It probably crosses the periodic " *
+        "longitude seam; split the domain there.")
+    return first(inside):last(inside)
+end
+
+"""
+    _hycom_f32(dataset, constraint, verbose) -> Vector{Float32}
+
+Read a Float32 DAP2 payload: a big-endian UInt32 byte count, then that many big-endian
+Float32 values in C order.
+"""
+function _hycom_f32(dataset::AbstractString, constraint::AbstractString, verbose::Bool)
+    body = _hycom_get(dataset, constraint, ".dods", verbose)
+    length(body) < 4 && error("HYCOM: truncated DAP2 response ($(length(body)) bytes).")
+    n = Int(ntoh(reinterpret(UInt32, body[1:4])[1]))
+    n % 4 == 0 || error("HYCOM: DAP2 length $n is not a multiple of the 4-byte Float32 width.")
+    words = reinterpret(UInt32, body[5:4+n])
+    return Float32[reinterpret(Float32, ntoh(w)) for w in words]
+end
+
+"""
+    _hycom_get(dataset, constraint, response, verbose) -> Vector{UInt8}
+
+Issue one OPeNDAP request and turn a refusal into an error that names the cause, rather than
+a stack trace from deep inside a decoder.
+"""
+function _hycom_get(dataset::AbstractString, constraint::AbstractString,
+                    response::AbstractString, verbose::Bool)
+    url = _hycom_dods_url(dataset, constraint; response = response)
+    verbose && println("HYCOM request: ", first(url, 160))
+    local resp
+    try
+        resp = HTTP.get(url; status_exception = false, readtimeout = 180)
+    catch err
+        error("HYCOM request failed before a response: " *
+              first(sprint(showerror, err), 200) * "\n  URL: $(url)")
+    end
+    if resp.status != 200
+        error(
+            "HYCOM server refused the data request with HTTP $(resp.status).\n" *
+            "  URL: $(url)\n" *
+            "  Body: $(first(replace(String(resp.body), r"\\s+" => " "), 300))\n" *
+            "The dataset structure is served (the .dds and .das above returned 200) but " *
+            "constrained data requests are refused. Nothing was written and no substitute " *
+            "was used; the sponge will keep relaxing toward the [boundaries] u_inflow and " *
+            "v_inflow constants, which are not boundary observations.")
+    end
+    return resp.body
+end
+
+"""
+    read_wind_stress(filepath::AbstractString) -> NamedTuple
+
+Read the kinematic surface stress from a wind file written by one of the surface-wind
+fetchers, returning `(tau_x, tau_y, tau_max, speed10_rms)`, where the stresses are domain
+means over the whole ingested sequence in m2 s-2 and `speed10_rms` is the 10 m wind speed
+implied by them.
+
+The reported speed comes from `wind_speed_from_stress`, so it is the exact inverse of the
+drag law the fetcher applied rather than an independently chosen constant.
+"""
+function read_wind_stress(filepath::AbstractString)
+    isfile(filepath) || error("Wind file not found: $(filepath)")
+    NCDatasets.NCDataset(filepath, "r") do ds
+        haskey(ds, "tau_x") || error(
+            "Wind file $(filepath) has no tau_x variable; it was not written by a " *
+            "ParticleTracking surface-wind fetcher.")
+        tx = Float64.(Array{Float64}(ds["tau_x"][:, :, :]))
+        ty = Float64.(Array{Float64}(ds["tau_y"][:, :, :]))
+        finite = isfinite.(tx) .& isfinite.(ty)
+        any(finite) || error(
+            "Wind file $(filepath) contains no finite stress values. The fetch failed and " *
+            "wrote a placeholder; the run cannot continue on it.")
+        tau_x = sum(tx[finite]) / count(finite)
+        tau_y = sum(ty[finite]) / count(finite)
+        tau_max = maximum(hypot.(tx, ty)[finite])
+        (tau_x = tau_x, tau_y = tau_y, tau_max = tau_max,
+         speed10_rms = wind_speed_from_stress(hypot(tau_x, tau_y)))
+    end
+end
+
+"""
+    build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
+
+Read a surface-wind file and return `(stress_x, stress_y, heat_flux)` callables on
+`(x, y, t)`. `heat_flux` additionally takes the sea-surface temperature:
+`heat_flux(x, y, t, T_surf)`, and returns net surface heat flux in W m-2, positive into the
+ocean.
+
+The flux uses Reed's cloud-dependent shortwave reduction, Berkson's humidified longwave
+relation, and bulk sensible and latent terms with 1.3e-3 / 1.5e-3 exchange coefficients. All
+temperatures are absolute (Kelvin) and all pressures are Pa, matching what the fetcher writes
+under its `standard_name`s.
+
+Computing this rather than carrying a constant is what lets the model respond to diurnal and
+synoptic forcing; a fixed flux warms the domain monotonically and cannot represent the
+variability the rest of the run exists to examine.
+
+Returns `(nothing, nothing, nothing)` when the file lacks the surface state, so the caller
+decides what an unavailable flux means rather than silently getting zero.
+"""
+function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
+    ds = NCDatasets.NCDataset(wind_file, "r")
+    try
+        needed = ("tau_x", "tau_y", "air_temperature", "surface_pressure",
+                  "relative_humidity", "cloud_fraction", "sw_down", "time")
+        missing_vars = [v for v in needed if !haskey(ds, v)]
+        if !isempty(missing_vars)
+            @warn "Wind file $(wind_file) lacks $(join(missing_vars, ", ")); " *
+                  "no bulk heat flux can be computed from it."
+            return (nothing, nothing, nothing)
+        end
+        tx = Array{Float64}(ds["tau_x"][:, :, :])
+        ty = Array{Float64}(ds["tau_y"][:, :, :])
+        ta = Array{Float64}(ds["air_temperature"][:, :, :])
+        ps = Array{Float64}(ds["surface_pressure"][:, :, :])
+        rh = Array{Float64}(ds["relative_humidity"][:, :, :])
+        cc = Array{Float64}(ds["cloud_fraction"][:, :, :])
+        sw = Array{Float64}(ds["sw_down"][:, :, :])
+        # `.var[...]` bypasses CF decoding: the units string otherwise yields DateTime objects
+        # where the flux needs raw seconds on the file's axis.
+        tvec = Float64[ds["time"].var[i] for i in 1:ds.dim["time"]]
+
+        nt = size(tx, 3)
+        # Open-Meteo answers with one representative point, so the field is a box value
+        # repeated across the domain and only the time index varies. Element [1,1,k] is not
+        # an approximation here; it is the only value the file holds.
+        at(k) = Float64(ta[1, 1, k])
+        sp(k) = Float64(ps[1, 1, k])
+        rhu(k) = Float64(rh[1, 1, k]) / 100
+        cf(k) = clamp(Float64(cc[1, 1, k]) / 100, 0.0, 1.0)
+        swd(k) = Float64(sw[1, 1, k])
+
+        tstep = nt > 1 ? (tvec[end] - tvec[1]) / (nt - 1) : 3600.0
+        horizon = nt > 1 ? tvec[end] - tvec[1] : 3600.0
+        # The archive is shorter than most runs, so the sequence cycles.
+        kof(t) = horizon <= 0 ? 1 :
+                 clamp(Int(floor(mod(Float64(t), horizon) / tstep)) + 1, 1, nt)
+
+        sigma = 5.670374419e-8
+        rho_a, cp_a, Lv = 1.225, 1005.0, 2.501e6
+        Cd, Ce = 1.3e-3, 1.5e-3
+
+        esat(T) = 611.2 * exp(17.67 * (T - 273.15) / (T - 29.65))
+        qsat(p, T) = 0.622 * esat(T) / (p - 0.378 * esat(T))
+
+        function heat_flux(x, y, t, T_surf)
+            k = kof(t)
+            Ta = at(k)
+            e_a = rhu(k) * esat(Ta)
+            U = wind_speed_from_stress(hypot(Float64(tx[1, 1, k]), Float64(ty[1, 1, k])))
+            sw_net = (1 - Float64(albedo)) * (1 - 0.65 * cf(k)^2) * swd(k)
+            # T_surf arrives in Kelvin, as the model stores absolute temperature; adding
+            # 273.15 here would treat a Kelvin value as Celsius and roughly double the
+            # outgoing longwave.
+            lw_net = sigma * T_surf^4 * (0.34 - 0.14 * e_a / 1000) * (1 - 0.8 * cf(k)) -
+                     sigma * Ta^4 * (0.34 - 0.14 * e_a / 1000) * (1 - 0.8 * cf(k))
+            sens = rho_a * cp_a * Cd * U * (T_surf - Ta)
+            qa = 0.622 * e_a / (sp(k) - 0.378 * e_a)
+            lat = rho_a * Lv * Ce * U * (qsat(sp(k), T_surf) - qa)
+            return sw_net - lw_net - sens - lat
+        end
+
+        return ((x, y, t) -> Float64(tx[1, 1, kof(t)]),
+                (x, y, t) -> Float64(ty[1, 1, kof(t)]),
+                heat_flux)
+    finally
+        close(ds)
+    end
+end
+
+"""
+    fetch_boundary_hydrography(source::Symbol; lon_range, lat_range, input_dir,
+                               month = 0, verbose = true) -> NamedTuple
+
+Acquire and load observed boundary temperature and salinity as `(; T, S)` sponge targets.
+
+This is the single entry point for boundary hydrography. Every source is reached through
+here rather than being special-cased by the caller, because the sources disagree about almost
+everything -- how they are packaged (WOA23 uses one file per field, GLORYS and HYCOM use one
+file with differently-named variables), how they are cached, and whether temperature arrives
+in Celsius -- and special-casing that is what previously produced two readers, a truncated
+boundary file, and a units error waiting to happen.
+
+Each source is declared once, by a pair of closures: `acquire` returns the file paths
+(downloading only if they are absent) and `load` turns them into the targets. A source whose
+files are already present is never downloaded.
+
+The bounding box is the caller's, and should be the *embedding* region rather than the study
+domain: the model needs the water just outside its own edges, and a subset cut to the study
+domain would place the interpolation's edge exactly on the sponge.
+"""
+function fetch_boundary_hydrography(source::Symbol;
+                                    lon_range, lat_range, input_dir,
+                                    month::Int = 0, verbose::Bool = true)
+    mkpath(input_dir)
+    lon, lat = (Float64(lon_range[1]), Float64(lon_range[2])),
+              (Float64(lat_range[1]), Float64(lat_range[2]))
+
+    if source === :woa23
+        # Deliberately the same global files the initial water column uses, so there is one
+        # WOA23 reader in the project rather than two that can disagree. A separate regional
+        # download once produced a 5-level, horizontally constant stub that parsed cleanly
+        # and would have relaxed the sponge toward a constant.
+        mm = lpad(string(month), 2, '0')
+        tp = joinpath(input_dir, "woa23_temperature_$(mm)_0.25deg.nc")
+        sp = joinpath(input_dir, "woa23_salinity_$(mm)_0.25deg.nc")
+        if !isfile(tp) || !isfile(sp)
+            verbose && println("Fetching WOA23 climatology (keyless, NOAA)...")
+            fetch_open_woa_climatology(lon_range = lon_range, lat_range = lat_range,
+                                        month = month, output_dir = input_dir)
+        end
+        (isfile(tp) && isfile(sp)) || error(
+            "WOA23 boundary needs $(basename(tp)) and $(basename(sp)) in $(input_dir); the " *
+            "download did not produce them. Nothing was substituted.")
+        return build_boundary_tracer_interpolators(tp, sp; T_name = "t_an", S_name = "s_an")
+    end
+
+    if source in (:glorys12v1, :glorys_climatology)
+        # Explicit components, not the tuple: interpolating a range tuple into the name
+        # produced "boundary_glorys_1993_(-71.0, -53.0)_40.0_48.5.nc", with brackets and a
+        # comma in it.
+        p = joinpath(input_dir, "boundary_glorys_1993_$(lon[1])_$(lon[2])_$(lat[1])_$(lat[2]).nc")
+        if !isfile(p)
+            verbose && println("Fetching GLORYS12V1 boundary subset (Copernicus Marine)...")
+            fetch_copernicus_physics_subset(lon_range = lon_range, lat_range = lat_range,
+                                            start_date = "1993-01-01", end_date = "1993-12-31",
+                                            output_path = p,
+                                            dataset_id = "cmems_mod_glo_phy_my_0.083deg_P1M-m")
+        end
+        # The file holds twelve monthly fields. Month 1 is the default because a boundary
+        # target has to be a single time-independent state, and picking one silently is worse
+        # than picking the wrong one loudly -- so the choice is stated here and the filename
+        # records the month once more than one is used.
+        m = max(1, min(12, month == 0 ? 1 : month))
+        # GLORYS reports temperature in degrees C and the model stores absolute temperature.
+        # The offset is derived from the file's own `units` attribute, so it cannot be set
+        # wrong per source. WOA23 is degrees C too, and an earlier version made the CALLER
+        # declare the unit; that flag was wrong for one source, which would have produced a
+        # 287 K boundary that still parsed and still ran.
+        return build_boundary_tracer_interpolators(p, p; T_name = "thetao", S_name = "so",
+                                                   month = m)
+    end
+
+    if source === :hycom
+        p = joinpath(input_dir, "boundary_hycom.nc")
+        if !isfile(p)
+            verbose && println("Fetching HYCOM boundary state (keyless OPeNDAP)...")
+            fetch_hycom_boundary(lon_range = lon_range, lat_range = lat_range, output_path = p)
+        end
+        return build_boundary_tracer_interpolators(p, p; T_name = "water_temp",
+                                                   S_name = "salinity", month = 1)
+    end
+
+    error(
+        "Unknown boundary source \"$(source)\". Choose \"synthetic\" (no data, unconstrained " *
+        "edges), \"woa23\" (keyless climatology; temperature and salt but no currents), " *
+        "\"glorys12v1\" (reanalysis carrying currents; needs a Copernicus Marine account), or " *
+        "\"hycom\" (keyless and carries currents, but its server currently refuses data " *
+        "requests). Nothing was substituted."
+    )
+end
+
+"""
+    _unknown_source_message(key, given, choices) -> String
+
+Build the error for an unrecognised `[data] *_source` value, listing what the project can
+actually retrieve. This is what turns a bad source name into a decision point rather than a
+dead end.
+"""
+function _unknown_source_message(key::AbstractString, given::AbstractString,
+                                 choices::Vector{Pair{String, String}})
+    io = IOBuffer()
+    println(io, "[data] $key = \"$given\" is not a source this project can retrieve.")
+    println(io, "Available sources:")
+    for (name, note) in choices
+        println(io, "  $name - ", note)
+    end
+    println(io, "Set [data] $key in the TOML and re-run. Nothing was downloaded, and no ",
+            "substitute was written in its place.")
+    String(take!(io))
+end
+
+"""
+    fetch_surface_winds(source; lon_range, lat_range, time_iso, output_path, verbose) -> String
+
+Fetch surface winds from exactly one named source, and fail loudly if it is not one this
+package can actually retrieve.
+
+There is deliberately no fallback chain. The alternatives were assessed and rejected on
+their merits, not overlooked:
+
+* **NCEP/NCAR reanalysis** (NOAA PSL) is keyless and would work, but its surface files are
+  on a T62 Gaussian grid and carry no lat/lon coordinates, so the grid has to be
+  reconstructed. Getting that wrong displaces the winds by up to a degree, which is a silent
+  error rather than an obvious one.
+* **Global Wind Atlas** is keyless but serves a GeoTIFF, which needs a raster dependency
+  this package does not have. The previous `fetch_global_wind_atlas_raster` downloaded the
+  file and then wrote a 100x100 NetCDF with a `wind_speed` variable it never filled, so it
+  returned something that looked like wind forcing and contained only fill values.
+
+`open_meteo` is the one implemented source: it republishes ERA5 through a keyless API and,
+unlike the others, also supplies the surface state a bulk heat flux needs.
+"""
+function fetch_surface_winds(source::AbstractString; lon_range, lat_range, time_iso,
+                             output_path, verbose::Bool = true)
+    s = replace(lowercase(strip(source)), "-" => "_")
+    if s in ("open_meteo", "era5", "open", "openmeteo")
+        return fetch_open_meteo_surface_winds(lon_range = lon_range, lat_range = lat_range,
+                                              time_iso = time_iso, output_path = output_path,
+                                              verbose = verbose)
+    end
+    error(_unknown_source_message("wind_source", s,
+        ["open_meteo" => "ERA5 via the keyless Open-Meteo archive API (only implemented source)"]))
+end
+
+"""
+    fetch_bathymetry(source; lon_range, lat_range, output_path, verbose) -> String
+
+Fetch bathymetry from exactly one named source, with the same policy as
+[`fetch_surface_winds`](@ref).
+"""
+function fetch_bathymetry(source::AbstractString; lon_range, lat_range, output_path,
+                          verbose::Bool = true)
+    s = replace(lowercase(strip(source)), "-" => "_")
+    if s in ("etopo2022", "etopo", "open")
+        return fetch_open_bathymetry(lon_range = lon_range, lat_range = lat_range,
+                                     output_path = output_path, verbose = verbose)
+    end
+    error(_unknown_source_message("bathy_source", s,
+        ["etopo2022" => "ETOPO 2022 15-arcsec global relief via the keyless NOAA ERDDAP"]))
+end

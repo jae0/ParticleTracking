@@ -7,7 +7,6 @@ in Oceananigans.jl for coastal shelf domains.
 
 using Oceananigans
 using Oceananigans.Units
-using Oceananigans.Advection: WENOVectorInvariant
 # `ContinuousForcing` lives in `Oceananigans.Forcings`, which Oceananigans `using`s
 # internally but does not re-export at top level. `ZeroForcing` is defined locally below,
 # so it is deliberately not imported here.
@@ -88,7 +87,8 @@ function build_hydrodynamic_model(
     u_decay::Float64 = 200.0,
     v_decay::Float64 = 500.0,
     lon_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
-    lat_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
+    lat_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    boundary_tracers::Union{Nothing, NamedTuple} = nothing
 )
     active_tracers = (enable_o2 && !(:O2 in tracers)) ? (tracers..., :O2) : tracers
 
@@ -113,8 +113,16 @@ function build_hydrodynamic_model(
     # Surface kinematic boundary conditions, expressed the same way as the manual builder so
     # that `ocean_simulation` inherits them instead of inventing its own defaults.
     rho0_cp = 1025.0 * 3990.0
+    # A bulk surface heat flux depends on the sea-surface temperature, which is the tracer the
+    # flux is being applied to. Oceananigans hands a tracer to a flux boundary condition whose
+    # function accepts it, so the arity decides the call: a 3-argument function is treated as a
+    # flux that does not need the surface state, a 5-argument one receives (x, y, z, t, T).
     kinematic_T_flux = if surface_heat_flux isa Function
-        (x, y, t) -> -surface_heat_flux(x, y, t) / rho0_cp
+        if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
+            (x, y, z, t, T) -> -surface_heat_flux(x, y, t, T) / rho0_cp
+        else
+            (x, y, t) -> -surface_heat_flux(x, y, t) / rho0_cp
+        end
     elseif surface_heat_flux isa AbstractMatrix
         -surface_heat_flux ./ rho0_cp
     else
@@ -216,6 +224,50 @@ function build_hydrodynamic_model(
         if !isnothing(v_tide_val)
             composed_forcing = merge(composed_forcing,
                 (; v = ContinuousForcing((x, y, z, t) -> Float64(v_tide_val(x, y, z, t)))))
+        end
+    end
+
+    # Tracer sponge -- INCOMPLETE, and deliberately so documented here rather than left for
+    # the reader to discover from a result.
+    #
+    # What it does: relaxes T and S inside the sponge band toward an observed climatology.
+    #
+    # What it does NOT do, which is the important part:
+    #
+    #   1. It does not constrain momentum. The u/v sponge still relaxes toward the analytic
+    #      `u_inflow`/`v_inflow` constants, because WOA23 carries no currents. So the sponge
+    #      fixes what the incoming water *is* (temperature, salt) and not how fast it is
+    #      *going*. For a domain whose open edges are the main water source, that is half an
+    #      open boundary, not a whole one, and a result that depends on inflow is still
+    #      resting on two hand-entered numbers.
+    #   2. It is time-independent. A climatology is one repeating state, so the boundary has
+    #      no tidal, synoptic or seasonal cycle of its own. Eddies and storms arriving from
+    #      outside are not represented.
+    #   3. It covers T and S only. A model carrying oxygen (`enable_o2`) relaxes the other
+    #      tracers not at all.
+    #   4. It is CPU-only, because the targets are interpolation objects and therefore not
+    #      `isbits`; the GPU path refuses rather than silently dropping the sponge.
+    #
+    # Closing any of these needs a source that supplies the missing quantity -- a reanalysis
+    # with currents (GLORYS) for (1), a dated series rather than a climatology for (2). It
+    # does not need more code here; the code is not the missing part.
+    if !isnothing(boundary_tracers) && sponge_active
+        if Base.get(ENV, "PARTICLETRACKING_USE_GPU", "0") == "1"
+            error(
+                "Boundary hydrography was supplied, but a data-backed tracer sponge cannot be " *
+                "lowered into a GPU kernel: the interpolation object is not `isbits`. Refusing " *
+                "rather than skipping it, because a run that appears to carry observed " *
+                "boundary temperature and salinity but does not would be a silent physics " *
+                "error. Run this config on CPU, or set " *
+                "[boundaries] ocean_boundary_source = \"synthetic\" for the GPU run."
+            )
+        end
+        for (nm, itp) in pairs(boundary_tracers)
+            composed_forcing = merge(
+                composed_forcing,
+                (nm => Relaxation(rate = relax_rate, mask = sponge_mask,
+                                  target = (x, y, z, t) -> Float64(itp(x, y, -z))),)
+            )
         end
     end
 
@@ -420,43 +472,87 @@ Two convention differences from the model grid are handled here:
   the global WOA23 grid (already `-179.88 … 179.88`) but matters for sector files that store the
   Atlantic as positive longitudes.
 """
-function read_woa_variable(filepath::AbstractString, varname::AbstractString)
+function read_woa_variable(filepath::AbstractString, varname::AbstractString; month::Int = 1)
     NCDatasets.NCDataset(filepath, "r") do ds
         haskey(ds, varname) || error(
             "WOA file $(filepath) has no variable '$(varname)'.")
 
-        lon_raw = collect(Float64, ds["lon"][:])
-        lat_raw = collect(Float64, ds["lat"][:])
-        dep_raw = collect(Float64, ds["depth"][:])
+        # Coordinate variable names differ by provider: WOA23 uses lon/lat/depth, GLORYS uses
+        # longitude/latitude/depth, and older netCDF uses z/lev. Probing a small alias list is
+        # what lets one reader serve every source, which is the point of routing all boundary
+        # hydrography through a single entry point.
+        pick(names) = begin
+            hit = findfirst(n -> haskey(ds, n), names)
+            isnothing(hit) && error(
+                "None of $(join(names, "/")) is present in $(basename(filepath)); it has " *
+                "coordinate variables: $(join(sort(collect(filter(n -> !(n in ("time", "crs", "climatology_bounds")), keys(ds)))), ", ")).")
+            names[hit]
+        end
+        lon_name = pick(("lon", "longitude", "x"))
+        lat_name = pick(("lat", "latitude", "y"))
+        dep_name = pick(("depth", "z", "lev", "depths"))
 
+        lon_raw = collect(Float64, ds[lon_name][:])
+        lat_raw = collect(Float64, ds[lat_name][:])
+        dep_raw = collect(Float64, ds[dep_name][:])
         lon_wrapped = [mod(v + 180.0, 360.0) - 180.0 for v in lon_raw]
-        dep_model = [-v for v in dep_raw]          # positive-down -> negative-down
 
+        # Normalise the depth axis to POSITIVE-down, whatever the file used. WOA23 ships both
+        # conventions: the 1-degree files are negative-down (-300..0) and the 0.25-degree files
+        # are positive-down (0..5500). Negating unconditionally, as this reader used to, turned
+        # the second kind upside down and the returned axis no longer matched the documented
+        # contract -- which made the boundary sampler map a query depth to the wrong level and
+        # quietly flattened every profile. Deciding from the data rather than the filename means
+        # a future re-release that flips the convention again cannot break it.
+        dep_max = maximum(abs, dep_raw)
+        dep_down = (minimum(dep_raw) >= -0.5 * dep_max) ? dep_raw : -dep_raw
         ip = sortperm(lon_wrapped)
         jp = sortperm(lat_raw)
-        kp = sortperm(dep_model)
+        kp = sortperm(dep_down)
 
         lon = lon_wrapped[ip]
         lat = lat_raw[jp]
-        depth = dep_model[kp]
+        depth = dep_down[kp]
 
         # Real WOA23 files carry a trailing singleton time axis, so the variable arrives as
         # (lon, lat, depth, time) rather than (lon, lat, depth). Accept either and drop a
         # length-1 trailing axis; anything else genuinely ambiguous is an error.
+        # Dimension order is verified, not assumed. Permuting a (depth, lat, lon) file as if it
+        # were (lon, lat, depth) still produces a correctly-sized array, so the shape check
+        # below would pass while every value was scrambled -- which is precisely the class of
+        # error that produces plausible-looking nonsense.
         raw = Array(ds[varname])
-        if ndims(raw) == 4
-            size(raw, 4) == 1 || error(
-                "WOA variable '$(varname)' has $(size(raw, 4)) time levels; this reader " *
-                "expects a single climatological period. Select a month first.")
-            raw = raw[:, :, :, 1]
-        elseif ndims(raw) != 3
-            error("WOA variable '$(varname)' has $(ndims(raw)) dimensions; expected 3 " *
-                  "(lon, lat, depth) or 4 with a singleton time axis.")
+        dnames = String.(NCDatasets.dimnames(ds[varname]))
+        want = (lon_name, lat_name, dep_name)
+        if length(dnames) == 4
+            time_dim = setdiff(dnames, want)
+            length(time_dim) == 1 || error(
+                "Variable '$(varname)' has dimensions $(join(dnames, ", ")); expected " *
+                "$(join(want, ", ")) plus a single time axis.")
+            taxis = findfirst(==(time_dim[1]), dnames)   # position of time, not its name
+            ntime = size(raw, taxis)
+            (ntime == 1 || month in 1:12) || error(
+                "Variable '$(varname)' has $(ntime) time steps; pass month = 1:12 to choose " *
+                "one. Refusing to average or to guess, because a boundary target that silently " *
+                "averaged twelve months would not be the stated period.")
+            tsel = ntime == 1 ? 1 : clamp(month, 1, ntime)
+            raw = taxis == 4 ? raw[:, :, :, tsel] : permutedims(raw, (tsel, 4, 1, 2, 3))[1, :, :, :]
+        elseif length(dnames) == 3
+            sort(dnames) == sort(want) || error(
+                "Variable '$(varname)' has dimensions $(join(dnames, ", ")); expected " *
+                "$(join(want, ", ")) in any order.")
+            # want is (lon, lat, depth); the array is in `dnames` order, so map each requested
+            # axis onto the position it actually occupies.
+            perm = ntuple(k -> findfirst(==(want[k]), dnames), 3)
+            raw = permutedims(raw, perm)
+        else
+            error("Variable '$(varname)' has $(length(dnames)) dimensions; expected 3 " *
+                  "($(join(want, ", "))) or 4 with a time axis.")
         end
 
-        # WOA masks land/ice either with a huge negative fill value or, in the current
-        # A5B4 release, with `Missing`. Both have to become NaN: a `Missing` left in place
-        # would poison every downstream interpolation.
+        # From here `raw` is (lon, lat, depth). WOA masks land/ice either with a huge negative
+        # fill value or, in the current release, with `Missing`; both must become NaN, since a
+        # `Missing` left in place would poison every downstream interpolation.
         vals = permutedims(Float64.(coalesce.(raw, NaN)), (3, 2, 1))  # (lon,lat,depth)->(depth,lat,lon)
         vals = vals[kp, jp, ip]
 
@@ -505,6 +601,205 @@ function build_woa_interpolator(values::AbstractArray, lon, lat, depth)
     # `values` is (depth, lat, lon) with each axis ascending, which is the order
     # `interpolate` expects for the returned array.
     return interpolate(values, (BSpline(Linear()), BSpline(Linear()), BSpline(Linear())))
+end
+
+"""
+    _clamped_bracket(axis, x) -> (i0, i1, f)
+
+Locate `x` on a strictly ascending `axis`, returning the two bracketing indices and the
+fraction between them. Outside the axis the endpoints are held, so a query beyond the data
+clamps to the edge rather than extrapolating or throwing. Clamping is the right choice at an
+open boundary: the nearest value the dataset has is a far better answer than a linear
+continuation off the end of it, and `searchsortedlast` on an out-of-range `x` would otherwise
+index past the array.
+"""
+function _clamped_bracket(axis::AbstractVector{<:Real}, x::Real)
+    n = length(axis)
+    n == 1 && return (1, 1, 0.0)
+    xf = Float64(x)
+    xf <= axis[1] && return (1, 1, 0.0)
+    xf >= axis[n] && return (n, n, 0.0)
+    i = clamp(searchsortedlast(axis, xf), 1, n - 1)
+    a, b = Float64(axis[i]), Float64(axis[i+1])
+    return (i, i + 1, b == a ? 0.0 : (xf - a) / (b - a))
+end
+
+"""
+    _trilinear(vals, ax, ay, az, x, y, z) -> Float64
+
+Trilinear sample of `vals` (ordered depth, latitude, longitude) at physical coordinates.
+Written out rather than delegating to `Interpolations` because that package indexes by array
+position, not by physical coordinate, and mixing the two silently returns a plausible number
+from the wrong place.
+"""
+function _trilinear(vals::AbstractArray{<:Real, 3}, ax, ay, az, x, y, z)
+    i0, i1, fx = _clamped_bracket(ax, x)
+    j0, j1, fy = _clamped_bracket(ay, y)
+    k0, k1, fz = _clamped_bracket(az, z)
+    c000 = @inbounds vals[k0, j0, i0]; c100 = @inbounds vals[k0, j0, i1]
+    c010 = @inbounds vals[k0, j1, i0]; c110 = @inbounds vals[k0, j1, i1]
+    c001 = @inbounds vals[k1, j0, i0]; c101 = @inbounds vals[k1, j0, i1]
+    c011 = @inbounds vals[k1, j1, i0]; c111 = @inbounds vals[k1, j1, i1]
+    c00 = c000 + fx * (c100 - c000); c10 = c010 + fx * (c110 - c010)
+    c01 = c001 + fx * (c101 - c001); c11 = c011 + fx * (c111 - c011)
+    c0 = c00 + fy * (c10 - c00); c1 = c01 + fy * (c11 - c01)
+    return c0 + fz * (c1 - c0)
+end
+
+"""
+    _check_boundary_field_is_real(path, vals, what)
+
+Refuse a boundary field that is structurally incapable of being an ocean.
+
+This exists because a boundary file once came out of the download path with 5 depth levels
+and no horizontal variation whatsoever: T = 14.0 and S = 31.5 at every point of an 18 x 8.5
+degree box. It parsed cleanly, interpolated cleanly, and would have relaxed the sponge band
+toward a constant while every downstream number looked entirely reasonable. Nothing about the
+*use* of that file reveals the problem, so it has to be caught at the point of loading.
+
+Two independent checks, because either failure alone is enough to make the field useless and
+they fail for different reasons:
+
+* **Depth coverage.** A real WOA23 column has 102 standard levels to 5500 m. A handful of
+  levels means the column was truncated, and since the sampler clamps, the model would then
+  treat the deepest level's value as applying all the way to the seabed.
+* **Horizontal variation.** Real temperature and salinity at a fixed depth differ from place
+  to place. A field that is constant across the domain is a stub or a default, and a sponge
+  built from it is not constraining anything.
+
+The thresholds are deliberately loose. They are here to catch a broken file, not to
+second-guess a legitimately uniform region.
+"""
+function _check_boundary_field_is_real(path::AbstractString, vals::AbstractArray, what::AbstractString)
+    nz, ny, nx = size(vals)
+    nz < 20 && error(
+        "Boundary field $(what) in $(basename(path)) has only $(nz) depth level(s). A real " *
+        "ocean climatology has tens of levels spanning to the seabed; this file is truncated. " *
+        "Since the sampler clamps at the ends, a truncated column would have its deepest value " *
+        "applied to the whole water column below it. Refusing rather than using it.")
+
+    # Surface layer only: the whole-column spread would be dominated by the vertical
+    # gradient and would not detect a horizontally constant field.
+    surface = @view vals[1, :, :]
+    spread = maximum(surface) - minimum(surface)
+    spread < 1.0e-3 && error(
+        "Boundary field $(what) in $(basename(path)) is identical at every point of the " *
+        "domain at the surface (spread $(round(spread, digits=6))). A real climatology varies " *
+        "horizontally, so this file is a stub or a default rather than data. Refusing rather " *
+        "than relaxing the sponge toward a constant.")
+    return nothing
+end
+
+"""
+    _temperature_offset_k(units) -> Float64
+
+Kelvin offset implied by a NetCDF temperature `units` string: 0 for an absolute scale
+(Kelvin), +273.15 for Celsius, and an error for anything else.
+
+The model stores absolute temperature, so a boundary field in degrees C must be shifted or
+the sponge relaxes the open edges to roughly 273 K and the domain gains a large spurious
+heat sink along them. Both sources in use -- WOA23 `t_an` and GLORYS `thetao` -- report
+`degrees_celsius` or `degrees_C`, so this conversion is load-bearing in every case and is
+not a special case for one provider.
+
+Reading the attribute rather than being told the unit is deliberate: a caller-supplied flag
+had to be set per source, and one of them was set wrong, which would have produced a 287 K
+boundary that still parsed and still ran.
+"""
+function _temperature_offset_k(units::AbstractString)
+    u = lowercase(strip(units))
+    isempty(u) && error("Boundary temperature has no `units` attribute.")
+    (occursin("kelvin", u) || endswith(u, " k")) && return 0.0
+    # Matches degree_C, degrees_C, degC, degree Celsius and degree_celsius alike. An earlier
+    # version tested for the literal "degree_c", which is not a substring of "degrees_C" --
+    # the form GLORYS actually uses -- so the guard rejected a file whose units were correct
+    # and unambiguous. Being strict about the string rather than about the meaning is exactly
+    # how a safety check becomes an outage.
+    (occursin("celsius", u) || occursin(r"degree[s]?\s*_?\s*c\b", u)) && return 273.15
+    error("Boundary temperature has units \"$(units)\", which is neither Kelvin nor Celsius. " *
+          "Refusing rather than guessing, because a wrong offset would make the sponge relax " *
+          "the open edges to the wrong absolute temperature.")
+end
+
+"""
+    build_boundary_tracer_interpolators(T_path, S_path; T_name, S_name)
+
+Build `(; T, S)` boundary targets from observed hydrography, for the lateral sponge.
+
+Both file paths are explicit and both are required, because the sources disagree about how
+they are packaged: WOA23 publishes temperature and salinity in separate files, GLORYS packs
+both into one, and HYCOM puts them in one file under different names. Accepting a single
+optional path and guessing the other is how this ended up with two different readers and a
+truncated file nobody noticed. A caller now has to say where each field lives, and the grids
+are checked to match before anything is returned.
+
+Returns two callables, each `f(lon, lat, depth)` with **positive-down** depth. The WOA reader
+negates its source axis, so this comes out positive-down; `build_hydrodynamic_model` negates
+`z` before calling, so the sponge sees the model's negative-down coordinate.
+
+This is what gives a keyless open edge real water in it. WOA23 is a monthly climatology
+averaged over many years, so it describes an average boundary rather than a particular day;
+it is a large improvement on unconstrained edges and a modest one on a dated reanalysis.
+
+**It is an incomplete open boundary, not a complete one.** It constrains temperature and
+salinity only. WOA23 carries no currents, so the inflow *velocity* still comes from the
+configured `u_inflow`/`v_inflow` constants; and because a climatology is one repeating state,
+the boundary has no tidal or synoptic cycle of its own. Any result that depends on how much
+water crosses an open edge is still resting on those constants. A source with currents
+(GLORYS) is what actually closes that, and it needs an account.
+"""
+function build_boundary_tracer_interpolators(T_path::AbstractString,
+                                              S_path::AbstractString;
+                                              T_name::AbstractString = "t_an",
+                                              S_name::AbstractString = "s_an",
+                                              month::Int = 1)
+    Tv, lon, lat, depth = read_woa_variable(T_path, T_name; month = month)
+    Sv, lon_s, lat_s, depth_s = read_woa_variable(S_path, S_name; month = month)
+    (lon_s == lon && lat_s == lat && depth_s == depth) || error(
+        "Boundary temperature and salinity are on different grids: $(basename(T_path)) has " *
+        "$(length(lon))x$(length(lat))x$(length(depth)) and $(basename(S_path)) has " *
+        "$(length(lon_s))x$(length(lat_s))x$(length(depth_s)). They are combined by trilinear " *
+        "sampling on one axis set, so they must agree.")
+
+    _check_boundary_field_is_real(T_path, Tv, T_name)
+    _check_boundary_field_is_real(S_path, Sv, S_name)
+
+    t_offset = NCDatasets.NCDataset(T_path, "r") do ds
+        haskey(ds, T_name) || error("$(basename(T_path)) has no variable $(T_name).")
+        _temperature_offset_k(get(ds[T_name].attrib, "units", ""))
+    end
+
+    # Land mask repair.
+    #
+    # WOA23 marks land with `Missing`, which the reader turns into NaN, and a shelf domain
+    # like the Scotian Shelf is bordered by masked cells. `_trilinear` returns NaN if *any*
+    # of its eight corners is masked, so a single masked neighbour anywhere in the sponge band
+    # would propagate NaN into the model -- and a NaN in a `Relaxation` target is not a small
+    # error, it poisons the run.
+    #
+    # Two stages, in this order:
+    #   1. each column is filled from its own valid depths, so a coastal column keeps the
+    #      profile it does have rather than being flattened to a global average;
+    #   2. columns masked over their entire depth range carry no information at all, so they
+    #      take the mean of the whole field.
+    for V in (Tv, Sv)
+        global_valid = filter(!isnan, V)
+        isempty(global_valid) && error(
+            "Boundary hydrography contains no valid values at all; the source file is empty " *
+            "or entirely masked.")
+        global_mean = sum(global_valid) / length(global_valid)
+        for j in axes(V, 2), i in axes(V, 3)
+            col = @view V[:, j, i]
+            bad = findall(isnan, col)
+            isempty(bad) && continue
+            valid = filter(!isnan, col)
+            col[bad] .= isempty(valid) ? global_mean : sum(valid) / length(valid)
+        end
+    end
+
+    Tf = (x, y, z) -> _trilinear(Tv, lon, lat, depth, x, y, z) + t_offset
+    Sf = (x, y, z) -> _trilinear(Sv, lon, lat, depth, x, y, z)
+    return (; T = Tf, S = Sf)
 end
 
 """

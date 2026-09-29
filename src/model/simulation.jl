@@ -289,6 +289,54 @@ function inspect_hydrodynamic_checkpoint(filepath::AbstractString)
 end
 
 """
+    velocity_peak_location(s::Simulation, loc) -> (lon, lat, depth)
+
+Geographic location of interior index `loc` in a simulation, for the divergence watchdog.
+
+Oceananigans no longer exposes per-cell metric objects on the grid (`grid.metrics.lon_metrics`
+was removed), so the coordinates come from `extract_grid_coordinates`, which is the accessor
+this package already uses everywhere else. It returns halo-stripped 1D vectors, matching the
+halo-stripped velocity interior the watchdog reduces over, so `loc` indexes them directly.
+
+Each index is clamped into range because a velocity interior that has been restricted to the
+footprint shared by `u` and `v` can be one element longer than a coordinate vector along an
+axis; clamping reports the nearest real cell rather than raising an out-of-bounds error while
+already handling a divergence.
+"""
+function velocity_peak_location(s, loc)
+    lons, lats, depths = extract_grid_coordinates(s.model.grid)
+    i = clamp(loc[1], 1, length(lons))
+    j = clamp(loc[2], 1, length(lats))
+    k = clamp(loc[3], 1, length(depths))
+    return (Float64(lons[i]), Float64(lats[j]), Float64(depths[k]))
+end
+
+"""
+    checkpoint_halos(f, data_size) -> NTuple{3,Int}
+
+Halo widths `(Hx, Hy, Hz)` to exclude when reading a checkpoint's velocity data.
+
+The widths are read from the checkpoint itself, where `save_hydrodynamic_checkpoint` records
+them as `file["halo"]`. These grids are built with a halo of `(7, 7, 5)`, not the 3 that a
+hardcoded `4:end-3` assumed, so guessing would leave four columns of halo in the "interior" and
+four rows of never-evolved cells in the divergence check.
+
+Checkpoints written before the halo was recorded fall back to 3, which is the conservative
+choice: it inspects slightly more of the domain rather than silently ignoring a live region.
+"""
+function checkpoint_halos(f, data_size::Tuple)
+    h = get(f, "halo", nothing)
+    if !isnothing(h) && length(h) == 3
+        try
+            widths = Int.(collect(h))
+            all(>=(0), widths) && return (widths[1], widths[2], widths[3])
+        catch
+        end
+    end
+    return (3, 3, 3)
+end
+
+"""
     verify_checkpoint_compatibility(
         filepath::AbstractString,
         expected_u_dim::Tuple;
@@ -330,18 +378,24 @@ function verify_checkpoint_compatibility(
                     return
                 end
 
-                # Exclude boundary halos (standard 3 cells on each boundary)
-                u_int = (ndims(u_data) == 3 && all(size(u_data) .> 6)) ?
-                    @view(u_data[4:end-3, 4:end-3, 4:end-3]) : u_data
-                max_u = maximum(abs, u_int)
+                # Exclude the boundary halos. The halo width is not fixed at 3: these grids
+                # are built with a wider halo (7 in x and y, 5 in z), so a hardcoded
+                # `4:end-3` left halo cells in the "interior" and made this check sensitive to
+                # a region of the domain that is never physically evolved. Derive the trim from
+                # the checkpoint's own grid metadata when it is present, and fall back to
+                # trimming a conservative 3 only when it is not.
+                halos = checkpoint_halos(f, size(u_data))
+                lo = halos .+ 1
+                hi = size(u_data) .- halos
+                interior_view(d) = (ndims(d) == 3 && all(hi .>= lo)) ?
+                    @view(d[lo[1]:hi[1], lo[2]:hi[2], lo[3]:hi[3]]) : d
+
+                max_u = maximum(abs, interior_view(u_data))
 
                 max_v = 0.0
                 if haskey(f["simulation"]["model"]["velocities"], "v") &&
                    haskey(f["simulation"]["model"]["velocities"]["v"], "data")
-                    v_data = f["simulation"]["model"]["velocities"]["v"]["data"]
-                    v_int = (ndims(v_data) == 3 && all(size(v_data) .> 6)) ?
-                        @view(v_data[4:end-3, 4:end-3, 4:end-3]) : v_data
-                    max_v = maximum(abs, v_int)
+                    max_v = maximum(abs, interior_view(f["simulation"]["model"]["velocities"]["v"]["data"]))
                 end
 
                 spd_max = max(max_u, max_v)
@@ -1122,17 +1176,25 @@ function setup_hydrodynamic_simulation(
     # 3. Numerical stability watchdog callback
     if watchdog
         stability_check(s) = begin
+            # `u` and `v` sit on staggered face axes, so their interiors are *not* the same
+            # shape: `u` is (nx+1, ny, nz) and `v` is (nx, ny+1, nz). Broadcasting the two
+            # against each other therefore always fails with a DimensionMismatch, so both are
+            # first restricted to the footprint they share. Only the high end of each axis is
+            # dropped, so the remaining indices still address the same metric entries below.
             u_int = interior(s.model.velocities.u)
             v_int = interior(s.model.velocities.v)
-            spd = max.(abs.(u_int), abs.(v_int))
+            nx_c = min(size(u_int, 1), size(v_int, 1))
+            ny_c = min(size(u_int, 2), size(v_int, 2))
+            spd = max.(
+                abs.(u_int[1:nx_c, 1:ny_c, :]),
+                abs.(v_int[1:nx_c, 1:ny_c, :])
+            )
             # Where is the maximum? A bare magnitude cannot distinguish a localised problem
             # (the Bay of Fundy narrows, a steep bank, a sponge edge) from a domain-wide one,
             # and those call for completely different fixes.
             spd_max, loc = findmax(spd)
-            g = s.model.grid
-            lon_loc, lat_loc = g.metrics.lon_metrics[loc[1]][loc[2]]
-            dep_loc = g.metrics.z_metrics[loc[3]] |> only
             if isnan(spd_max) || isinf(spd_max) || spd_max > divergence_velocity_limit
+                lon_loc, lat_loc, dep_loc = velocity_peak_location(s, loc)
                 error(
                     "Numerical divergence detected at iteration $(iteration(s)), " *
                     "time $(prettytime(s)). Velocity magnitude u_max = $(spd_max) m/s " *
@@ -1141,6 +1203,7 @@ function setup_hydrodynamic_simulation(
                     "depth=$(round(dep_loc, digits=1)) m."
                 )
             elseif spd_max > 5.0 && (iteration(s) % 50 == 0)
+                lon_loc, lat_loc, dep_loc = velocity_peak_location(s, loc)
                 @warn(
                     "Elevated interior velocity magnitude: max(|u|,|v|) = " *
                     "$(round(spd_max, digits=2)) m/s at iteration $(iteration(s)) ($(prettytime(s))), " *

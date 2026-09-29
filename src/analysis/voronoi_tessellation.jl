@@ -148,7 +148,8 @@ function generate_depth_stratified_voronoi_units(
     slope_weighting::Bool = true,
     slope_factor::Float64 = 15.0,
     lloyd_iterations::Int = 1,
-    seed::Int = 42
+    seed::Int = 42,
+    input_dir::AbstractString = joinpath("outputs", "inputs")
 )::VoronoiTessellation
     c_prob = something(core_prob, prob_core, 0.8)
     s_prob = something(shallow_prob, prob_shallow, 0.1)
@@ -183,10 +184,10 @@ function generate_depth_stratified_voronoi_units(
 
     # Load optional coastline polygons to strictly exclude land points
     coast_polys = NamedTuple[]
-    coast_path = joinpath("inputs", "coastline.dat")
+    coast_path = joinpath(input_dir, "coastline.dat")
     if isfile(coast_path)
         try
-            coast_polys = load_coastline_polygons("inputs")
+            coast_polys = load_coastline_polygons(input_dir)
         catch
         end
     end

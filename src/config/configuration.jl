@@ -12,24 +12,50 @@ using TOML
 """
     find_default_config_path() -> String
 
-Locate the default configuration file in the project workspace, checking
-`inputs/ParticleTracking.toml`, `ParticleTracking.toml`,
-`inputs/ParticleTracking.config`, or `ParticleTracking.config`.
+Locate the configuration file in the project workspace, or return `""` when there is none.
+
+Only project-root locations are searched. A configuration is an input the operator supplies;
+it is never discovered inside a previous run's containerised `inputs/` directory, and it is
+never guessed at. In particular there is no fallback to `configs/default.toml`: a run that
+silently adopts a different scenario than the one intended produces output that looks
+complete and answers a question nobody asked. Callers must fail loudly instead, which is what
+`load_configuration` does with an empty path.
+
+To run, pass one explicitly:
+
+    julia --project=. ParticleTrackingRun.jl --config=configs/snowcrab.toml
+
+or place `ParticleTracking.toml` at the project root.
 """
 function find_default_config_path()::String
-    candidates = [
-        joinpath("inputs", "ParticleTracking.toml"),
-        "ParticleTracking.toml",
-        joinpath("inputs", "ParticleTracking.config"),
-        "ParticleTracking.config"
-    ]
-    for p in candidates
-        if isfile(p)
-            return p
-        end
+    for p in ("ParticleTracking.toml", "ParticleTracking.config")
+        isfile(p) && return p
     end
-    return joinpath("inputs", "ParticleTracking.toml")
+    ""
 end
+
+const NO_CONFIG_ADVICE = """
+No configuration file was found.
+
+A configuration is required, not optional. It names the datasets to ingest, the domain and
+grid, the forcing sources, and the biology parameters, and those choices are what a run is.
+Without one the package would have to invent all of it, and the resulting output would carry
+no statement of what it actually simulated -- it would be indistinguishable from a run that
+was configured deliberately.
+
+Available configurations in this project:
+  configs/default.toml     small, fast baseline
+  configs/opendata.toml   keyless observed products, moderate grid
+  configs/snowcrab.toml    Scotian Shelf, high resolution, with tidal forcing
+
+Run with one of:
+
+    julia --project=. ParticleTrackingRun.jl --config=configs/snowcrab.toml
+
+or copy one to ParticleTracking.toml at the project root, which the loader picks up
+automatically. For a study of your own, copy the closest config and edit the sections the
+run depends on: [data] for datasets, [domain] and [grid] for the box and resolution,
+[tides] for tidal forcing, and [biology] for larval parameters."""
 
 """
     study_domain_ranges(cfg) -> NamedTuple
@@ -110,7 +136,10 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `domain_lat::Tuple{Float64, Float64}`: Latitude bounding box (min_lat, max_lat) in °N.
 - `domain_z::Tuple{Float64, Float64}`: Vertical depth range (z_min, z_max) in meters.
 - `grid_size::Tuple{Int, Int, Int}`: Grid cell counts (Nx, Ny, Nz).
-- `data_mode::Symbol`: `:real` (NOAA ERDDAP) or `:synthetic` (idealized shelf).
+- `bathy_source::String`: Which bathymetry product to ingest, read verbatim from
+  `[data] bathy_source` (for example `"etopo2022"`, `"synthetic"`). There is no separate
+  real/synthetic switch: acquisition always reads the named product, and falls back to analytic
+  fields with a warning if a download fails.
 - `enable_tides::Bool`: Whether to include astronomical tidal body forcing (M2).
 - `tidal_u_amp::Float64`: Zonal tidal velocity amplitude in m/s.
 - `tidal_v_amp::Float64`: Meridional tidal velocity amplitude in m/s.
@@ -135,11 +164,19 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `ascent_speed::Float64`: Directed upward swimming speed during ascent (m/s).
 - `ascent_target_depth::Float64`: Target epipelagic depth for ascent completion (meters).
 - `use_gpu::Bool`: Whether to run hydrodynamic equations on NVIDIA CUDA GPU.
-- `fallback_to_cpu::Bool`: Whether to fall back to CPU if CUDA GPU is not functional.
+- `fallback_to_cpu::Bool`: Whether a GPU request that cannot be honoured may degrade to CPU.
+  Defaults to `false`, so the run fails loudly instead of quietly running somewhere other than
+  where `use_gpu` said it would.
 - `interactive_map::Bool`: Whether to export interactive HTML5 Leaflet map.
 - `enable_duckdb::Bool`: Whether to persist simulation data to DuckDB.
 - `duckdb_path::String`: DuckDB file path.
 - `config_file::String`: Source configuration file path.
+- `bathy_source::String`: Which bathymetry product to ingest; the run always reads the product
+  named here rather than choosing between a real and a synthetic mode.
+- `inshore_depth::Float64`: Water depth at the landward edge of the domain (m, negative).
+- `shelf_slope::Float64`: Total seabed rise across the shelf (m).
+- `output_schedule_seconds::Float64`: Field-output cadence. Independent of
+  `checkpoint_schedule`, which is the state-checkpoint cadence; the two may legitimately differ.
 - `output_dir::String`: Directory for simulation artifacts and figures.
 - `input_dir::String`: Directory for raw and processed bathymetry/wind files.
 - `seed::Int`: Random number generator seed.
@@ -158,6 +195,7 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `resolution_scale::Float64`: Horizontal grid resolution scale multiplier / divisor.
 - `atmospheric_source::Symbol`: Atmospheric forcing provider (:era5, :synthetic, :climatology).
 - `ocean_boundary_source::Symbol`: Open boundary hydrographic data provider (:glorys12v1, :synthetic).
+  See the field comments for the full accepted set.
 - `obc_type::Symbol`: Lateral open boundary formulation (:flather_chapman, :radiation, :clamped).
 - `enable_voronoi::Bool`: Whether to compute multi-resolution Voronoi tessellation analysis.
 - `voronoi_n_units::Int`: Number of Voronoi units/centroids to generate across strata.
@@ -167,14 +205,29 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `voronoi_min_res_core_km::Float64`: Minimum Poisson-disc separation distance in core zone (km).
 - `voronoi_min_res_shallow_km::Float64`: Minimum separation distance in shallow zone (km).
 - `voronoi_min_res_deep_km::Float64`: Minimum separation distance in deep zone (km).
+- `voronoi_core_depth_min`/`_max`, `voronoi_shallow_depth_min`/`_max`,
+  `voronoi_deep_depth_min`/`_max`::Float64: The edges of the three depth strata, as positive
+  depths below the surface. These decide which seabed area each stratum samples, so they change
+  the connectivity result, not just its resolution. The sign is applied when the bands reach the
+  tessellator, which bins on signed `z`.
+- `voronoi_slope_weighting::Bool`: Whether minimum spacing is tightened on steep bathymetry.
+- `voronoi_slope_factor::Float64`: How aggressively spacing tightens with slope; only used when
+  `voronoi_slope_weighting` is true.
 """
 struct HydrodynamicOptions
     domain_lon               :: Tuple{Float64, Float64}
     domain_lat               :: Tuple{Float64, Float64}
     domain_z                 :: Tuple{Float64, Float64}
     grid_size                :: Tuple{Int, Int, Int}
-    data_mode                :: Symbol
+    bathy_source             :: String
+    coastline_source         :: String
+    wind_source              :: String
+    wind_time_iso            :: String
+    inshore_depth            :: Float64
+    shelf_slope              :: Float64
     enable_tides             :: Bool
+    tides_source             :: String
+    tidal_constituents       :: Vector{Symbol}
     tidal_u_amp              :: Float64
     tidal_v_amp              :: Float64
     s2_u_amp                 :: Float64
@@ -220,6 +273,7 @@ struct HydrodynamicOptions
     enable_checkpoint        :: Bool
     checkpoint_prefix        :: String
     checkpoint_schedule      :: Float64
+    output_schedule_seconds  :: Float64
     checkpoint_dir           :: String
     checkpoint_cleanup       :: Bool
     auto_restart             :: Bool
@@ -228,11 +282,81 @@ struct HydrodynamicOptions
     nz_above :: Int
     vertical_break_depth :: Float64
     vertical_grid_file       :: String
+    vertical_depths          :: Vector{Float64}
     resolution_scale         :: Float64
-    atmospheric_source       :: Symbol
-    ocean_boundary_source    :: Symbol
+    atmospheric_source :: Symbol
+    # Where each piece of the model's outside world comes from.
+    #
+    # The model is a window cut out of the ocean, so three of its edges are not real coastline
+    # but imaginary lines. Along those lines the model has to be told what the water is doing
+    # just outside: how warm, how salty, and which way it is moving. That is the
+    # "lateral boundary" below. If it is left unset, the model still runs, but water can drift
+    # in or out of the open edges unchecked, and results that depend on the flow across an
+    # edge are then unreliable.
+    #
+    # The values are stored as Symbols, so a misspelling stays visible in a comparison rather
+    # than quietly becoming an empty field. They are read straight from the TOML with no
+    # normalisation, so the accepted spellings are exactly as listed.
+    #
+    #   ocean_boundary_source  -- what sets the imaginary edges
+    #     "synthetic"    Nothing is downloaded. The open edges are simply not constrained, and
+    #                    the model behaves as if they are out of sight. This is a real choice
+    #                    for a run that only studies the interior; it is not a stand-in for
+    #                    data, and it writes no file.
+    #     "glorys12v1"   A global real-world reconstruction, GLORYS12V1, at 1/12 degree (about
+    #                    9 km). Comes from Copernicus Marine, which is free but does require
+    #                    registering an account and putting a username and key in a file
+    #                    called ~/.copernicusmarine/credentials. Without that file the download
+    #                    is rejected.
+    #     "hycom"        HYCOM GOFS at the same 1/12 degree (about 9 km), and unlike the
+    #                    options below it also carries how fast the water is moving, which is
+    #                    the part that matters most for an open edge. No account, no key. Read
+    #                    the note on `fetch_hycom_boundary` before relying on it: its data is
+    #                    currently not downloadable even though the catalogue works.
+    #     "woa23"        A monthly average of the whole ocean, free and no account. But it
+    #                    holds only temperature and salt, not movement, so it fixes what the
+    #                    water is like but not how much of it flows through the edge.
+    #
+    #   atmospheric_source  -- what drives the sea surface from the sky
+    #     "open_meteo"        Real weather, served for free by an open website. It also
+    #                         reports air temperature, pressure, humidity, cloud cover and
+    #                         sunlight, which is what the model needs to work out how much
+    #                         heat the sea gains or loses each hour. Currently the only choice
+    #                         that makes the heat flux change over the run. It gives one
+    #                         representative spot rather than a picture of the sky, so the same
+    #                         weather is used across the whole domain.
+    #     "era5_climatology"  A fixed typical month, repeating. No download. Use it only to
+    #                         debug; the sea will warm monotonically and never vary.
+    #     "synthetic"         A single fixed number. No download, no variation. Diagnostics only.
+    #
+    #   tides_source  -- what sets the rise and fall of the tides
+    #     "tpxo9_atlas"   Measured tide heights and currents, free and no account. Supplies the
+    #                     real size of the M2 and S2 tides, which is what makes the spring-neap
+    #                     cycle (big tides every two weeks) come out right.
+    #     "tpxo9"         The same product, named more briefly.
+    #     "analytic"      Tide shapes made up from a single number you supply. No download, and
+    #                     no detail across space, so tides are the same everywhere in the
+    #                     domain. Fine for checking the machinery, not for a real tide.
+    #
+    #   bathy_source  -- where the sea floor shape comes from
+    #     "etopo2022"  A global map of the sea floor, free and no account, detailed to about
+    #                  450 m. "etopo" and "open" are other spellings of the same thing.
+    #
+    #   hydrography_source  -- what the water starts out like at t = 0
+    #     "woa23"      Average temperature and salt for a chosen month, free and no account.
+    #     "synthetic"  A made-up smooth profile, no download. For testing.
+    #     "glorys12v1" A real reconstruction; needs the Copernicus account described above.
+    #
+    #   coastline_source  -- where the outline of the land comes from
+    #     "natural_earth_10m"  Very detailed, public domain, no account. "50m" and "110m" are
+    #                         coarser outlines for when the detail is not needed.
+    #
+    # None of these falls back quietly. If a value is not recognised the run stops and says
+    # what it could have used instead. That is deliberate: a run that asked for one product
+    # and quietly received a different one would have different temperature or flow at its
+    # edges, and nothing in the output would reveal it.
     # Source for the 3-D hydrographic (T, S) initial state. This is deliberately
-    # separate from `data_mode`/`ocean_boundary_source`, which govern bathymetry,
+    # separate from `bathy_source`/`ocean_boundary_source`, which govern bathymetry,
     # wind and lateral boundaries: the initial water column is its own choice.
     #   :synthetic — analytic profile from `set_initial_stratification!`
     #   :woa23     — World Ocean Atlas 2023 climatology (keyless, NOAA NCEI)
@@ -248,6 +372,14 @@ struct HydrodynamicOptions
     voronoi_min_res_core_km  :: Float64
     voronoi_min_res_shallow_km :: Float64
     voronoi_min_res_deep_km  :: Float64
+    voronoi_core_depth_min   :: Float64
+    voronoi_core_depth_max   :: Float64
+    voronoi_shallow_depth_min :: Float64
+    voronoi_shallow_depth_max :: Float64
+    voronoi_deep_depth_min   :: Float64
+    voronoi_deep_depth_max   :: Float64
+    voronoi_slope_weighting  :: Bool
+    voronoi_slope_factor     :: Float64
     animate_hydro            :: Bool
     anim_variable            :: Symbol
     anim_fps                 :: Int
@@ -275,8 +407,15 @@ function HydrodynamicOptions(;
     domain_lat            :: Tuple{Real, Real} = (40.0, 48.5),
     domain_z              :: Tuple{Real, Real} = (-3500.0, 0.0),
     grid_size             :: Tuple{Int, Int, Int} = (50, 50, 10),
-    data_mode             :: Symbol = :synthetic,
+    bathy_source           :: AbstractString = "etopo2022",
+    coastline_source       :: AbstractString = "natural_earth_10m",
+    wind_source            :: AbstractString = "open_meteo",
+    wind_time_iso          :: AbstractString = "2020-06-01T00:00:00Z",
+    inshore_depth          :: Real = -20.0,
+    shelf_slope            :: Real = 500.0,
     enable_tides          :: Bool = true,
+    tides_source          :: AbstractString = "tpxo9",
+    tidal_constituents    :: AbstractVector{Symbol} = [:M2, :S2],
     tidal_u_amp           :: Real = 0.25,
     tidal_v_amp           :: Real = 0.12,
     s2_u_amp              :: Real = 0.11,
@@ -322,14 +461,16 @@ function HydrodynamicOptions(;
     enable_checkpoint     :: Bool = true,
     checkpoint_prefix     :: AbstractString = "",
     checkpoint_schedule   :: Real = 0.0,
+    output_schedule_seconds :: Real = 21600.0,
     checkpoint_dir        :: AbstractString = "",
     checkpoint_cleanup    :: Bool = true,
     auto_restart             :: Bool = true,
     run_id                   :: AbstractString = "",
-    vertical_stretching_mode :: Symbol = :tanh,
+    vertical_stretching_mode :: Symbol = :oceananigans,
     nz_above :: Int = 0,
     vertical_break_depth :: Real = -400.0,
-    vertical_grid_file       :: AbstractString = joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
+    vertical_grid_file       :: AbstractString = "",
+    vertical_depths          :: AbstractVector{<:Real} = Float64[],
     resolution_scale         :: Real = 1.0,
     atmospheric_source       :: Symbol = :era5,
     ocean_boundary_source    :: Symbol = :glorys12v1,
@@ -344,6 +485,14 @@ function HydrodynamicOptions(;
     voronoi_min_res_core_km  :: Real = 1.5,
     voronoi_min_res_shallow_km :: Real = 5.0,
     voronoi_min_res_deep_km  :: Real = 10.0,
+    voronoi_core_depth_min   :: Real = 50.0,
+    voronoi_core_depth_max   :: Real = 350.0,
+    voronoi_shallow_depth_min :: Real = 0.0,
+    voronoi_shallow_depth_max :: Real = 50.0,
+    voronoi_deep_depth_min   :: Real = 350.0,
+    voronoi_deep_depth_max   :: Real = 6000.0,
+    voronoi_slope_weighting  :: Bool = true,
+    voronoi_slope_factor     :: Real = 15.0,
     animate_hydro            :: Bool = false,
     anim_variable            :: Symbol = :dashboard,
     anim_fps                 :: Int = 10,
@@ -374,8 +523,15 @@ function HydrodynamicOptions(;
         (Float64(domain_lat[1]), Float64(domain_lat[2])),
         (Float64(domain_z[1]), Float64(domain_z[2])),
         grid_size,
-        data_mode,
+        bathy_source,
+        coastline_source,
+        wind_source,
+        wind_time_iso,
+        Float64(inshore_depth),
+        Float64(shelf_slope),
         enable_tides,
+        tides_source,
+        tidal_constituents,
         Float64(tidal_u_amp),
         Float64(tidal_v_amp),
         Float64(s2_u_amp),
@@ -421,6 +577,7 @@ function HydrodynamicOptions(;
         enable_checkpoint,
         resolved_cp_prefix,
         Float64(checkpoint_schedule),
+        Float64(output_schedule_seconds),
         String(checkpoint_dir),
         checkpoint_cleanup,
         auto_restart,
@@ -429,6 +586,7 @@ function HydrodynamicOptions(;
         Int(nz_above),
         Float64(vertical_break_depth),
         String(vertical_grid_file),
+        Float64[Float64(d) for d in vertical_depths],
         Float64(resolution_scale),
         atmospheric_source,
         ocean_boundary_source,
@@ -443,6 +601,14 @@ function HydrodynamicOptions(;
         Float64(voronoi_min_res_core_km),
         Float64(voronoi_min_res_shallow_km),
         Float64(voronoi_min_res_deep_km),
+        Float64(voronoi_core_depth_min),
+        Float64(voronoi_core_depth_max),
+        Float64(voronoi_shallow_depth_min),
+        Float64(voronoi_shallow_depth_max),
+        Float64(voronoi_deep_depth_min),
+        Float64(voronoi_deep_depth_max),
+        voronoi_slope_weighting,
+        Float64(voronoi_slope_factor),
         animate_hydro,
         anim_variable,
         anim_fps,
@@ -467,7 +633,7 @@ end
     load_configuration(config_path::AbstractString = find_default_config_path()) -> Dict{String, Any}
 
 Read and parse a centralized `ParticleTracking.toml` file into a nested Julia Dictionary.
-If the requested file does not exist, returns the default parameter configuration dictionary.
+A missing or unparseable file is an error, not a silent fall back to defaults.
 
 # Inputs
 - `config_path::AbstractString`: Path to the `.toml` (TOML format) file.
@@ -478,22 +644,24 @@ If the requested file does not exist, returns the default parameter configuratio
 function load_configuration(
     config_path::AbstractString = find_default_config_path()
 )::Dict{String, Any}
-    if isfile(config_path)
-        try
-            return TOML.parsefile(config_path)
-        catch err
-            @warn "Failed to parse configuration file at $(config_path): $(err). Using defaults."
-            return get_default_configuration()
-        end
-    else
-        return get_default_configuration()
+    # A run must never proceed on defaults it did not ask for: a silently substituted
+    # configuration produces output that looks real and is not. `get_default_configuration()`
+    # remains available for callers that genuinely want the defaults.
+    isempty(config_path) && error(strip(NO_CONFIG_ADVICE, '\n'))
+    isfile(config_path) || error(
+        "Configuration file not found: $(config_path). Pass --config=<path>."
+    )
+    try
+        return TOML.parsefile(config_path)
+    catch err
+        error("Failed to parse configuration file at $(config_path): $(err)")
     end
 end
 
 """
     save_configuration(
         config_dict::AbstractDict,
-        config_path::AbstractString = joinpath("inputs", "ParticleTracking.toml")
+        config_path::AbstractString = "ParticleTracking.toml"
     ) -> String
 
 Serialize a nested configuration dictionary to a centralized `.toml` file in TOML format.
@@ -507,7 +675,7 @@ Serialize a nested configuration dictionary to a centralized `.toml` file in TOM
 """
 function save_configuration(
     config_dict::AbstractDict,
-    config_path::AbstractString = joinpath("inputs", "ParticleTracking.toml")
+    config_path::AbstractString = "ParticleTracking.toml"
 )::String
     out_dir = dirname(abspath(config_path))
     if !isdir(out_dir)
@@ -540,23 +708,21 @@ function get_default_configuration()::Dict{String, Any}
             "ny" => 50,
             "nz" => 10,
             "resolution_scale" => 1.0,
-            "vertical_stretching_mode" => "tanh",
-            "vertical_grid_file" => "inputs/scotian_shelf_vertical_grid.csv"
+            "vertical_stretching_mode" => "oceananigans",
+            "vertical_grid_file" => ""
         ),
         "data" => Dict{String, Any}(
-            "data_mode" => "synthetic",
-            "bathy_dataset_id" => "nceiEtopo2022",
-            "wind_dataset_id" => "erdBSwinds1day",
+            "bathy_source" => "etopo2022",
+            "coastline_source" => "natural_earth_10m",
+            "wind_source" => "open_meteo",
             "hydrography_source" => "woa23",
-            "wind_time_iso" => "2023-06-01T00:00:00Z",
-            "inshore_depth" => -100.0,
-            "shelf_slope" => 500.0
+            "wind_time_iso" => "2023-06-01T00:00:00Z"
         ),
         "bathymetry" => Dict{String, Any}(
             "source" => "numerical_earth",
-            "provider" => "etopo2022",
             "resolution_arcsec" => 15,
-            "fallback_dataset_id" => "etopo180"
+            "inshore_depth" => -20.0,
+            "shelf_slope" => 500.0
         ),
         "boundaries" => Dict{String, Any}(
             "method" => "relaxation",
@@ -643,9 +809,34 @@ function get_default_configuration()::Dict{String, Any}
             "checkpoint_dir" => "outputs/checkpoints",
             "checkpoint_cleanup" => true
         ),
+        "tessellation" => Dict{String, Any}(
+            "enable_voronoi" => false,
+            "n_units" => 5000,
+            "prob_core" => 0.8,
+            "prob_shallow" => 0.1,
+            "prob_deep" => 0.1,
+            "min_res_core_km" => 1.5,
+            "min_res_shallow_km" => 5.0,
+            "min_res_deep_km" => 10.0,
+            # Depth band edges as positive depths below the surface. Core is the mid-shelf
+            # nursery, shallow the nearshore strip, deep everything below the shelf break.
+            "core_depth_min" => 50.0,
+            "core_depth_max" => 350.0,
+            "shallow_depth_min" => 0.0,
+            "shallow_depth_max" => 50.0,
+            "deep_depth_min" => 350.0,
+            "deep_depth_max" => 6000.0,
+            "slope_weighting" => true,
+            "slope_factor" => 15.0
+        ),
         "hardware" => Dict{String, Any}(
             "use_gpu" => false,
-            "fallback_to_cpu" => true
+            # Off by default, and deliberately. A GPU request that cannot be honoured must
+            # fail loudly: silently running the CPU path instead would leave
+            # `resolved_config.toml` recording `use_gpu = true` for a run that never touched
+            # a GPU, which is the same silent lie the provenance file exists to prevent. Set
+            # it to true only on a machine where degrading is genuinely acceptable.
+            "fallback_to_cpu" => false
         ),
         "visualization" => Dict{String, Any}(
             "interactive_map" => true,
@@ -659,8 +850,6 @@ function get_default_configuration()::Dict{String, Any}
             "title" => "Regional Marine Lagrangian Particle Tracking & Dispersion"
         ),
         "paths" => Dict{String, Any}(
-            "output_dir" => "outputs",
-            "input_dir" => "inputs",
             "seed" => 42
         )
     )
@@ -701,9 +890,29 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     ny = Int(get_val("grid", "ny", 50))
     nz = Int(get_val("grid", "nz", 10))
 
-    data_mode = Symbol(get_val("data", "data_mode", "synthetic"))
+    bathy_source = String(get_val("data", "bathy_source", "etopo2022"))
+    coastline_source = String(get_val("data", "coastline_source", "natural_earth_10m"))
+    wind_source = String(get_val("data", "wind_source", "open_meteo"))
+    wind_time_iso = String(get_val("data", "wind_time_iso", "2020-06-01T00:00:00Z"))
+
+    # Shelf geometry, from [bathymetry]. `inshore_depth` is the water depth at the landward
+    # edge of the domain; `shelf_slope` is the total rise across the shelf. Both are read
+    # from here rather than hardcoded, so a config can actually shape its own seabed.
+    inshore_depth = Float64(get_val("bathymetry", "inshore_depth", -20.0))
+    shelf_slope   = Float64(get_val("bathymetry", "shelf_slope", 500.0))
+
+    # Tidal body forcing. `constituents` is an empty list in a config that disables tides, so
+    # an empty read is not an error; it simply means no constituents were requested.
+    tides_src = String(get_val("tides", "tides_source", "tpxo9"))
+    raw_cons = get_val("tides", "constituents", Any[:M2, :S2])
+    # Normalised to upper case because `get_tidal_frequency` dispatches on `:M2`/`:S2`
+    # case-sensitively, while the atlas file lookup is case-insensitive. Normalising here
+    # means a TOML writing "m2" and one writing "M2" behave identically.
+    tidal_cons = Symbol[Symbol(uppercase(String(c))) for c in raw_cons]
 
     enable_tides = Bool(get_val("tides", "enable_tides", true))
+    tides_source = tides_src
+    tidal_constituents = tidal_cons
     tidal_u = Float64(get_val("tides", "tidal_u_amp", 0.25))
     tidal_v = Float64(get_val("tides", "tidal_v_amp", 0.12))
     s2_u = Float64(get_val("tides", "s2_u_amp", 0.11))
@@ -764,7 +973,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     cv_settlement = Float64(get_val("biology", "cv_settlement", 0.25))
 
     use_gpu      = Bool(get_val("hardware", "use_gpu", false))
-    fallback_cpu = Bool(get_val("hardware", "fallback_to_cpu", true))
+    fallback_cpu = Bool(get_val("hardware", "fallback_to_cpu", false))
     interactive  = Bool(get_val("visualization", "interactive_map", true))
     anim_hydro   = Bool(get_val("visualization", "animate_hydro", false))
     anim_var     = Symbol(lowercase(String(get_val("visualization", "anim_variable", "dashboard"))))
@@ -777,8 +986,15 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     enable_duckdb = Bool(get_val("storage", "enable_duckdb", true))
     duckdb_path   = String(get_val("storage", "duckdb_path", "outputs/particle_tracking.duckdb"))
 
-    output_dir = String(get_val("paths", "output_dir", "outputs"))
-    input_dir  = String(get_val("paths", "input_dir", "inputs"))
+    output_dir = String(get_val("storage", "output_dir", "outputs"))
+    # Ingested data lives in `<output_dir>/inputs`, beside this run's outputs, provenance and
+    # resolved config. It is deliberately NOT configurable and NOT shared between runs: a
+    # single top-level `inputs/` let a run with a changed domain silently reuse another
+    # domain's bathymetry, which is exactly the quiet mismatch `resolved_config.toml` and
+    # `data_provenance.json` exist to expose. The cost is disk -- a dataset is fetched once
+    # per scenario rather than once per machine -- and that is the intended trade, because it
+    # makes each scenario a self-contained, shareable directory.
+    input_dir  = joinpath(output_dir, "inputs")
     seed       = Int(get_val("paths", "seed", 42))
 
     hydro_file = String(get_val("hydrodynamics", "hydro_model_file",
@@ -794,13 +1010,16 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
                                 get_val("hydrodynamics", "checkpoint_prefix", "")))
     cp_sched  = Float64(get_val("storage", "checkpoint_schedule_seconds",
                                 get_val("hydrodynamics", "checkpoint_schedule_seconds", 0.0)))
+    # Field-output cadence, distinct from the checkpoint cadence. Read from [storage] rather
+    # than hardcoded downstream, so the two can legitimately differ.
+    out_sched = Float64(get_val("storage", "output_schedule_seconds", 21600.0))
     cp_dir    = String(get_val("storage", "checkpoint_dir",
                                get_val("paths", "checkpoint_dir", "")))
     cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", true))
     auto_res  = Bool(get_val("hydrodynamics", "auto_restart", true))
 
     res_scale = Float64(get_val("grid", "resolution_scale", 1.0))
-    v_mode_str = String(get_val("grid", "vertical_stretching_mode", "tanh"))
+    v_mode_str = String(get_val("grid", "vertical_stretching_mode", "oceananigans"))
     # Two-segment shelf grid parameters. `vertical_stretching_mode = "two_segment"` splits `nz`
     # into a surface-refined upper segment above `vertical_break_depth` and a coarse lower segment,
     # which is the only way to resolve the 10-400 m active layer while still reaching the deep basin.
@@ -808,14 +1027,54 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     nz_above_cfg = Int(get_val("grid", "nz_above", 0))
     vertical_break_depth = Float64(get_val("grid", "vertical_break_depth", -400.0))
     v_mode = Symbol(lowercase(v_mode_str))
-    v_file = String(get_val("grid", "vertical_grid_file",
-                            joinpath("inputs", "scotian_shelf_vertical_grid.csv")))
-    atmo_src = Symbol(lowercase(String(get_val("atmosphere", "source", "era5"))))
+    v_file = strip(String(get_val("grid", "vertical_grid_file", "")))
+
+    # `vertical_grid_file` is the operator's own file: a relative path is resolved against the
+    # working directory they ran from, not against a previous run's inputs. If they name a
+    # file, it has to exist -- silently falling back to a generated grid would run the whole
+    # simulation on a vertical grid nobody chose. The file is then copied into this run's
+    # containerised input directory so the run is self-contained and reproducible.
+    #
+    # `[grid] depths` is the discretised vertical axis written inline in the config, as
+    # positive-downward face depths starting at the surface: depths = [0, 10, 20, ...].
+    # It is the alternative to naming a CSV, and the two are mutually exclusive so a config
+    # can never silently prefer one over the other.
+    raw_depths = get_val("grid", "depths", Any[])
+    v_depths = Float64[Float64(d) for d in raw_depths]
+    if !isempty(v_depths)
+        isempty(v_file) || error(
+            "[grid] sets both vertical_grid_file and depths. Use one: an explicit depth list " *
+            "is easier to review in the config than a side-car CSV.")
+        abs(first(v_depths)) <= 1e-6 || error(
+            "[grid] depths must start at 0.0 (the surface); got $(first(v_depths)).")
+        all(diff(v_depths) .> 0) || error(
+            "[grid] depths must increase monotonically (positive downward): $(v_depths).")
+        length(v_depths) == nz + 1 || error(
+            "[grid] depths has $(length(v_depths)) entries, but nz = $nz requires " *
+            "$(nz + 1) faces.")
+        # The deepest face has to reach the bottom of the domain, or the grid silently stops
+        # short of the seabed and the deepest water column is left unresolvable.
+        abs(last(v_depths) - abs(z_min)) <= 1.0 || error(
+            "[grid] depths ends at $(last(v_depths)) m but [domain] z_min is $(z_min) m. " *
+            "The deepest face must reach the domain bottom.")
+    end
+    if !isempty(v_file)
+        src = abspath(v_file)
+        isfile(src) || error(
+            "[grid] vertical_grid_file names '$v_file', which does not exist (resolved to " *
+            "$src). Supply the file, or remove the key to derive the grid from the depth " *
+            "range and nz instead."
+        )
+        dst = joinpath(input_dir, basename(v_file))
+        isfile(dst) || cp(src, dst, force = true)
+        v_file = dst
+    end
+    atmo_src = Symbol(lowercase(String(get_val("atmosphere", "forcing", "era5_climatology"))))
     obc_src = Symbol(lowercase(String(get_val("boundaries", "ocean_boundary_source", "glorys12v1"))))
     obc_tp = Symbol(lowercase(String(get_val("boundaries", "obc_type", "flather_chapman"))))
 
     # Initial 3-D hydrography (T, S). Read from `[data]`, independent of the
-    # bathymetry/wind `data_mode` and the lateral `ocean_boundary_source`, because the
+    # bathymetry/wind `bathy_source` and the lateral `ocean_boundary_source`, because the
     # initial water column is a separate choice from the forcing and the boundaries.
     hydro_src = Symbol(lowercase(String(get_val("data", "hydrography_source", "synthetic"))))
     hydro_month = Int(get_val("data", "hydrography_month", 0))
@@ -839,6 +1098,17 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     voronoi_min_core = Float64(get_val("tessellation", "min_res_core_km", 1.5))
     voronoi_min_shallow = Float64(get_val("tessellation", "min_res_shallow_km", 5.0))
     voronoi_min_deep = Float64(get_val("tessellation", "min_res_deep_km", 10.0))
+    # Depth band edges, as positive depths below the surface (the TOML convention). The
+    # tessellator works in signed z (negative downwards), so the sign is applied when the
+    # bands are passed to it; see the `generate_depth_stratified_voronoi_units` call.
+    voronoi_core_min     = Float64(get_val("tessellation", "core_depth_min", 50.0))
+    voronoi_core_max     = Float64(get_val("tessellation", "core_depth_max", 350.0))
+    voronoi_shallow_min  = Float64(get_val("tessellation", "shallow_depth_min", 0.0))
+    voronoi_shallow_max  = Float64(get_val("tessellation", "shallow_depth_max", 50.0))
+    voronoi_deep_min     = Float64(get_val("tessellation", "deep_depth_min", 350.0))
+    voronoi_deep_max     = Float64(get_val("tessellation", "deep_depth_max", 6000.0))
+    voronoi_slope_wt     = Bool(get_val("tessellation", "slope_weighting", true))
+    voronoi_slope_fac    = Float64(get_val("tessellation", "slope_factor", 15.0))
 
     # Construct HydrodynamicOptions with overrides applied
     return HydrodynamicOptions(;
@@ -846,8 +1116,15 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         domain_lat = (lat_min, lat_max),
         domain_z = (z_min, z_max),
         grid_size = (nx, ny, nz),
-        data_mode = data_mode,
+        bathy_source = bathy_source,
+    coastline_source = coastline_source,
+    wind_source = wind_source,
+    wind_time_iso = wind_time_iso,
+        inshore_depth = inshore_depth,
+        shelf_slope = shelf_slope,
         enable_tides = enable_tides,
+    tides_source = tides_source,
+    tidal_constituents = tidal_constituents,
         tidal_u_amp = tidal_u,
         tidal_v_amp = tidal_v,
         s2_u_amp = s2_u,
@@ -893,6 +1170,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         enable_checkpoint = enable_cp,
         checkpoint_prefix = cp_pfx_raw,
         checkpoint_schedule = cp_sched,
+        output_schedule_seconds = out_sched,
         checkpoint_dir = cp_dir,
         checkpoint_cleanup = cp_clean,
         auto_restart = auto_res,
@@ -901,6 +1179,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         nz_above = nz_above_cfg,
         vertical_break_depth = vertical_break_depth,
         vertical_grid_file = v_file,
+    vertical_depths = v_depths,
         resolution_scale = res_scale,
     atmospheric_source = atmo_src,
     ocean_boundary_source = obc_src,
@@ -915,6 +1194,14 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         voronoi_min_res_core_km = voronoi_min_core,
         voronoi_min_res_shallow_km = voronoi_min_shallow,
         voronoi_min_res_deep_km = voronoi_min_deep,
+        voronoi_core_depth_min = voronoi_core_min,
+        voronoi_core_depth_max = voronoi_core_max,
+        voronoi_shallow_depth_min = voronoi_shallow_min,
+        voronoi_shallow_depth_max = voronoi_shallow_max,
+        voronoi_deep_depth_min = voronoi_deep_min,
+        voronoi_deep_depth_max = voronoi_deep_max,
+        voronoi_slope_weighting = voronoi_slope_wt,
+        voronoi_slope_factor = voronoi_slope_fac,
         animate_hydro = anim_hydro,
         anim_variable = anim_var,
         anim_fps = anim_fps,
@@ -960,7 +1247,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "vertical_stretching_mode" => string(opts.vertical_stretching_mode),
             "nz_above" => opts.nz_above,
             "vertical_break_depth" => opts.vertical_break_depth,
-            "vertical_grid_file" => opts.vertical_grid_file
+            "vertical_grid_file" => opts.vertical_grid_file,
+            "depths" => opts.vertical_depths
         ),
         "atmosphere" => Dict{String, Any}(
             "source" => string(opts.atmospheric_source)
@@ -975,14 +1263,21 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "v_inflow" => opts.v_inflow
         ),
         "data" => Dict{String, Any}(
-            "data_mode" => string(opts.data_mode),
+            "bathy_source" => opts.bathy_source,
+            "coastline_source" => opts.coastline_source,
+            "wind_source" => opts.wind_source,
+            "wind_time_iso" => opts.wind_time_iso,
             "hydrography_source" => string(opts.hydrography_source),
-            "hydrography_month" => opts.hydrography_month,
-            "inshore_depth" => -100.0,
-            "shelf_slope" => 500.0
+            "hydrography_month" => opts.hydrography_month
+        ),
+        "bathymetry" => Dict{String, Any}(
+            "inshore_depth" => opts.inshore_depth,
+            "shelf_slope" => opts.shelf_slope
         ),
         "tides" => Dict{String, Any}(
             "enable_tides" => opts.enable_tides,
+            "tides_source" => opts.tides_source,
+            "tidal_constituents" => String.(opts.tidal_constituents),
             "tidal_u_amp" => opts.tidal_u_amp,
             "tidal_v_amp" => opts.tidal_v_amp,
             "s2_u_amp" => opts.s2_u_amp,
@@ -1035,12 +1330,14 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "cv_mortality" => opts.cv_mortality
         ),
         "storage" => Dict{String, Any}(
+            "output_dir" => opts.output_dir,
             "enable_duckdb" => opts.enable_duckdb,
             "duckdb_path" => opts.duckdb_path,
             "run_id" => opts.run_id,
             "enable_checkpoint" => opts.enable_checkpoint,
             "checkpoint_prefix" => opts.checkpoint_prefix,
             "checkpoint_schedule_seconds" => opts.checkpoint_schedule,
+            "output_schedule_seconds" => opts.output_schedule_seconds,
             "checkpoint_dir" => opts.checkpoint_dir,
             "checkpoint_cleanup" => opts.checkpoint_cleanup
         ),
@@ -1056,7 +1353,15 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "prob_deep" => opts.voronoi_prob_deep,
             "min_res_core_km" => opts.voronoi_min_res_core_km,
             "min_res_shallow_km" => opts.voronoi_min_res_shallow_km,
-            "min_res_deep_km" => opts.voronoi_min_res_deep_km
+            "min_res_deep_km" => opts.voronoi_min_res_deep_km,
+            "core_depth_min" => opts.voronoi_core_depth_min,
+            "core_depth_max" => opts.voronoi_core_depth_max,
+            "shallow_depth_min" => opts.voronoi_shallow_depth_min,
+            "shallow_depth_max" => opts.voronoi_shallow_depth_max,
+            "deep_depth_min" => opts.voronoi_deep_depth_min,
+            "deep_depth_max" => opts.voronoi_deep_depth_max,
+            "slope_weighting" => opts.voronoi_slope_weighting,
+            "slope_factor" => opts.voronoi_slope_factor
         ),
         "visualization" => Dict{String, Any}(
             "interactive_map" => opts.interactive_map,
@@ -1069,8 +1374,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "anim_output_path" => opts.anim_output_path
         ),
         "paths" => Dict{String, Any}(
-            "output_dir" => opts.output_dir,
-            "input_dir" => opts.input_dir,
             "seed" => opts.seed
         )
     )
@@ -1095,9 +1398,13 @@ struct HydrodynamicConfig
     nz_above :: Int
     vertical_break_depth :: Float64
     vertical_grid_file       :: String
+    vertical_depths          :: Vector{Float64}
     resolution_scale         :: Float64
     bathymetry_source        :: Symbol
-    bathy_dataset_id         :: String
+    bathy_source             :: String
+    coastline_source         :: String
+    wind_source              :: String
+    wind_time_iso            :: String
     inshore_depth            :: Float64
     shelf_slope              :: Float64
     atmospheric_source       :: Symbol
@@ -1210,11 +1517,15 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :grid_size                => opts.grid_size,
         :vertical_stretching_mode => opts.vertical_stretching_mode,
         :vertical_grid_file       => opts.vertical_grid_file,
+        :vertical_depths          => opts.vertical_depths,
         :resolution_scale         => opts.resolution_scale,
-        :bathymetry_source        => opts.data_mode == :real ? :gebco : :synthetic,
-        :bathy_dataset_id         => "etopo180",
-        :inshore_depth            => -20.0,
-        :shelf_slope              => 500.0,
+        :bathymetry_source        => Symbol(opts.bathy_source),
+        :bathy_source              => opts.bathy_source,
+        :coastline_source          => opts.coastline_source,
+        :wind_source               => opts.wind_source,
+        :wind_time_iso             => opts.wind_time_iso,
+        :inshore_depth            => opts.inshore_depth,
+        :shelf_slope              => opts.shelf_slope,
         :atmospheric_source       => opts.atmospheric_source,
         :drag_formulation         => :garratt_1977,
         :bulk_heat_flux           => true,
@@ -1227,8 +1538,8 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :sponge_layer_width       => opts.sponge_layer_width,
         :sponge_timescale         => opts.sponge_timescale,
         :enable_tides             => opts.enable_tides,
-        :tides_source             => :tpxo9_atlas,
-        :tidal_constituents       => [:M2, :S2],
+        :tides_source             => Symbol(opts.tides_source),
+        :tidal_constituents       => opts.tidal_constituents,
         :tidal_u_amp              => opts.tidal_u_amp,
         :tidal_v_amp              => opts.tidal_v_amp,
         :cd_drag                  => 0.0025,
@@ -1250,7 +1561,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :output_filename          => isempty(opts.hydro_model_file) ?
                                      "hydrodynamics_output.jld2" :
                                      basename(opts.hydro_model_file),
-        :output_schedule_seconds  => 21600.0,
+        :output_schedule_seconds  => opts.output_schedule_seconds,
         :enable_checkpoint        => opts.enable_checkpoint,
         :checkpoint_prefix        => opts.checkpoint_prefix,
         :checkpoint_schedule      => opts.checkpoint_schedule,
@@ -1266,9 +1577,10 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
 
     return HydrodynamicConfig(
         d[:domain_lon], d[:domain_lat], d[:domain_z], d[:grid_size],
-        Symbol(d[:vertical_stretching_mode]), String(d[:vertical_grid_file]),
+        Symbol(d[:vertical_stretching_mode]),         String(d[:vertical_grid_file]),
+        Float64[Float64(x) for x in d[:vertical_depths]],
         Float64(d[:resolution_scale]), Symbol(d[:bathymetry_source]),
-        String(d[:bathy_dataset_id]), Float64(d[:inshore_depth]),
+        String(d[:bathy_source]), String(d[:coastline_source]), String(d[:wind_source]), String(d[:wind_time_iso]), Float64(d[:inshore_depth]),
         Float64(d[:shelf_slope]), Symbol(d[:atmospheric_source]),
         Symbol(d[:drag_formulation]), Bool(d[:bulk_heat_flux]),
         Bool(d[:climatology]), Float64(d[:mhw_temp_anomaly]),

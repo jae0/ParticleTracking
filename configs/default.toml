@@ -20,16 +20,16 @@ author = "ParticleTracking contributors"
 version = "1.0.0"
 
 [data]
-# "synthetic" keeps the run fully offline: an analytical shelf bathymetry is
-# generated and wind stress comes from a closed-form drag law. Set "real" to pull
-# ETOPO 2022 bathymetry and ERA5 winds through NumericalEarth.jl instead.
-data_mode = "synthetic"
-bathy_dataset_id = "synthetic"    # Analytical shelf profile (no download)
-wind_dataset_id = "synthetic"     # Closed-form Large & Pond wind stress (no download)
-hydrography_source = "synthetic"  # Analytic T/S stratification
-wind_time_iso = "2020-06-01T00:00:00Z"  # Unused in synthetic mode; kept for schema parity
-inshore_depth = -20.0            # Depth at the landward edge of the synthetic shelf (m)
-shelf_slope = 500.0              # Scale of the synthetic continental slope (m)
+# The product to ingest is named directly; there is no real/synthetic mode switch
+# and no fallback product. "synthetic" here keeps the run fully offline: an
+# analytical shelf bathymetry is generated and wind stress comes from a closed-form
+# drag law. Set bathy_source = "etopo2022" (and a real wind_source) to pull observed
+# products through NumericalEarth.jl instead.
+coastline_source = "natural_earth_10m"  # Outline of the land at full detail, public domain
+bathy_source = "etopo2022"      # Sea floor map from NOAA, about 450 m detail, free
+wind_source = "open_meteo"      # Real past weather, via a free website
+hydrography_source = "woa23"    # Monthly average temperature and salt for the whole ocean, NOAA, free
+wind_time_iso = "2020-06-01T00:00:00Z"  # Which moment to take the weather from
 
 [climate]
 # Baseline (no perturbation). Switch to ssp126 / ssp245 / ssp585 / mhw to apply a
@@ -49,75 +49,73 @@ z_min = -3000.0
 z_max = 0.0
 buffer_km = 50.0        # Spatial buffer for particle seeding (km)
 
-# Embedding domain: the larger region boundary/forcing data would be drawn from.
-# Unused in synthetic mode, but declared so the schema is complete and switching
-# data_mode to "real" works without editing this file.
-embedding_lon_min = -71.0
-embedding_lon_max = -53.0
-embedding_lat_min = 40.0
-embedding_lat_max = 48.5
+# The embedding domain is declared once, in [boundaries]. It is not repeated here.
 
 [grid]
 # Coarse grid: ~11 km cells, so a full run is cheap. Raise nx/ny for real work.
 nx = 60
 ny = 45
 nz = 10
+depths = [0.0, 10.0, 20.0, 40.0, 60.0, 100.0, 200.0, 400.0, 700.0, 1500.0, 3000.0]
 resolution_scale = 1.0
 # "tanh" refines resolution toward the surface and seabed; "uniform" is plain layers.
 vertical_stretching_mode = "tanh"
-vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"  # Only read when mode = "csv"
 
 [bathymetry]
-source = "synthetic"        # Generated analytically, no network access
-provider = "synthetic"
+# The dataset is named once, as `bathy_source` in [data] ("synthetic" here). No fallback
+# dataset is offered.
+ingest_library = "numerical_earth"
 resolution_arcsec = 60       # Coarser "resolution" to match the coarse grid
-fallback_dataset_id = "synthetic"
 inshore_depth = -20.0
 shelf_slope = 500.0
 
 [atmosphere]
 # Analytical wind stress (Large & Pond 1981) rather than ERA5, so the run is offline.
-source = "era5_climatology"
+forcing = "era5_climatology"
 climatology = true
 variables = ["u10", "v10"]
 drag_formulation = "garratt_1977"   # Cd = (0.75 + 0.067*U10)*1e-3
 bulk_heat_flux = true
 
 [boundaries]
-# Lateral sponge. Disabled for this baseline: the sponge/tidal interior forcing is not yet
-# wired into the NumericalEarth.ocean_simulation forcing interface with an isbits kernel
-# signature, so it is off here rather than silently dropped mid-run. Set
-# boundary method to "none" is explicit; to re-enable relaxation, see the note in
-# configs/snowcrab.toml and the forcing wiring in src/hydrodynamic_model.jl.
+# Switched off here, along with the tides below, because this file is the fast baseline the
+# test suite runs against: sponge and tides off is what makes a run cheap enough to repeat.
+# The edges being unconstrained is a real consequence, not a placeholder -- any result that
+# depends on water crossing an open edge is not a result this config can support.
+# configs/snowcrab.toml is the one set up for real analysis, with the sponge on.
+#
+# What each accepted value gives you is documented once, in src/config/configuration.jl.
+# This file only records the choice.
 method = "none"
 parent_ocean = "synthetic"
-ocean_boundary_source = "synthetic"    # Synthetic mode: no GLORYS download, no OBC sponge
-climatology = true
-obc_type = "flather_chapman"
-active_boundaries = ["east", "south", "west"]
-sponge_layer_width = 0.25          # Sponge thickness in degrees
-sponge_timescale_seconds = 3600.0  # Relaxation timescale (1 hour)
-u_inflow = -0.15                   # Along-shelf inflow (m/s)
-v_inflow = 0.05                    # Cross-shelf inflow (m/s)
+ocean_boundary_source = "synthetic"    # no download; open edges unconstrained
+climatology = true              # Let the outside conditions repeat instead of running out
+obc_type = "flather_chapman"    # Standard treatment for the sea surface height and overall flow
+active_boundaries = ["east", "south", "west"]   # Which edges are open
+sponge_layer_width = 0.25          # Width of the eased band, in degrees
+sponge_timescale_seconds = 3600.0  # How long that band takes to be pulled back, in seconds
+u_inflow = -0.15                   # Speed of water coming in along the shelf, m/s
+v_inflow = 0.05                    # Speed of that water across the shelf, m/s
 
-embedding_lon_min = -71.0
-embedding_lon_max = -53.0
-embedding_lat_min = 40.0
-embedding_lat_max = 48.5
+# The surrounding region the outside conditions are cut from. Larger than the study area,
+# because the model needs to know what the water is doing just beyond the study area's edges.
+embedding_lon_min = -71.0         # Western edge of the surrounding region
+embedding_lon_max = -53.0         # Eastern edge
+embedding_lat_min = 40.0          # Southern edge
+embedding_lat_max = 48.5          # Northern edge
 
 [tides]
-# Astronomical tidal forcing. Disabled for this baseline for the same reason as the
-# sponge above: tidal interior forcing is not yet expressed with an isbits kernel
-# signature for the ocean_simulation forcing interface.
-tides_source = "analytic"
-constituents = []
-enable_tides = false
-tidal_u_amp = 0.25      # M2 semi-major amplitude (m/s)
-tidal_v_amp = 0.12      # M2 semi-minor amplitude (m/s)
-s2_u_amp = 0.11         # S2 semi-major amplitude (m/s)
-s2_v_amp = 0.05         # S2 semi-minor amplitude (m/s)
-tidal_period = 44712.0  # M2 period (s)
-tidal_phase = 0.0
+# Tides are switched off for this baseline, for the same unfinished reason as the open edges
+# above. See configs/snowcrab.toml for a working version.
+tides_source = "analytic"     # Tides made up from the numbers below; nothing downloaded
+constituents = []             # Which tides to include; empty because tides are off
+enable_tides = false          # Leave this off unless you specifically want tides
+tidal_u_amp = 0.25      # How strongly the M2 tide pushes water along the shelf, m/s
+tidal_v_amp = 0.12      # How strongly it pushes across the shelf, m/s
+s2_u_amp = 0.11         # The same for the S2 tide, along the shelf
+s2_v_amp = 0.05         # The same for the S2 tide, across the shelf
+tidal_period = 44712.0  # How long one M2 cycle lasts, in seconds (about 12.4 hours)
+tidal_phase = 0.0       # Where in its cycle the model starts
 
 [bottom_boundary_layer]
 cd_drag = 0.0025                # Quadratic bottom drag coefficient
@@ -148,24 +146,17 @@ enable_checkpoint = true
 # Voronoi units for connectivity analysis. Small N keeps the baseline quick.
 enable_voronoi = true
 n_units = 200
-bathymetry_source = "synthetic"
 core_depth_min = 50.0
 core_depth_max = 350.0
-core_prob = 0.8
 prob_core = 0.8
-core_min_res_km = 1.5
 min_res_core_km = 1.5
 shallow_depth_min = 0.0
 shallow_depth_max = 50.0
-shallow_prob = 0.1
 prob_shallow = 0.1
-shallow_min_res_km = 5.0
 min_res_shallow_km = 5.0
 deep_depth_min = 350.0
 deep_depth_max = 6000.0
-deep_prob = 0.1
 prob_deep = 0.1
-deep_min_res_km = 10.0
 min_res_deep_km = 10.0
 slope_weighting = true
 slope_factor = 15.0
@@ -233,6 +224,9 @@ mortality_cold_threshold = 0.0
 mortality_cold_sensitivity = 0.01
 
 [storage]
+# All output for this configuration lands under outputs/default/, and the resolved
+# configuration is copied there as `resolved_config.toml` for provenance.
+output_dir = "outputs/default"
 output_filename = "default.jld2"
 output_schedule_seconds = 3600.0
 checkpoint_fields = ["u", "v", "w", "T", "S"]
@@ -240,7 +234,6 @@ enable_duckdb = true
 duckdb_path = "outputs/default/default.duckdb"
 enable_checkpoint = true
 checkpoint_prefix = "default_checkpoint"
-checkpoint_schedule = 3600.0
 checkpoint_schedule_seconds = 3600.0
 checkpoint_dir = "outputs/default/checkpoints"
 cleanup_checkpoints = true
@@ -250,15 +243,13 @@ auto_restart = true
 # CPU by default: this is a coarse verification grid, and the run is dominated by
 # compilation rather than compute. Set use_gpu = true to exercise the CUDA path.
 use_gpu = false
-fallback_to_cpu = true
+fallback_to_cpu = false             # A GPU request aborts rather than degrading silently
 
 [visualization]
 interactive_map = true
 title = "ParticleTracking Baseline Run"
 
 [paths]
-# All output for this configuration lands under outputs/default/, and the
-# realized configuration is copied there as `resolved_config.toml` for provenance.
-output_dir = "outputs/default"
-input_dir = "inputs"
+# `output_dir` lives in [storage] with the rest of the output settings. `input_dir`
+# is the fixed shared cache for ingested data and is not configurable.
 seed = 42

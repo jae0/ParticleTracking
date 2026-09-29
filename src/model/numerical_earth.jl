@@ -335,9 +335,9 @@ function AtmosphericForcing(;
 
     # Check for cached NetCDF atmospheric datasets in inputs/
     netcdf_candidates = [
-        joinpath("inputs", "surface_forcing.nc"),
-        joinpath("inputs", "real_surface_winds.nc"),
-        joinpath("inputs", "wind_active.nc")
+        joinpath(opts.input_dir, "surface_forcing.nc"),
+        joinpath(opts.input_dir, "real_surface_winds.nc"),
+        joinpath(opts.input_dir, "wind_active.nc")
     ]
     active_nc = findfirst(isfile, netcdf_candidates)
 
@@ -400,7 +400,7 @@ end
     stretched_tanh_z_faces(
         nz::Int = 20,
         Lz::Real = 5000.0;
-        csv_path::AbstractString = joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
+        csv_path::AbstractString = "",
         scaling::Real = 2.5,
         linear_weight::Real = 0.8,
         tanh_weight::Real = 0.2
@@ -413,7 +413,7 @@ otherwise evaluates the hyperbolic tangent stretching formulation.
 function stretched_tanh_z_faces(
     nz::Int = 20,
     Lz::Real = 5000.0;
-    csv_path::AbstractString = joinpath("inputs", "scotian_shelf_vertical_grid.csv"),
+    csv_path::AbstractString = "",
     scaling::Real = 2.0,
     linear_weight::Real = 0.8,
     tanh_weight::Real = 0.2
@@ -485,89 +485,6 @@ Returns 0 outside the sponge layer and ramp up linearly toward the boundary.
     return ratio < 0.0 ? 0.0 : (ratio > 1.0 ? 1.0 : ratio)
 end
 
-"""
-    regrid_bathymetry(
-        grid;
-        source::Symbol = :gebco,
-        filepath::Union{Nothing, AbstractString} = nothing,
-        fallback_slope::Real = 500.0,
-        inshore_depth::Real = -20.0
-    ) -> Matrix{Float64}
-
-Extract and regrid high-resolution seafloor bathymetry onto the target `grid` horizontal dimensions.
-Compatible with GEBCO, ETOPO, or regional NetCDF grids.
-"""
-function regrid_bathymetry(
-    grid;
-    source::Symbol = :gebco,
-    filepath::Union{Nothing, AbstractString} = nothing,
-    fallback_slope::Real = 500.0,
-    inshore_depth::Real = -20.0
-)::Matrix{Float64}
-    # Resolve grid dimensions and coordinates
-    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    Nx, Ny = base_g.Nx, base_g.Ny
-
-    lons = collect(Float64, base_g.λᶠᵃᵃ[1:Nx])
-    lats = collect(Float64, base_g.φᵃᶠᵃ[1:Ny])
-
-    lon_min, lon_max = extrema(lons)
-    lat_min, lat_max = extrema(lats)
-
-    # Check candidate bathymetry files on disk
-    candidates = isnothing(filepath) ? [
-        joinpath("inputs", "etopo2022_bathymetry.nc"),
-        joinpath("inputs", "bathymetry_active.nc"),
-        joinpath("inputs", "real_bathymetry.nc"),
-        joinpath("inputs", "nova_scotia_bathymetry.nc")
-    ] : [filepath]
-
-    active_file = findfirst(isfile, candidates)
-    if !isnothing(active_file)
-        target_file = candidates[active_file]
-        try
-            elev, src_lon, src_lat = NCDatasets.Dataset(target_file, "r") do ds
-                ev_name = haskey(ds, "elevation") ? "elevation" :
-                          (haskey(ds, "z") ? "z" : (haskey(ds, "altitude") ? "altitude" : "topo"))
-                lo_name = haskey(ds, "lon") ? "lon" : (haskey(ds, "longitude") ? "longitude" : "x")
-                la_name = haskey(ds, "lat") ? "lat" : (haskey(ds, "latitude") ? "latitude" : "y")
-                raw_e = Array{Float64}(ds[ev_name][:, :])
-                lo = collect(Float64, ds[lo_name][:])
-                la = collect(Float64, ds[la_name][:])
-                raw_e, lo, la
-            end
-
-            # 2D bilinear interpolation onto target mesh using a robust implementation
-            return regrid_2d_bilinear(lons, lats, src_lon, src_lat, elev)
-        catch err
-            @warn "Failed regridding $(candidates[active_file]): $(err). Generating synthetic profile."
-        end
-    end
-
-    # Analytical Scotian Shelf bathymetry with shallow banks, Laurentian Channel, and slope
-    bathy = Matrix{Float64}(undef, Nx, Ny)
-    for j in 1:Ny
-        y_norm = clamp((lats[j] - lat_min) / max(1e-3, lat_max - lat_min), 0.0, 1.0)
-        for i in 1:Nx
-            x_norm = clamp((lons[i] - lon_min) / max(1e-3, lon_max - lon_min), 0.0, 1.0)
-            # Offshore continental slope deepening toward south and east
-            shelf_depth = Float64(inshore_depth) - Float64(fallback_slope) * (1.0 - y_norm)^1.5
-            # Continental slope plunge
-            if y_norm < 0.35
-                slope_fac = (0.35 - y_norm) / 0.35
-                shelf_depth -= 3500.0 * slope_fac^1.8
-            end
-            # Laurentian Channel trench entering from the Northeast
-            if x_norm > 0.65 && y_norm > 0.45
-                channel_fac = sin(π * clamp((x_norm - 0.65) / 0.35, 0.0, 1.0))
-                shelf_depth -= 350.0 * channel_fac
-            end
-            bathy[i, j] = clamp(shelf_depth, -5000.0, -5.0)
-        end
-    end
-
-    return bathy
-end
 
 """
     regrid_2d_bilinear(tgt_lons, tgt_lats, src_lons, src_lats, src_data) -> Matrix{Float64}

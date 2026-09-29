@@ -39,24 +39,23 @@ author = "ParticleTracking contributors"
 version = "1.0.0"
 
 [data]
-# "real" means: download real bathymetry and real winds, rather than generating them
-# analytically. Combined with hydrography_source = "woa23" below, every forcing and
-# initial-condition field in this run comes from an observed product.
-data_mode = "real"
-bathy_dataset_id = "etopo2022"   # ETOPO 2022 15-arcsec global relief, NOAA ERDDAP (open)
-wind_dataset_id = "open_meteo"   # ERA5 via the keyless Open-Meteo archive API
-wind_time_iso = "2020-06-01T00:00:00Z"  # Representative spring transition period
-inshore_depth = -20.0            # Coastal boundary depth for the shelf (meters)
-shelf_slope = 500.0              # Bathymetric continental slope scale (meters)
+# Everything the model starts from and is driven by comes from a real published dataset that
+# needs no account and no API key. There is no on/off switch for "real data", and no backup:
+# if a download fails the run stops rather than quietly making something up. Nothing here is
+# generated. The values this file accepts are documented once, in src/config/configuration.jl.
+coastline_source = "natural_earth_10m"  # Land outline, Natural Earth, public domain
+bathy_source = "etopo2022"      # Sea floor map, NOAA ERDDAP, free
+wind_source = "open_meteo"      # Real past weather via a free API
+wind_time_iso = "2020-06-01T00:00:00Z"  # Which moment of 2020 to take the weather from
 
-# Source of the initial 3-D water column (temperature and salinity).
-#   "woa23"     World Ocean Atlas 2023 climatology, NOAA NCEI THREDDS. Keyless.
-#   "synthetic" Analytic stratification profile, no download.
-#   "glorys12v1" GLORYS reanalysis; requires copernicusmarine credentials and is NOT
-#                available in this config's keyless setup.
+# Where the starting temperature and salt for the whole water column come from. WOA23 is a
+# monthly average of the whole ocean from NOAA: the smooth "what does the ocean look like on
+# average" picture, with none of the year-to-year variation and none of the swirling eddies a
+# single real year would contain. A reanalysis instead (GLORYS) does contain eddies, but
+# needs an account, so it does not fit this file.
 hydrography_source = "woa23"
-# 0 selects the annual climatology (the full 12-month mean), which is the right choice for
-# a climatology-scenario run. Set 1-12 for a specific calendar month's climatology.
+# 0 uses the average of all twelve months, which suits a run about the average state. Set
+# 1-12 to use one particular month's average instead.
 hydrography_month = 0
 
 [climate]
@@ -80,11 +79,7 @@ z_min = -3000.0
 z_max = 0.0
 buffer_km = 50.0        # Spatial buffer for particle seeding (km)
 
-# Embedding domain: the larger region boundary/forcing data would be drawn from.
-embedding_lon_min = -71.0
-embedding_lon_max = -53.0
-embedding_lat_min = 40.0
-embedding_lat_max = 48.5
+# The embedding domain is declared once, in [boundaries]. It is not repeated here.
 
 [grid]
 # Moderate resolution (~2.5 km class) so a keyless run stays tractable on CPU. This is
@@ -93,38 +88,57 @@ embedding_lat_max = 48.5
 nx = 145
 ny = 105
 nz = 15
+depths = [0.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 450.0, 700.0, 1100.0, 1800.0, 2400.0, 3000.0]
 resolution_scale = 1.0
 vertical_stretching_mode = "tanh"  # Surface- and seabed-refined layers
-vertical_grid_file = "inputs/scotian_shelf_vertical_grid.csv"  # Only read when mode = "csv"
 
 [bathymetry]
 # ETOPO 2022 is served from the NOAA CoastWatch ERDDAP, which needs no credentials.
-# ETOPO 180-arcsec is the automatic fallback if the 15-arcsec request fails.
-source = "numerical_earth"
-provider = "etopo2022"
+# The dataset is named once, as `bathy_source` in [data]. There is no fallback
+# dataset: if the 15-arcsec request fails the run aborts rather than silently
+# substituting ETOPO 180-arcsec.
+ingest_library = "numerical_earth"
 resolution_arcsec = 15          # 15 arc-second (~500 m at mid-latitudes)
-fallback_dataset_id = "etopo180"
 inshore_depth = -20.0
 shelf_slope = 500.0
 
 [atmosphere]
-# Winds come from the keyless Open-Meteo ERA5 archive API. `fetch_open_surface_winds`
-# tries Open-Meteo first, then NOAA PSL NCEP reanalysis, and only then falls back to an
-# analytical drag law, so this configuration degrades gracefully rather than failing.
-source = "open_meteo"
+# What the weather does to the sea surface. Here the wind is real weather fetched for the
+# date above, and it also carries air temperature, pressure, humidity, cloud cover and
+# sunlight, so the model can work out how much heat the sea gains or loses each hour. Only
+# this source makes the heat flux vary through the run; "era5_climatology" repeats a
+# typical year, and "synthetic" is a single fixed number.
+forcing = "open_meteo"
 climatology = true
 variables = ["u10", "v10"]
 drag_formulation = "garratt_1977"   # Dynamic Cd = (0.75 + 0.067*U10)*1e-3
 bulk_heat_flux = true
 
 [boundaries]
-# Lateral sponge. The relaxation forcing is bitstype-safe and enabled; inflow values are
-# the upstream Scotian Shelf reference velocities.
+# The band of water next to the model's open edges is eased back toward the incoming speeds
+# given below, over about an hour, so the middle of the domain stays free to do its own
+# thing. Those speeds are reference values for this part of the shelf.
 method = "relaxation"
-# No GLORYS download: the lateral boundary is driven by prescribed upstream inflow rather
-# than a parent reanalysis, keeping this config keyless end to end.
 parent_ocean = "synthetic"
-ocean_boundary_source = "synthetic"
+ocean_boundary_source = "woa23"
+# This file exists to show what the model can do with free, account-free data, so the
+# alternatives are the point of it here rather than a duplicate of the manual. The full
+# comparison of every accepted value lives in src/config/configuration.jl.
+#
+# WOA23 is real observed data, so the outermost band of the domain is eased toward measured
+# temperature and salt rather than left to invent its own. What that does NOT give you:
+#   - How fast the water is moving. WOA23 carries no currents, so the inflow speed still
+#     comes from u_inflow/v_inflow below. That is half an open boundary, not a whole one, and
+#     any result depending on how much water crosses an edge rests on those two numbers.
+#   - Tidal or storm variation at the edge. A climatology is one repeating state.
+#   - CPU only. A data-backed sponge cannot be lowered into a GPU kernel, and the run refuses
+#     rather than silently dropping it.
+#
+# The account-free alternative that would fix the first gap is HYCOM, which also carries
+# currents. Its server currently refuses every data request (the catalogue works, the numbers
+# do not come back), so it is wired and ready but not usable. GLORYS carries currents too and
+# does work, but needs a free Copernicus Marine account -- which is exactly what this file
+# exists to avoid.
 climatology = true
 obc_type = "flather_chapman"
 active_boundaries = ["east", "south", "west"]
@@ -179,24 +193,17 @@ enable_checkpoint = true
 # Depth-stratified Voronoi units for release and connectivity analysis.
 enable_voronoi = true
 n_units = 2000
-bathymetry_source = "numerical_earth"
 core_depth_min = 50.0
 core_depth_max = 350.0
-core_prob = 0.8
 prob_core = 0.8
-core_min_res_km = 1.5
 min_res_core_km = 1.5
 shallow_depth_min = 0.0
 shallow_depth_max = 50.0
-shallow_prob = 0.1
 prob_shallow = 0.1
-shallow_min_res_km = 5.0
 min_res_shallow_km = 5.0
 deep_depth_min = 350.0
 deep_depth_max = 6000.0
-deep_prob = 0.1
 prob_deep = 0.1
-deep_min_res_km = 10.0
 min_res_deep_km = 10.0
 slope_weighting = true
 slope_factor = 15.0
@@ -255,6 +262,9 @@ mortality_cold_threshold = 0.0
 mortality_cold_sensitivity = 0.01
 
 [storage]
+# All output lands under work/opendata/, and the realized configuration is copied there
+# as resolved_config.toml for provenance.
+output_dir = "work/opendata"
 output_filename = "opendata.jld2"
 output_schedule_seconds = 21600.0
 checkpoint_fields = ["u", "v", "w", "T", "S", "η"]
@@ -262,7 +272,6 @@ enable_duckdb = true
 duckdb_path = "work/opendata/opendata.duckdb"
 enable_checkpoint = true
 checkpoint_prefix = "opendata_checkpoint"
-checkpoint_schedule = 21600.0
 checkpoint_schedule_seconds = 21600.0
 checkpoint_dir = "work/opendata/checkpoints"
 cleanup_checkpoints = true
@@ -272,15 +281,13 @@ auto_restart = true
 # CPU by default: a keyless run is usually done on shared or laptop hardware, and this
 # grid is modest. Set use_gpu = true to exercise the CUDA path.
 use_gpu = false
-fallback_to_cpu = true
+fallback_to_cpu = false             # A GPU request aborts rather than degrading silently
 
 [visualization]
 interactive_map = true
 title = "Snow Crab Larval Dispersal - Keyless Open Data"
 
 [paths]
-# All output lands under work/opendata/, and the realized configuration is copied there
-# as resolved_config.toml for provenance.
-output_dir = "work/opendata"
-input_dir = "inputs"
+# `output_dir` lives in [storage] with the rest of the output settings. `input_dir`
+# is the fixed shared cache for ingested data and is not configurable.
 seed = 42

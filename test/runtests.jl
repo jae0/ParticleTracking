@@ -38,6 +38,20 @@ import Pkg
 Pkg.activate(joinpath(@__DIR__, ".."), io = devnull)
 using ParticleTracking
 
+# The package requires a configuration: `load_configuration` errors when none is found, on
+# the grounds that a run must not invent the datasets, domain and parameters it reports. A
+# test suite exercises library functions, some of which read the active configuration, so the
+# suite provides one explicitly for the duration -- a real config file, not a stub, because a
+# stub would let a test pass against parameters no run would ever use.
+#
+# It is written to the project root because that is the one location the loader accepts
+# without an explicit path, and it is removed again below so the working tree is left clean.
+const SUITE_CONFIG_PATH = joinpath(@__DIR__, "..", "ParticleTracking.toml")
+const SUITE_CONFIG_BACKUP = SUITE_CONFIG_PATH * ".suite-backup"
+const suite_had_config = isfile(SUITE_CONFIG_PATH)
+suite_had_config && cp(SUITE_CONFIG_PATH, SUITE_CONFIG_BACKUP, force = true)
+cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force = true)
+
 @testset "ParticleTracking.jl Test Suite" begin
 
     @testset "1. Drag Law & Open Data Utilities" begin
@@ -60,21 +74,6 @@ using ParticleTracking
         regridded = regrid_2d_field(src_lon, src_lat, src_data, tgt_lon, tgt_lat)
         @test size(regridded) == (5, 5)
         @test !any(isnan, regridded)
-    end
-
-    @testset "2. Synthetic Data & Inspection" begin
-        synth_bathy = generate_synthetic_bathymetry(
-            "inputs/test_bathy.nc",
-            lon_range = (-65.0, -60.0),
-            lat_range = (43.0, 46.0),
-            n_lon = 20,
-            n_lat = 20
-        )
-        @test isfile(synth_bathy)
-
-        info = inspect_netcdf(synth_bathy, verbose = false)
-        @test haskey(info[:dimensions], "lon")
-        @test haskey(info[:dimensions], "lat")
     end
 
     @testset "3. Grid & Immersed Topography" begin
@@ -1514,25 +1513,29 @@ using ParticleTracking
         )
         @test isfile(etopo_path)
         @test filesize(etopo_path) > 0
-        info_etopo = inspect_netcdf(etopo_path, verbose = false)
-        @test any(v -> v in info_etopo[:variables], ["altitude", "elevation", "z", "topo"])
+        # The variable list is read with NCDatasets directly: `inspect_netcdf` was removed
+        # along with the synthetic-data module, and a test should not depend on a project
+        # utility to learn what a file contains. The do-block closes the file, which matters
+        # on Windows -- an open handle makes the `rm` below fail with EBUSY.
+        etopo_vars = NCDatasets.NCDataset(etopo_path, "r") do ds
+            collect(keys(ds))
+        end
+        @test any(v -> v in etopo_vars, ["altitude", "elevation", "z", "topo"])
         rm(etopo_path, force = true)
 
         # 4. ERA5 Atmospheric Forcing Ingestion
-        tmp_era5 = joinpath(tempdir(), "test_era5.nc")
-        era5_path = fetch_era5_atmospheric_forcing(
-            (-64.0, -62.0),
-            (43.0, 45.0);
-            output_file = tmp_era5,
-            n_hours = 24
-        )
-        @test isfile(era5_path)
-        @test filesize(era5_path) > 0
-        info_era5 = inspect_netcdf(era5_path, verbose = false)
-        @test "tau_x" in info_era5[:variables]
-        @test "tau_y" in info_era5[:variables]
-        @test "heat_flux" in info_era5[:variables]
-        rm(era5_path, force = true)
+        # `fetch_era5_atmospheric_forcing` was removed: it never fetched ERA5, it generated a
+        # sinusoid from hard-coded constants while claiming the name. The real ERA5 path is
+        # `fetch_surface_winds("open_meteo")`, which is exercised against the network in the
+        # atmosphere tests. What is checked here, without a download, is the one piece of
+        # atmospheric physics that must hold regardless of source: the drag-law inversion is
+        # the exact inverse of the law the fetchers apply.
+        worst_rt = maximum(abs(ParticleTracking.wind_speed_from_stress(hypot(tx, ty)) - U) / U
+                           for (tx, ty, U) in
+                           [(ParticleTracking.wind_speed_to_kinematic_stress(u, 0.0)[1],
+                             ParticleTracking.wind_speed_to_kinematic_stress(u, 0.0)[2], u)
+                            for u in (0.5, 2.0, 4.0, 11.0, 15.0, 25.0)])
+        @test worst_rt < 1e-9
 
         # 5. WOA23 Climatology Ingestion
         tmp_woa = joinpath(tempdir(), "test_woa23.nc")
@@ -1545,10 +1548,15 @@ using ParticleTracking
         )
         @test isfile(woa_path)
         @test filesize(woa_path) > 0
-        info_woa = inspect_netcdf(woa_path, verbose = false)
-        @test "t_an" in info_woa[:variables]
-        @test "s_an" in info_woa[:variables]
-        @test "o_an" in info_woa[:variables]
+        # Read the variable list with NCDatasets rather than the removed `inspect_netcdf`.
+        # The do-block closes the handle, which matters on Windows: an open file makes the
+        # `rm` below fail with EBUSY.
+        woa_vars = NCDatasets.NCDataset(woa_path, "r") do ds
+            collect(keys(ds))
+        end
+        @test "t_an" in woa_vars
+        @test "s_an" in woa_vars
+        @test "o_an" in woa_vars
         rm(woa_path, force = true)
 
         # 6. Hydrodynamic Model with Oxygen and ClimaOcean / NEMO-TKE closure
@@ -1570,5 +1578,31 @@ test_grid = build_shelf_grid(
         @test haskey(test_model.tracers, :O2)
     end
 
+    # The TPXO/FES harmonic reader has its own file so it can also be run standalone
+    # (`julia --project=. test/tidal_reader_test.jl`) without standing up the whole suite.
+    include("tidal_reader_test.jl")
+
+    # The provenance registry, likewise runnable on its own.
+    include("provenance_test.jl")
+
+    # TPXO elevation harmonics read from the real archive. Skips itself if the archive has not
+    # been fetched, so the suite still runs on a machine without it.
+    include("tpxo_real_test.jl")
+
+    # ZIP extraction, checked byte-for-byte against a known-good extraction. Also self-skips.
+    include("zip_extract_test.jl")
+
+    # Inputs containerised under the run's output directory.
+    include("containerisation_test.jl")
+
+end
+
+# Remove the configuration the suite installed, restoring any that was already there. This
+# runs even when a testset fails, because a leftover ParticleTracking.toml would silently
+# become the config for the next run started from this working tree.
+if suite_had_config
+    mv(SUITE_CONFIG_BACKUP, SUITE_CONFIG_PATH; force = true)
+else
+    rm(SUITE_CONFIG_PATH; force = true)
 end
 
