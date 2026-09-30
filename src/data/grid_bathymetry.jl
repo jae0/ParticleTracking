@@ -899,7 +899,13 @@ function load_coastline_polygons(path::AbstractString = "inputs/coastline.dat")
             continue
         end
 
-        parts = split(trimmed, ",")
+        # Vertex lines are "lon,lat", but whitespace is accepted too. The two writers and the
+        # reader have disagreed on this before: a space-separated file parsed as zero vertices,
+        # and `load_coastline_polygons` then returned `REGIONAL_COASTLINE` with no warning, so
+        # a whole-world coastline download was silently replaced by the legacy hand-drawn
+        # outline. Accepting both separators is cheap; the real fix is in the writer, and this
+        # is the belt to its braces.
+        parts = occursin(',', trimmed) ? split(trimmed, ",") : split(trimmed)
         if length(parts) >= 2
             p_lon = tryparse(Float64, strip(parts[1]))
             p_lat = tryparse(Float64, strip(parts[2]))
@@ -919,7 +925,16 @@ function load_coastline_polygons(path::AbstractString = "inputs/coastline.dat")
         ))
     end
 
-    return isempty(polys) ? REGIONAL_COASTLINE : polys
+    if isempty(polys)
+        # Falling back to the legacy outline here is the one place this loader can quietly
+        # discard real data, so it says so out loud.
+        @warn "No coastline polygons could be read from $(path); falling back to the " *
+              "built-in regional outline. If $(path) was just downloaded, the file format " *
+              "does not match what `load_coastline_polygons` reads and the download is " *
+              "being discarded."
+        return REGIONAL_COASTLINE
+    end
+    return polys
 end
 
 """

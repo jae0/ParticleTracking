@@ -695,14 +695,35 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test isempty(dups) ||
               error("ParticleTrackingRun.jl passes these options more than once (a repeated " *
                     "keyword is a syntax error): " * join(sort(dups), ", "))
-        @test isempty(setdiff(struct_fields, Set(keys_in_order))) ||
+        # `embedding_lon`/`embedding_lat` are the two fields the driver does not name explicitly.
+        # They are derived inside the keyword constructor from the parsed `[boundaries]`
+        # section, because the raw config dict is not available further down. That still
+        # satisfies the intent of this test -- a field must not silently fall back to its
+        # default -- but it is invisible to a scan of the call site, so it is asserted
+        # separately below rather than counted as "omitted".
+        derived_fields = ["embedding_lon", "embedding_lat"]
+        named = setdiff(struct_fields, Set(keys_in_order))
+        @test isempty(setdiff(named, Set(derived_fields))) ||
               error("ParticleTrackingRun.jl omits these HydrodynamicOptions fields, so they " *
-                    "revert to defaults: " *
-                    join(sort(collect(setdiff(struct_fields, Set(keys_in_order)))), ", "))
+                    "revert to defaults: " * join(sort(collect(setdiff(named, Set(derived_fields)))), ", "))
         @test isempty(setdiff(Set(keys_in_order), struct_fields)) ||
               error("reconstruction passes keys that are not fields: " *
                     join(sort(collect(setdiff(Set(keys_in_order), struct_fields))), ", "))
-        @test length(keys_in_order) == length(struct_fields)   # 1:1, no duplicates
+        @test length(keys_in_order) + length(derived_fields) == length(struct_fields)
+
+        # The derived pair must actually come from the config rather than from the keyword
+        # default, which is the property this testset exists to protect. A value that merely
+        # equals the default would pass a "was it set?" test without proving anything, so the
+        # config is given non-default bounds first.
+        let cfg = get_default_configuration()
+            cfg["boundaries"]["embedding_lon_min"] = -70.0
+            cfg["boundaries"]["embedding_lon_max"] = -58.0
+            cfg["boundaries"]["embedding_lat_min"] = 41.0
+            cfg["boundaries"]["embedding_lat_max"] = 47.0
+            parsed = configuration_to_options(cfg)
+            @test parsed.embedding_lon == (-70.0, -58.0)
+            @test parsed.embedding_lat == (41.0, 47.0)
+        end
 
         # and the values must actually survive parsing + serialisation
         cfg = get_default_configuration()

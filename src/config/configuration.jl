@@ -239,7 +239,8 @@ struct HydrodynamicOptions
     min_dt_seconds           :: Float64
     adaptive_cfl             :: Bool
     target_cfl               :: Float64
-    surface_heat_flux        :: Float64
+      surface_heat_flux        :: Float64
+      bulk_heat_flux           :: Bool
     max_flow_snapshots       :: Int
     allow_analytical_fallback :: Bool
     max_current_speed        :: Union{Nothing, Float64}
@@ -286,6 +287,13 @@ struct HydrodynamicOptions
     resolution_scale         :: Float64
     atmospheric_source :: Symbol
     ocean_boundary_source :: Symbol
+    # The larger region the open-boundary data is cut from. These are separate from
+    # `domain_lon`/`domain_lat` because the boundary needs the water just *outside* the study
+    # area; a subset cut to the study domain would put the interpolation's edge exactly on the
+    # sponge. They are fields rather than re-read from the raw config dict because a value
+    # fetched by key from somewhere downstream is a value nothing checks.
+    embedding_lon :: Tuple{Float64, Float64}
+    embedding_lat :: Tuple{Float64, Float64}
     # Where each piece of the model's outside world comes from.
     #
     # The model is a window cut out of the ocean, so three of its edges are not real coastline
@@ -392,6 +400,7 @@ struct HydrodynamicOptions
     boundary_method          :: Symbol   # :relaxation | :none
     sponge_layer_width       :: Float64  # sponge buffer width (degrees)
     sponge_timescale         :: Float64  # relaxation timescale (s)
+    tidal_relaxation_timescale :: Float64  # relaxation toward the prescribed tide (s)
     u_inflow                 :: Float64  # reference zonal inflow velocity (m/s)
     v_inflow                 :: Float64  # reference meridional inflow velocity (m/s)
     # Time integration ceiling
@@ -428,7 +437,8 @@ function HydrodynamicOptions(;
     min_dt_seconds        :: Real = 2.0,
     adaptive_cfl          :: Bool = true,
     target_cfl            :: Real = 0.2,
-    surface_heat_flux     :: Real = 50.0,
+      surface_heat_flux     :: Real = 50.0,
+      bulk_heat_flux        :: Bool = true,
     max_flow_snapshots    :: Int = 400,
     allow_analytical_fallback :: Bool = false,
     max_current_speed     :: Union{Nothing, Real} = 3.0,
@@ -475,6 +485,8 @@ function HydrodynamicOptions(;
     resolution_scale         :: Real = 1.0,
     atmospheric_source       :: Symbol = :era5,
     ocean_boundary_source    :: Symbol = :glorys12v1,
+    embedding_lon            :: Tuple{Float64, Float64} = (-71.0, -53.0),
+    embedding_lat            :: Tuple{Float64, Float64} = (40.0, 48.5),
     hydrography_source       :: Symbol = :synthetic,
     hydrography_month        :: Int     = 0,
     obc_type                 :: Symbol = :flather_chapman,
@@ -504,6 +516,7 @@ function HydrodynamicOptions(;
     boundary_method          :: Symbol = :relaxation,
     sponge_layer_width       :: Real = 0.35,
     sponge_timescale         :: Real = 3600.0,
+    tidal_relaxation_timescale :: Real = 3600.0,
     u_inflow                 :: Real = -0.15,
     v_inflow                 :: Real = 0.05,
     max_dt                   :: Real = 600.0,
@@ -518,6 +531,12 @@ function HydrodynamicOptions(;
         cfg_name = resolve_config_name(config_file)
         "checkpoint_$(cfg_name)"
     end
+
+    # The open-boundary embedding region arrives as the `embedding_lon`/`embedding_lat`
+    # keywords rather than being re-derived from a config dict here: this constructor takes
+    # individual keywords and has no parsed `cfg` to read. `configuration_to_options`, which
+    # does have the parsed TOML, is what supplies them -- so the value has exactly one path
+    # from the file into the struct.
 
     return HydrodynamicOptions(
         (Float64(domain_lon[1]), Float64(domain_lon[2])),
@@ -544,8 +563,9 @@ function HydrodynamicOptions(;
         Float64(min_dt_seconds),
         adaptive_cfl,
         Float64(target_cfl),
-        Float64(surface_heat_flux),
-        Int(max_flow_snapshots),
+  Float64(surface_heat_flux),
+  bulk_heat_flux,
+  Int(max_flow_snapshots),
         allow_analytical_fallback,
         (max_current_speed isa Real && max_current_speed > 0) ? Float64(max_current_speed) : nothing,
         n_particles,
@@ -591,6 +611,8 @@ function HydrodynamicOptions(;
         Float64(resolution_scale),
         atmospheric_source,
         ocean_boundary_source,
+        embedding_lon,
+        embedding_lat,
         hydrography_source,
         hydrography_month,
         obc_type,
@@ -620,6 +642,7 @@ function HydrodynamicOptions(;
         boundary_method,
         Float64(sponge_layer_width),
         Float64(sponge_timescale),
+        Float64(tidal_relaxation_timescale),
         Float64(u_inflow),
         Float64(v_inflow),
         Float64(max_dt),
@@ -931,6 +954,22 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     adapt_cfl = Bool(get_val("hydrodynamics", "adaptive_cfl", true))
     tgt_cfl   = Float64(get_val("hydrodynamics", "target_cfl", 0.2))
     heat_flux = Float64(get_val("hydrodynamics", "surface_heat_flux", 50.0))
+    # `bulk_heat_flux` selects WHICH heat flux is applied: true computes it from the ingested
+    # atmospheric surface state, false applies the constant `surface_heat_flux` above. It was
+    # parsed into `HydrodynamicConfig` and documented in the TOML but never carried onto
+    # `HydrodynamicOptions`, so nothing downstream could read it and the bulk flux was applied
+    # unconditionally.
+    #
+    # It is read from `[atmosphere]`, which is where the TOML actually carries it (next to
+    # `atmospheric_source`, `wind_source` and the rest of the atmospheric configuration). The
+    # `[hydrodynamics]` section is accepted as a fallback so the key is not silently ignored
+    # if it is written there instead.
+    bulk_heat_flux = if haskey(config_dict, "atmosphere") &&
+                        haskey(config_dict["atmosphere"], "bulk_heat_flux")
+        Bool(get_val("atmosphere", "bulk_heat_flux", true))
+    else
+        Bool(get_val("hydrodynamics", "bulk_heat_flux", true))
+    end
     # Cap on how many hydrodynamic snapshots are held in memory when building the 4D flow
     # interpolator for particle tracking. A production run stores thousands of snapshots and
     # materialising all of them for u, v, w and T is hundreds of gigabytes; the snapshots are
@@ -1137,7 +1176,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         min_dt_seconds = min_dt_seconds,
         adaptive_cfl = adapt_cfl,
         target_cfl = tgt_cfl,
-        surface_heat_flux = heat_flux,
+          surface_heat_flux = heat_flux,
+          bulk_heat_flux = Bool(bulk_heat_flux),
     max_flow_snapshots = max_flow_snapshots,
     allow_analytical_fallback = allow_analytical_fallback,
     max_current_speed = (max_current_speed isa Real && max_current_speed > 0) ?
@@ -1184,6 +1224,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         resolution_scale = res_scale,
     atmospheric_source = atmo_src,
     ocean_boundary_source = obc_src,
+    embedding_lon = embedding_domain_ranges(config_dict).lon,
+    embedding_lat = embedding_domain_ranges(config_dict).lat,
     hydrography_source = hydro_src,
     hydrography_month = hydro_month,
         obc_type = obc_tp,
@@ -1213,6 +1255,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         boundary_method = boundary_method,
         sponge_layer_width = sponge_width_val,
         sponge_timescale = sponge_tau_val,
+        tidal_relaxation_timescale = Float64(get_val("tides", "tidal_relaxation_timescale_seconds", 3600.0)),
         u_inflow = u_inflow_val,
         v_inflow = v_inflow_val,
         max_dt = max_dt_val,
@@ -1417,6 +1460,7 @@ struct HydrodynamicConfig
     obc_type                 :: Symbol
     sponge_layer_width       :: Float64
     sponge_timescale         :: Float64
+    tidal_relaxation_timescale :: Float64
     enable_tides             :: Bool
     tides_source             :: Symbol
     tidal_constituents       :: Vector{Symbol}

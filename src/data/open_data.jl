@@ -11,6 +11,7 @@ using Statistics
 using Interpolations
 using HTTP
 using Base64
+using JSON3
 
 # Import domain constants
 
@@ -2112,18 +2113,23 @@ function fetch_boundary_hydrography(source::Symbol;
                                             output_path = p,
                                             dataset_id = "cmems_mod_glo_phy_my_0.083deg_P1M-m")
         end
-        # The file holds twelve monthly fields. Month 1 is the default because a boundary
-        # target has to be a single time-independent state, and picking one silently is worse
-        # than picking the wrong one loudly -- so the choice is stated here and the filename
-        # records the month once more than one is used.
-        m = max(1, min(12, month == 0 ? 1 : month))
+        # The file holds twelve monthly fields. A single month is a boundary target in name
+        # only, so which one is used is stated here and recorded in the filename.
+        #
+        # `month = 0` means ANNUAL, and it now means it: all twelve months are averaged.
+        # It previously collapsed to month 1, which made an annual boundary a January
+        # boundary -- a different state from the annual WOA23 field the interior is
+        # initialised from, and the mismatch showed up as a ~7.9 K surface density front at
+        # the open edge that drove the run's vertical velocity to ~1.7 m/s. Substituting a
+        # month for "annual" is precisely the silent choice that comment above warns against.
+        m = month == 0 ? collect(1:12) : [max(1, min(12, month))]
         # GLORYS reports temperature in degrees C and the model stores absolute temperature.
         # The offset is derived from the file's own `units` attribute, so it cannot be set
         # wrong per source. WOA23 is degrees C too, and an earlier version made the CALLER
         # declare the unit; that flag was wrong for one source, which would have produced a
         # 287 K boundary that still parsed and still ran.
         return build_boundary_tracer_interpolators(p, p; T_name = "thetao", S_name = "so",
-                                                   month = m)
+                                                   months = m)
     end
 
     if source === :hycom
@@ -2143,6 +2149,124 @@ function fetch_boundary_hydrography(source::Symbol;
         "\"hycom\" (keyless and carries currents, but its server currently refuses data " *
         "requests). Nothing was substituted."
     )
+end
+
+"""
+    fetch_natural_earth_coastline(; lon_range, lat_range, resolution = "10m", output_path,
+                                  margin_deg = 1.0, verbose = true)
+
+Fetch the Natural Earth coastline and write it as the vertex-list format
+`load_coastline_polygons` reads: a `> name,code` header per feature, then one `lon lat`
+vertex per line.
+
+The source is the keyless GeoJSON mirror `nvkelso/natural-earth-vector`, not the
+naturalearthdata.com download page: the page is the citable origin but serves a shapefile
+archive, and reading a shapefile would mean taking a geometry dependency this package does not
+have. GeoJSON parses with JSON3, which is already a dependency. The mirror is public domain and
+needs no account.
+
+The archive is whole-world (~4100 LineStrings, ~10 MB), so it is clipped to the run's domain
+expanded by `margin_deg` before writing. Clipping is a bounding-box test on vertices, not a
+geometric intersection: a segment whose endpoints straddle the box is kept whole, which is the
+conservative direction -- a land mask that is slightly too generous removes a little more water
+than strictly needed, whereas clipping the wrong way invents coast that is not there.
+
+`resolution` accepts "10m", "50m" or "110m" and defaults to the finest. An unrecognised value
+raises rather than quietly substituting the finest, because a run that asked for a coarse
+outline and got a detailed one would mask differently and the difference would not appear in
+the output.
+"""
+function fetch_natural_earth_coastline(;
+                                       lon_range::Tuple{Real, Real},
+                                       lat_range::Tuple{Real, Real},
+                                       resolution::AbstractString = "10m",
+                                       output_path::AbstractString = joinpath("inputs", "coastline.dat"),
+                                       margin_deg::Real = 1.0,
+                                       verbose::Bool = true)
+    res = lowercase(strip(resolution))
+    res in ("10m", "50m", "110m") || error(
+        "Natural Earth resolution \"$(resolution)\" is not one of 10m, 50m, 110m. Refusing " *
+        "rather than substituting a different series, because the outline would mask " *
+        "differently and nothing in the output would show it.")
+    url = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/" *
+          "ne_$(res)_coastline.geojson"
+
+    mkpath(dirname(output_path))
+    lo_lon, hi_lon = minmax(Float64(lon_range[1]), Float64(lon_range[2]))
+    lo_lat, hi_lat = minmax(Float64(lat_range[1]), Float64(lat_range[2]))
+    lo_lon -= Float64(margin_deg); hi_lon += Float64(margin_deg)
+    lo_lat -= Float64(margin_deg); hi_lat += Float64(margin_deg)
+
+    if verbose
+        println("Retrieving Natural Earth $(res) coastline from GeoJSON mirror...")
+        println("  bbox: lon [$(lo_lon), $(hi_lon)], lat [$(lo_lat), $(hi_lat)]")
+    end
+
+    local text
+    try
+        text = Downloads.download(url)
+    catch err
+        error("Could not download the Natural Earth coastline from $(url):\n" *
+              "  " * first(sprint(showerror, err), 200))
+    end
+
+    gj = JSON3.read(text)
+    kept = 0
+    verts = 0
+    open(output_path, "w") do io
+        println(io, "# Natural Earth $(res) coastline, clipped to the run domain")
+        println(io, "# bbox lon [", lo_lon, ", ", hi_lon, "] lat [", lo_lat, ", ", hi_lat, "]")
+        println(io, "# Format: > name,code header, then one 'lon lat' vertex per line")
+        for feat in gj.features
+            geom = feat.geometry
+            # A LineString's `coordinates` is already a list of [lon, lat] positions; a
+            # MultiLineString's is a list of those. Normalising to "list of rings" here is what
+            # keeps the inner loop identical for both -- treating a LineString as a ring of
+            # rings makes each `point` a bare Float64 and indexing it as a pair throws.
+            rings = if geom.type == "MultiLineString"
+                collect(geom.coordinates)
+            elseif geom.type == "LineString"
+                [collect(geom.coordinates)]
+            else
+                continue                       # Points/Polygons are not coastline segments
+            end
+            n = 0
+            buf = Tuple{Float64, Float64}[]
+            for ring in rings
+                for pt in ring
+                    (pt isa AbstractVector || pt isa Tuple) && length(pt) >= 2 || continue
+                    lon, lat = Float64(pt[1]), Float64(pt[2])
+                    (lo_lon <= lon <= hi_lon && lo_lat <= lat <= hi_lat) || continue
+                    push!(buf, (lon, lat))
+                    n += 1
+                end
+            end
+            n < 3 && continue          # a fragment is not a coastline
+            props = hasproperty(feat, :properties) ? feat.properties : nothing
+            nm = (isnothing(props) || !haskey(props, :name)) ? "coastline" :
+                 String(props[:name])
+            code = Symbol(lowercase(replace(nm, r"[^A-Za-z0-9]+" => "_")))
+            println(io, ">", nm, ",", code)
+            for (lon, lat) in buf
+                # Comma-separated: `load_coastline_polygons` and `save_coastline_polygons`
+                # both define the vertex line as "lon,lat". Writing it space-separated parses
+                # as zero vertices, and the loader then silently returns the legacy regional
+                # fallback -- a whole-world download quietly discarded in favour of a
+                # 9-polygon hand-drawn outline, with nothing in the output to say so.
+                println(io, lon, ",", lat)
+            end
+            kept += 1
+            verts += n
+        end
+    end
+
+    kept == 0 && error(
+        "The Natural Earth download succeeded but no feature fell inside the requested " *
+        "bounding box (lon [$(lo_lon), $(hi_lon)], lat [$(lo_lat), $(hi_lat)]). An empty " *
+        "coastline file would leave every grid cell wet, so this is refused rather than " *
+        "written. Check that the domain bounds are not transposed.")
+    verbose && println("  kept $(kept) coastline segments ($(verts) vertices) -> $(output_path)")
+    return output_path
 end
 
 """

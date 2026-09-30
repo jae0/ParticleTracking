@@ -1153,24 +1153,92 @@ function setup_hydrodynamic_simulation(
         u_max = maximum(abs, interior(s.model.velocities.u))
         v_max = maximum(abs, interior(s.model.velocities.v))
         cfl_val = compute_advective_cfl(s.model, s.Δt)
+        # Report the vertical velocity, the three directional Courant numbers and the
+        # free-surface range alongside the advective CFL. `compute_advective_cfl` returns only
+        # the MAXIMUM of the three, so on this grid it was impossible to tell from the log
+        # which direction was actually limiting the step -- and a CFL of 6 against a 0.20
+        # target is a scheme running far outside its stability limit, so knowing which
+        # direction is responsible is the whole diagnosis.
+        w_max = maximum(abs, interior(s.model.velocities.w))
+        # The grid-metric breakdown is best-effort: the metric field names differ between the
+        # underlying grid of an `ImmersedBoundaryGrid` and a bare `LatitudeLongitudeGrid`, and
+        # guessing them wrong would turn a diagnostic into the very failure it is meant to
+        # report. `w_max` and the free-surface range are the numbers that matter here, and both
+        # are always available, so a failure to read the metrics costs detail, not the run.
+        metrics = try
+            base_g = s.model.grid isa ImmersedBoundaryGrid ? s.model.grid.underlying_grid : s.model.grid
+            dz_min = min_vertical_spacing(base_g)
+            r_earth = Float64(base_g.radius)
+            dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
+            dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃᵃ[1:base_g.Ny + 1])))
+            lat_max_abs = max(abs(base_g.φᵃᶠᵃᵃ[1]), abs(base_g.φᵃᶠᵃᵃ[base_g.Ny + 1]))
+            (dx_m = r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg),
+             dy_m = r_earth * deg2rad(dlat_deg),
+             dz_m = dz_min,
+             cflx = (u_max * s.Δt) / max(1.0, r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg)),
+             cfly = (v_max * s.Δt) / max(1.0, r_earth * deg2rad(dlat_deg)),
+             cflz = (w_max * s.Δt) / max(1.0, dz_min))
+        catch
+            nothing
+        end
+        # Free-surface excursion, in metres. A barotropic acceleration shows up here first:
+        # if eta grows without bound the barotropic velocity follows, and the divergence
+        # watchdog (which only inspects u and v) reports the consequence, not the cause.
+        eta_txt = try
+            if hasproperty(s.model, :free_surface) && hasproperty(s.model.free_surface, :η)
+                η = s.model.free_surface.η
+                " | η: $(round(minimum(interior(η)), digits=3))..$(round(maximum(interior(η)), digits=3)) m"
+            else
+                ""
+            end
+        catch
+            ""
+        end
+        metrics_txt = isnothing(metrics) ? "" :
+            " | Δx=$(round(metrics.dx_m, digits=1)) Δy=$(round(metrics.dy_m, digits=1)) " *
+            "Δz=$(round(metrics.dz_m, digits=2)) m (x=$(round(metrics.cflx, digits=3)), " *
+            "y=$(round(metrics.cfly, digits=3)), z=$(round(metrics.cflz, digits=3)))"
         @info(
             "Iter: $(iteration(s)) | Time: $(prettytime(s)) | " *
             "Δt: $(round(s.Δt, digits=1))s | max(|u|): $(round(u_max, digits=4)) m/s | " *
-            "max(|v|): $(round(v_max, digits=4)) m/s | CFL: $(round(cfl_val, digits=3))"
+            "max(|v|): $(round(v_max, digits=4)) m/s | max(|w|): $(round(w_max, digits=4)) m/s | " *
+            "CFL: $(round(cfl_val, digits=3))" * metrics_txt * eta_txt
         )
     end
     sim.callbacks[:progress] = Callback(progress_fn, prog_sched)
 
     # 2. Adaptive time step management
+    #
+    # This is deliberately NOT Oceananigans' `TimeStepWizard`. The wizard derives its Courant
+    # number from the horizontal grid metrics alone, and on this model that is blind to the
+    # direction that actually limits the step.
+    #
+    # Concretely, on the snowcrab configuration the wizard reported a horizontal CFL of about
+    # 0.026 (u = 3.85 m/s, dt = 26.4 s, dx ~ 3.9 km) against a target of 0.2, and therefore
+    # INCREASED dt from 18.0 s to 26.4 s -- while the true stability was being violated in the
+    # vertical, where max(|w|) = 2.4 m/s across a 10 m surface cell gives a Courant number near
+    # 6. Growing dt in the face of that is what let max(|u|) climb to the 20 m/s watchdog, and
+    # max(|w|) reach 7 m/s, which no ocean flow produces.
+    #
+    # `compute_advective_cfl` already computes the correct three-directional maximum, including
+    # the smallest vertical cell, so the controller below drives dt from that instead. It runs
+    # every iteration rather than every 5, and is allowed to halve dt in a single step: the
+    # growth being controlled is exponential, so a controller limited to a 0.5x change every
+    # fifth iteration cannot catch up once it starts falling behind.
     if adaptive_time_step
-        wizard = TimeStepWizard(
-            cfl = target_cfl,
-            max_change = 1.1,
-            min_change = 0.5,
-            max_Δt = max_Δt,
-            min_Δt = min_Δt
-        )
-        sim.callbacks[:wizard] = Callback(wizard, IterationInterval(5))
+        adapt_fn = function (s)
+            cfl = compute_advective_cfl(s.model, s.Δt)
+            if isfinite(cfl) && cfl > 0
+                # Scale so the next step lands on the target, then bound the change to a
+                # factor of two in either direction: unbounded scaling lets a single noisy
+                # field maximum collapse dt to the floor, and a factor-of-two cap per step
+                # still removes a CFL of 6 in about three iterations.
+                s.Δt = clamp(s.Δt * (target_cfl / cfl), 0.5 * s.Δt, 2.0 * s.Δt)
+                s.Δt = clamp(s.Δt, Float64(min_Δt), Float64(max_Δt))
+            end
+            return nothing
+        end
+        sim.callbacks[:wizard] = Callback(adapt_fn, IterationInterval(1))
     end
 
     # 3. Numerical stability watchdog callback
@@ -1457,6 +1525,75 @@ the resident set matches the part of the record actually being interrogated.
 # References
 - Marshall, J., et al. (1997). *J. Geophys. Res. Oceans*, 102(C3), 5753-5766.
 """
+
+"""
+    resolve_hydro_model_paths(filepath::AbstractString) -> Vector{String}
+
+Return every archive belonging to one simulation, in chronological part order.
+
+A run that is extended writes a NEW file rather than appending, because `JLD2Writer`
+re-serialises the model properties (`serialized/coriolis`, `buoyancy`, `closure`, and the
+grid entries) unconditionally whenever it opens a file. Reopening an archive it previously
+wrote therefore raises `a group or dataset named rotation_rate is already present`. There is
+no append mode in this writer: `overwrite_existing` only decides whether the file is removed
+first. So each part is written once and never reopened, and the parts must be stitched
+together on read.
+
+Naming is `<base>_partN.jld2`, ordered **numerically**. Sorting the suffixes as strings
+would place `_part10` before `_part2`, and the resulting time axis would run backwards at
+that point -- which looks like a corrupt simulation rather than a lexicographic slip.
+
+The un-suffixed file is part 1. A run writes the plain `<base>.jld2` on its first invocation
+and `_partN` files on each subsequent extension, so the resolver returns the base **and** the
+parts. Treating the base as separate and returning only the parts would silently discard the
+first increment of every extended run -- the commonest case, and the one a short run would
+never reveal.
+
+A run that was never extended has no `_part*` files, so the base is returned on its own.
+That keeps every existing archive and every existing call site working unchanged.
+"""
+function resolve_hydro_model_paths(filepath::AbstractString)
+    base, ext = splitext(filepath)
+    isfile(filepath) || error("Simulation output file not found at: $(filepath)")
+    dir = dirname(filepath)
+    isdir(dir) || return [filepath]
+
+    stem = basename(base)
+    # Escape the stem before interpolating it into a pattern: a stem containing regex
+    # metacharacters would otherwise match (or fail to match) the wrong files.
+    esc = replace(stem, r"([\\^\$.|?*+()\[\]{}])" => s"\\\1")
+    # `\$` is escaped because a bare `$` immediately before the closing quote is parsed as an
+    # interpolation rather than as a regex anchor.
+    pat = Regex("^" * esc * "_part([0-9]+)\$")
+
+    # Parts live in a `parts/` subdirectory, not alongside the base archive. A long run can
+    # accumulate a dozen multi-GB files, and interleaving them with the inputs, checkpoints
+    # and figures makes the output directory hard to read and easy to copy by mistake.
+    pdir = joinpath(dir, "parts")
+    isdir(pdir) || return [filepath]
+
+    parts = String[]
+    for f in readdir(pdir; join = true)
+        name, fext = splitext(f)
+        fext == ext || continue
+        # Match on the BASE NAME. The pattern is anchored with `^` to the stem, so testing it
+        # against the full path -- which starts with the directory -- can never match, and the
+        # resolver silently returned the single un-extended path instead of every part.
+        m = match(pat, basename(name))
+        m === nothing && continue
+        push!(parts, f)
+    end
+    isempty(parts) && return [filepath]
+
+    num = Dict(f => parse(Int, match(pat, basename(splitext(f)[1])).captures[1]) for f in parts)
+    sort!(parts, by = f -> num[f])
+    # The base file is the first increment; the parts follow it.
+    all_parts = vcat([filepath], parts)
+    println("Reassembling $(length(all_parts)) simulation part(s): " *
+            join(basename.(all_parts), ", "))
+    return all_parts
+end
+
 function create_flow_interpolator_from_jld2(
     jld2_filepath::AbstractString;
     variables::Tuple = (:u, :v, :w, :T),
@@ -1466,277 +1603,245 @@ function create_flow_interpolator_from_jld2(
     max_snapshots::Union{Nothing, Integer} = nothing,
     time_range_out::Union{Nothing, Vector{Float64}} = nothing
 )
-    if !isfile(jld2_filepath)
+if !isfile(jld2_filepath)
         error("Simulation output file not found at: $(jld2_filepath)")
     end
 
-    # Load all grid coordinates and field arrays into local arrays.
-    # The file is closed after this block; the closure captures in-memory arrays.
-    local lons_vec, lats_vec, deps_vec, t_vec
-    local u_arr, v_arr, w_arr, T_arr
-    local has_eta, η_arr
+# A run extended past its first length writes a NEW `_partN` archive rather than
+    # reopening the previous one: `JLD2Writer` re-serialises `serialized/coriolis`,
+    # `buoyancy`, `closure` and the grid entries every time it opens a file, so reopening an
+    # archive it wrote before raises `a group or dataset named rotation_rate is already
+    # present`. `overwrite_existing` only decides whether the file is deleted first, so there
+    # is no append mode. The parts are stitched here, in one place, rather than in each
+    # reader that opens this file -- otherwise the compatibility check and the time-span
+    # query would each describe part 1 alone.
+    parts = resolve_hydro_model_paths(jld2_filepath)
+    multi = length(parts) > 1
 
-    jldopen(jld2_filepath, "r") do file
-        if !haskey(file, "timeseries/u")
-            error("JLD2 file at $(jld2_filepath) is missing required 'timeseries/u' group.")
-        end
-
-        u_group = file["timeseries/u"]
-        u_raw_keys = collect(keys(u_group))
-        if isempty(u_raw_keys)
-            error("JLD2 timeseries group 'timeseries/u' contains no time snapshots in $(jld2_filepath).")
-        end
-
-        # Robust chronological ordering: filter out non-numeric metadata keys (e.g. 'serialized')
-        numeric_keys = filter(k -> !isnothing(tryparse(Float64, k)), u_raw_keys)
-        if isempty(numeric_keys)
-            error("No numeric time snapshot keys found in 'timeseries/u' in $(jld2_filepath).")
-        end
-        sorted_keys = sort(numeric_keys, by = k -> parse(Float64, k))
-
-        nt_total = length(sorted_keys)
-
-        # Resolve the true simulation times BEFORE selecting snapshots.
-        #
-        # The snapshot *keys* are not times. They are elapsed-second stamps written by the
-        # checkpointer ("0", "50", "100", ... "227100"), while the physical time of each snapshot
-        # lives in `timeseries/t` and spans the full simulated period (here 0 -> 6.31e7 s, i.e.
-        # 730 days, at ~3.86 h spacing). Selecting on the keys therefore selects on checkpointer
-        # indices, not on the model's time axis, and a `t_window` in seconds would select the wrong
-        # snapshots -- or none. The interpolator's own temporal axis is `t_vec`, so the window must
-        # be applied to `t_vec` and the two must be kept in lockstep.
-        t_all = if haskey(file, "timeseries/t")
-            t_obj = file["timeseries/t"]
-            if t_obj isa JLD2.Group
-                [Float64(t_obj[k]) for k in sorted_keys]
+    # ---- Pass 1: the time axes of every part, and no field data.
+    #
+    # The combined axis must exist before any array is sized, for two reasons pulling the
+    # same way: the window and the snapshot cap must be applied to the WHOLE run -- subsample
+    # each part first and the concatenation has an unevenly spaced axis, which the
+    # interpolator accepts silently -- and selection must stay ahead of allocation, which is
+    # what bounds peak memory on a long run. Only `timeseries/t` and the key lists are read,
+    # so this costs one pass of metadata rather than a pass over the fields.
+    local part_keys = Vector{Vector{String}}(undef, length(parts))
+    local part_times = Vector{Vector{Float64}}(undef, length(parts))
+    for (pi, p) in enumerate(parts)
+        jldopen(p, "r") do file
+            haskey(file, "timeseries/u") || error(
+                "JLD2 file $(p) is missing required 'timeseries/u' group.")
+            g = file["timeseries/u"]
+            ks = filter(k -> !isnothing(tryparse(Float64, k)), collect(keys(g)))
+            isempty(ks) && error(
+                "JLD2 timeseries 'timeseries/u' in $(p) contains no numeric time keys.")
+            sort!(ks, by = k -> parse(Float64, k))
+            # The snapshot KEYS are not times -- they are elapsed-second stamps written by the
+            # checkpointer. The physical time of each snapshot lives in `timeseries/t`, and
+            # selecting on the keys would select on checkpointer indices, so a `t_window` in
+            # seconds would pick the wrong snapshots or none.
+            t = if haskey(file, "timeseries/t")
+                o = file["timeseries/t"]
+                o isa JLD2.Group ? [Float64(o[k]) for k in ks] : collect(Float64, o)
             else
-                collect(Float64, t_obj)
+                [parse(Float64, k) for k in ks]
             end
-        else
-            # No time group: fall back to the key stamps, which are at least monotonically ordered.
-            [parse(Float64, k) for k in sorted_keys]
+            length(t) == length(ks) || (t = t[1:min(length(t), length(ks))])
+            part_keys[pi] = ks
+            part_times[pi] = t
         end
-        length(t_all) == nt_total || (t_all = t_all[1:min(length(t_all), nt_total)])
+    end
 
-        # Restrict the retained snapshots BEFORE allocating any 4D field array. This is the only
-        # place the selection can happen cheaply: the arrays below are sized from `nt`, and their
-        # product with the grid is what exhausts memory on a long or high-cadence run.
-        t_lo, t_hi = t_all[1], t_all[end]
+    # Flatten to (part, index) pairs, ordered by TIME. Parts are written in order, but
+    # sorting on the time value is what actually guarantees a monotonic axis.
+    want_all = [(pi, k) for pi in eachindex(parts) for k in eachindex(part_keys[pi])]
+    all_t = [part_times[pi][k] for (pi, k) in want_all]
+    perm = sortperm(all_t)
+    want_all = want_all[perm]
+    all_t = all_t[perm]
 
-        keep = trues(nt_total)
-        if !isnothing(t_window)
-            lo, hi = Float64(t_window[1]), Float64(t_window[2])
-            keep .= (t_all .>= lo) .& (t_all .<= hi)
-            # If the window missed every snapshot (e.g. it lies outside the simulated period),
-            # fall back to the nearest snapshot rather than producing an empty interpolator.
-            if !any(keep)
-                keep[argmin(abs.(t_all .- clamp(lo, t_lo, t_hi)))] = true
-            end
+    # Drop repeated times. A part ends at the instant its successor resumes from, so a seam
+    # can carry the same time twice; two snapshots at one instant give the temporal
+    # interpolator a zero-length interval, which is a division by zero rather than a warning.
+    uniq = trues(length(all_t))
+    for i in 2:length(all_t)
+        all_t[i] == all_t[i - 1] && (uniq[i] = false)
+    end
+    ndup = length(all_t) - sum(uniq)
+    ndup > 0 && println("  dropped $(ndup) duplicate time(s) at part seam(s).")
+    want_all = want_all[uniq]
+    all_t = all_t[uniq]
+    isempty(all_t) && error(
+        "No time snapshots found across $(length(parts)) simulation part(s).")
+
+    nt_total = length(all_t)
+    t_lo, t_hi = all_t[1], all_t[end]
+
+    keep = trues(nt_total)
+    if !isnothing(t_window)
+        lo, hi = Float64(t_window[1]), Float64(t_window[2])
+        keep .= (all_t .>= lo) .& (all_t .<= hi)
+        if !any(keep)
+            keep[argmin(abs.(all_t .- clamp(lo, t_lo, t_hi)))] = true
         end
+    end
 
-        selected = findall(keep)
-        # `max_snapshots <= 0` (and `nothing`) mean "no cap": load every snapshot in the window.
-        # Without this guard a cap of 0 would subsample to zero snapshots and produce an empty
-        # interpolator, because `length(selected) > 0` holds for any non-empty selection.
-        if !isnothing(max_snapshots) && max_snapshots > 0 && length(selected) > max_snapshots
-            # Evenly subsample the selection, always keeping the first and last so the temporal
-            # extent of the requested window is preserved.
-            idx = unique!(round.(Int, range(1, length(selected), length = max_snapshots)))
-            selected = selected[idx]
+    selected = findall(keep)
+    if !isnothing(max_snapshots) && max_snapshots > 0 && length(selected) > max_snapshots
+        s2 = unique!(round.(Int, range(1, length(selected), length = max_snapshots)))
+        selected = selected[s2]
+    end
+    isempty(selected) && error(
+        "No snapshots retained from $(length(parts)) simulation part(s): the selection is " *
+        "empty (t_window=$(t_window), max_snapshots=$(max_snapshots)).")
+
+    want = want_all[selected]
+    t_vec = all_t[selected]
+    nt = length(want)
+    if nt < nt_total || multi
+        @info "create_flow_interpolator_from_jld2: retained $nt of $nt_total snapshots " *
+              "from $(length(parts)) part(s) (t_window=$(t_window), " *
+              "max_snapshots=$(max_snapshots)); covering " *
+              "$(round(t_vec[1], digits=1)) .. $(round(t_vec[end], digits=1)) s " *
+              "($(round((t_vec[end] - t_vec[1]) / 86400, digits=2)) days)"
+    end
+    if !isnothing(time_range_out)
+        resize!(time_range_out, 2)
+        time_range_out[1] = t_vec[1]
+        time_range_out[2] = t_vec[end]
+    end
+
+    # Grid geometry comes from the sidecar written alongside the FIRST part, which holds plain
+    # numeric vectors. `serialized/grid` is deliberately not read: deserialising it yields an
+    # opaque `JLD2.ReconstructedStatic`, because the grid's type parameters cannot be
+    # resolved in the reading session.
+    first_part = parts[first(want)[1]]
+    grid_path = string(first(splitext(first_part)), "_grid.jld2")
+    coords = if isfile(grid_path)
+        JLD2.jldopen(grid_path, "r") do cf
+            (lons = collect(Float64, cf["lons"]), lats = collect(Float64, cf["lats"]),
+             depths = collect(Float64, cf["depths"]),
+             halo = Int.(collect(cf["halo"])), size = Int.(collect(cf["size"])))
         end
-        isempty(selected) && error(
-            "No snapshots retained from $(jld2_filepath): the selection is empty " *
-            "(t_window=$(t_window), max_snapshots=$(max_snapshots)).")
+    else
+        nothing
+    end
 
-        sorted_keys = sorted_keys[selected]
-        t_vec = t_all[selected]
-        nt = length(sorted_keys)
-        if nt < nt_total
-            span_days = (t_vec[end] - t_vec[1]) / 86400
-            @info "create_flow_interpolator_from_jld2: retained $nt of $nt_total snapshots " *
-                  "from $(basename(jld2_filepath)) (t_window=$(t_window), " *
-                  "max_snapshots=$(max_snapshots)); covering " *
-                  "$(round(t_vec[1], digits=1)) .. $(round(t_vec[end], digits=1)) s " *
-                  "($(round(span_days, digits=2)) days)"
+    Nx = isnothing(coords) ? 0 : coords.size[1]
+    Ny = isnothing(coords) ? 0 : coords.size[2]
+    Nz = isnothing(coords) ? 0 : coords.size[3]
+    Hx = isnothing(coords) ? 0 : coords.halo[1]
+    Hy = isnothing(coords) ? 0 : coords.halo[2]
+    Hz = isnothing(coords) ? 0 : coords.halo[3]
+    if Nx == 0
+        jldopen(first_part, "r") do file
+            s2 = size(file["timeseries/u/$(part_keys[first(want)[1]][first(want)[2]])"])
+            Nx, Ny, Nz = s2[1], s2[2], s2[3]
         end
-        # Report the retained span to the caller, so a run can be sized from the hydrodynamics
-        # rather than from an assumed duration.
-        if !isnothing(time_range_out)
-            resize!(time_range_out, 2)
-            time_range_out[1] = t_vec[1]
-            time_range_out[2] = t_vec[end]
+    end
+
+    # Every part must describe the SAME grid. Asserted rather than trusted: stitching two
+    # different grids would either throw obscurely or, worse, interleave them into an array
+    # that is internally consistent and physically meaningless.
+    for (pi, p) in enumerate(parts)
+        jldopen(p, "r") do file
+            s2 = size(file["timeseries/u/$(part_keys[pi][1])"])
+            (s2[1], s2[2], s2[3]) == (Nx, Ny, Nz) || error(
+                "Simulation part $(basename(p)) has grid $(s2[1])x$(s2[2])x$(s2[3]) but " *
+                "$(basename(first_part)) has $(Nx)x$(Ny)x$(Nz). Parts of one simulation " *
+                "must share a grid; these cannot be stitched.")
         end
+    end
 
-        # Grid coordinates come from the sidecar written alongside the simulation
-        # (`<output>_grid.jld2`), which holds plain numeric vectors. We deliberately do not
-        # read `serialized/grid`: deserialising it yields an opaque
-        # `JLD2.ReconstructedStatic` rather than a usable grid, because the grid's type
-        # parameters cannot be resolved in the reading session.
-        sidecar = string(first(splitext(jld2_filepath)), "_grid.jld2")
-        coords = if isfile(sidecar)
-            JLD2.jldopen(sidecar, "r") do cf
-                (lons = collect(Float64, cf["lons"]),
-                 lats = collect(Float64, cf["lats"]),
-                 depths = collect(Float64, cf["depths"]),
-                 halo = Int.(collect(cf["halo"])),
-                 size = Int.(collect(cf["size"])))
-            end
-        else
-            nothing
-        end
+    lon_raw = if isnothing(coords)
+        isnothing(domain_lon) && error(
+            "No sidecar grid coordinates ($(grid_path)) and no `domain_lon` supplied. Pass " *
+            "the configured study-domain range from the TOML `[domain]` section.")
+        collect(range(Float64(domain_lon[1]), Float64(domain_lon[2]), length = Nx))
+    else
+        coords.lons
+    end
+    lat_raw = if isnothing(coords)
+        isnothing(domain_lat) && error(
+            "No sidecar grid coordinates ($(grid_path)) and no `domain_lat` supplied. Pass " *
+            "the configured study-domain range from the TOML `[domain]` section.")
+        collect(range(Float64(domain_lat[1]), Float64(domain_lat[2]), length = Ny))
+    else
+        coords.lats
+    end
+    dep_raw = isnothing(coords) ? collect(range(-1000.0, 0.0, length = Nz)) : coords.depths
 
-        ug = nothing   # grid type reconstruction is not used; see `coords` above
+    i_c = (1 + Hx):(Nx + Hx)
+    j_c = (1 + Hy):(Ny + Hy)
+    k_c = (1 + Hz):(Nz + Hz)
+    lons_vec = length(lon_raw) >= (Nx + 2 * Hx) ? lon_raw[i_c] :
+               (length(lon_raw) >= Nx ? lon_raw[1:Nx] :
+                collect(range(first(lon_raw), last(lon_raw), length = Nx)))
+    lats_vec = length(lat_raw) >= (Ny + 2 * Hy) ? lat_raw[j_c] :
+               (length(lat_raw) >= Ny ? lat_raw[1:Ny] :
+                collect(range(first(lat_raw), last(lat_raw), length = Ny)))
+    deps_vec = length(dep_raw) >= (Nz + 2 * Hz) ? dep_raw[k_c] :
+               (length(dep_raw) >= Nz ? dep_raw[1:Nz] :
+                collect(range(first(dep_raw), last(dep_raw), length = Nz)))
 
-        sample_u = file["timeseries/u/$(first(sorted_keys))"]
-        Nx = (!isnothing(coords)) ? coords.size[1] : size(sample_u, 1)
-        Ny = (!isnothing(coords)) ? coords.size[2] : size(sample_u, 2)
-        Nz = (!isnothing(coords)) ? coords.size[3] : size(sample_u, 3)
+    # ---- Pass 2: field data, one part at a time.
+    #
+    # Each part is opened once and only the selected snapshots are read from it, so a long run
+    # never holds two parts' data resident at the same time.
+    u_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
+    v_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
+    w_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
+    T_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
+    η_arr = Array{Float64}(undef, Nx, Ny, nt)
+    have_eta = false
 
-        Hx = (!isnothing(coords)) ? coords.halo[1] : 0
-        Hy = (!isnothing(coords)) ? coords.halo[2] : 0
-        Hz = (!isnothing(coords)) ? coords.halo[3] : 0
-
-        i_c = (1 + Hx):(Nx + Hx)
-        j_c = (1 + Hy):(Ny + Hy)
-        k_c = (1 + Hz):(Nz + Hz)
-
-        extract_coords(obj) = try
-            if hasproperty(obj, :parent)
-                collect(Float64, obj.parent)
-            else
-                collect(Float64, obj)
-            end
-        catch
-            nothing
-        end
-
-        # Horizontal coordinates come from the sidecar when present. Otherwise fall back to a
-        # caller-supplied domain, which originates from the TOML `[domain]` section.
-        #
-        # The fallback is resolved lazily: `domain_lon`/`domain_lat` are only consulted when
-        # `coords === nothing`, so a missing argument is an error only when there is genuinely
-        # no sidecar to read. Resolving it eagerly made a perfectly valid sidecar appear to
-        # fail whenever the caller passed no explicit domain.
-        missing_sidecar_hint(key) =
-            "Simulation file $(jld2_filepath) has no sidecar grid coordinates " *
-            "($(first(splitext(jld2_filepath)))_grid.jld2, written by " *
-            "write_grid_coordinates) and no `$(key)` was supplied. Pass the configured " *
-            "study-domain range (e.g. opts.$(key) from the TOML `[domain]` section)."
-
-        lon_raw = if isnothing(coords)
-            isnothing(domain_lon) && error(missing_sidecar_hint("domain_lon"))
-            collect(range(Float64(domain_lon[1]), Float64(domain_lon[2]), length = Nx))
-        else
-            coords.lons
-        end
-
-        lats_vec_raw = if isnothing(coords)
-            isnothing(domain_lat) && error(missing_sidecar_hint("domain_lat"))
-            collect(range(Float64(domain_lat[1]), Float64(domain_lat[2]), length = Ny))
-        else
-            coords.lats
-        end
-
-        lons_vec = length(lon_raw) >= (Nx + 2 * Hx) ? lon_raw[i_c] :
-                   (length(lon_raw) >= Nx ? lon_raw[1:Nx] :
-                    collect(range(first(lon_raw), last(lon_raw), length = Nx)))
-
-        lat_raw = lats_vec_raw
-        lats_vec = length(lat_raw) >= (Ny + 2 * Hy) ? lat_raw[j_c] :
-                   (length(lat_raw) >= Ny ? lat_raw[1:Ny] :
-                    collect(range(first(lat_raw), last(lat_raw), length = Ny)))
-
-        dep_raw = if !isnothing(coords)
-            coords.depths
-        elseif !isnothing(ug) && hasproperty(ug, :zᵃᵃᶜ)
-            something(extract_coords(ug.zᵃᵃᶜ), collect(range(-1000.0, 0.0, length = Nz)))
-        elseif !isnothing(ug) && hasproperty(ug, :z) && hasproperty(ug.z, :cᵃᵃᶜ)
-            something(extract_coords(ug.z.cᵃᵃᶜ), collect(range(-1000.0, 0.0, length = Nz)))
-        else
-            collect(range(-1000.0, 0.0, length = Nz))
-        end
-        deps_vec = length(dep_raw) >= (Nz + 2 * Hz) ? dep_raw[k_c] :
-                   (length(dep_raw) >= Nz ? dep_raw[1:Nz] :
-                    collect(range(first(dep_raw), last(dep_raw), length = Nz)))
-
-        # Load all time snapshots for each variable into 4D arrays (Nx, Ny, Nz, nt)
-        u_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
-        v_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
-        w_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
-        T_arr = Array{Float64}(undef, Nx, Ny, Nz, nt)
-
-        has_w   = haskey(file, "timeseries/w")
-        has_T   = haskey(file, "timeseries/T")
-        has_eta = haskey(file, "timeseries/η")
-
-        η_arr = has_eta ? Array{Float64}(undef, Nx, Ny, nt) : Array{Float64}(undef, 0, 0, 0)
-
-        for (m, key) in enumerate(sorted_keys)
+    for (m, (pi, k)) in enumerate(want)
+        jldopen(parts[pi], "r") do file
+            key = part_keys[pi][k]
             raw_u = Float64.(file["timeseries/u/$(key)"])
             u_arr[:, :, :, m] = if size(raw_u) == (Nx, Ny, Nz)
                 raw_u
-            elseif size(raw_u) >= (Nx + 1 + 2 * Hx, Ny + 2 * Hy, Nz + 2 * Hz)
-                u_face = raw_u[(1 + Hx):(Nx + 1 + Hx), j_c, k_c]
-                0.5 .* (u_face[1:Nx, :, :] .+ u_face[2:Nx + 1, :, :])
             elseif size(raw_u, 1) == Nx + 1
                 0.5 .* (raw_u[1:Nx, 1:Ny, 1:Nz] .+ raw_u[2:Nx + 1, 1:Ny, 1:Nz])
             else
                 raw_u[1:Nx, 1:Ny, 1:Nz]
             end
-
             raw_v = Float64.(file["timeseries/v/$(key)"])
             v_arr[:, :, :, m] = if size(raw_v) == (Nx, Ny, Nz)
                 raw_v
-            elseif size(raw_v) >= (Nx + 2 * Hx, Ny + 1 + 2 * Hy, Nz + 2 * Hz)
-                v_face = raw_v[i_c, (1 + Hy):(Ny + 1 + Hy), k_c]
-                0.5 .* (v_face[:, 1:Ny, :] .+ v_face[:, 2:Ny + 1, :])
             elseif size(raw_v, 2) == Ny + 1
                 0.5 .* (raw_v[1:Nx, 1:Ny, 1:Nz] .+ raw_v[1:Nx, 2:Ny + 1, 1:Nz])
             else
                 raw_v[1:Nx, 1:Ny, 1:Nz]
             end
-
-            if has_w
-                raw_w = Float64.(file["timeseries/w/$(key)"])
-                w_arr[:, :, :, m] = if size(raw_w) == (Nx, Ny, Nz)
-                    raw_w
-                elseif size(raw_w) >= (Nx + 2 * Hx, Ny + 2 * Hy, Nz + 1 + 2 * Hz)
-                    w_face = raw_w[i_c, j_c, (1 + Hz):(Nz + 1 + Hz)]
-                    0.5 .* (w_face[:, :, 1:Nz] .+ w_face[:, :, 2:Nz + 1])
-                elseif size(raw_w, 3) == Nz + 1
-                    0.5 .* (raw_w[1:Nx, 1:Ny, 1:Nz] .+ raw_w[1:Nx, 1:Ny, 2:Nz + 1])
-                else
-                    raw_w[1:Nx, 1:Ny, 1:Nz]
-                end
+            raw_w = haskey(file, "timeseries/w") ?
+                    Float64.(file["timeseries/w/$(key)"]) : zeros(Nx, Ny, Nz)
+            w_arr[:, :, :, m] = if size(raw_w) == (Nx, Ny, Nz)
+                raw_w
+            elseif size(raw_w, 3) == Nz + 1
+                0.5 .* (raw_w[1:Nx, 1:Ny, 1:Nz] .+ raw_w[1:Nx, 1:Ny, 2:Nz + 1])
             else
-                w_arr[:, :, :, m] = zeros(Nx, Ny, Nz)
+                raw_w[1:Nx, 1:Ny, 1:Nz]
             end
-
-            if has_T
-                raw_T = Float64.(file["timeseries/T/$(key)"])
-                T_arr[:, :, :, m] = if size(raw_T) == (Nx, Ny, Nz)
-                    raw_T
-                elseif size(raw_T) >= (Nx + 2 * Hx, Ny + 2 * Hy, Nz + 2 * Hz)
-                    raw_T[i_c, j_c, k_c]
-                else
-                    raw_T[1:Nx, 1:Ny, 1:Nz]
-                end
+            raw_T = haskey(file, "timeseries/T") ?
+                    Float64.(file["timeseries/T/$(key)"]) : zeros(Nx, Ny, Nz)
+            T_arr[:, :, :, m] = if size(raw_T) == (Nx, Ny, Nz)
+                raw_T
+            elseif size(raw_T, 3) == Nz + 1
+                0.5 .* (raw_T[1:Nx, 1:Ny, 1:Nz] .+ raw_T[1:Nx, 1:Ny, 2:Nz + 1])
             else
-                T_arr[:, :, :, m] = fill(4.5, Nx, Ny, Nz)
+                raw_T[1:Nx, 1:Ny, 1:Nz]
             end
-
-            if has_eta
-                raw_eta = Float64.(file["timeseries/η/$(key)"])
-                η_arr[:, :, m] = if size(raw_eta) == (Nx, Ny)
-                    raw_eta
-                elseif size(raw_eta) >= (Nx + 2 * Hx, Ny + 2 * Hy)
-                    raw_eta[i_c, j_c]
-                else
-                    raw_eta[1:Nx, 1:Ny]
-                end
+            if haskey(file, "timeseries/η")
+                have_eta = true
+                η_arr[:, :, m] = Float64.(file["timeseries/η/$(key)"])[1:Nx, 1:Ny]
             end
         end
     end
+    have_eta || (η_arr = Array{Float64}(undef, 0, 0, 0))
+has_eta = have_eta
+    sorted_keys = String[part_keys[pi][k] for (pi, k) in want]
 
     nx, ny, nz, nt = size(u_arr)
 

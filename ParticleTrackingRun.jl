@@ -449,6 +449,15 @@ function run_segment_grid(;
         # Oceananigans wants z faces negative and ascending, so negate and reverse. The config
         # layer has already checked monotonicity, the 0 m surface, and the nz+1 face count.
         f = sort(-Float64.(opts.vertical_depths))
+        # Precedence: an explicit depth list DEFINES the column, so nz must agree with it
+        # rather than being applied on top. Two numbers for one axis is a configuration
+        # disagreement, and picking either silently is how a run ends up with a column nobody
+        # asked for.
+        nz_from_depths = length(f) - 1
+        nz_from_depths != opts.grid_size[3] && error(
+            "[grid] nz = $(opts.grid_size[3]) conflicts with [grid] depths, which define " *
+            "$(length(f)) faces and therefore Nz = $(nz_from_depths). Set nz = $(nz_from_depths), " *
+            "or remove the depth list to let nz alone define the column. Refusing to pick one.")
         println("Using $(length(f)) vertical faces from [grid] depths " *
                 "(shallowest dz=$(round(f[end] - f[end-1], digits=1))m, " *
                 "deepest dz=$(round(f[2] - f[1], digits=1))m)...")
@@ -473,7 +482,17 @@ function run_segment_grid(;
         # shallowest cell centre at -258 m and no cell centre at all in the 0-50 m nursery band.
         Lz = abs(opts.domain_z[1] - opts.domain_z[2])
         nz_tot = opts.grid_size[3]
-        nz_above = opts.nz_above > 0 ? opts.nz_above : round(Int, 0.6 * nz_tot)
+        # The segment split is a second, independent way of saying how many layers there are,
+        # so it has to agree with nz rather than quietly dividing it differently.
+        if opts.nz_above > 0
+            nz_above = opts.nz_above
+            nz_below_implied = nz_tot - nz_above
+            nz_below_implied < 1 && error(
+                "[grid] nz_above = $nz_above leaves only $nz_below_implied layers below it " *
+                "given nz = $nz_tot. Need nz_above < nz.")
+        else
+            nz_above = round(Int, 0.6 * nz_tot)
+        end
         nz_below = nz_tot - nz_above
         nz_below < 1 && error(
             "vertical grid split leaves nz_below = $nz_below; need nz_above < nz = $nz_tot.")
@@ -545,7 +564,8 @@ function run_segment_model(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     immersed_grid = nothing,
     tau_x::Real = 1e-4,
-    tau_y::Real = 0.0
+    tau_y::Real = 0.0,
+    wind_file::AbstractString = ""
 )
     target_grid = if isnothing(immersed_grid)
         grid_res = run_segment_grid(opts = opts)
@@ -631,10 +651,9 @@ The bounding box is the `[boundaries] embedding_*` region rather than the study 
 has to be larger: the model needs the water just *outside* its own edges, and a subset cut
 to the study domain would put the interpolation's edge exactly on the sponge.
 """
-function fetch_boundary_tracers(source::Symbol, opts, cfg)
-    emb = embedding_domain_ranges(cfg)
+function fetch_boundary_tracers(source::Symbol, opts)
     return fetch_boundary_hydrography(source;
-        lon_range = emb.lon, lat_range = emb.lat,
+        lon_range = opts.embedding_lon, lat_range = opts.embedding_lat,
         input_dir = joinpath(pwd(), "inputs"),
         month = opts.hydrography_month)
 end
@@ -655,7 +674,7 @@ end
     obc_src = opts.ocean_boundary_source
     boundary_tracer_data = nothing
     if obc_src in (:woa23, :glorys12v1, :glorys_climatology, :hycom)
-        boundary_tracer_data = fetch_boundary_tracers(obc_src, opts, cfg)
+        boundary_tracer_data = fetch_boundary_tracers(obc_src, opts)
         println("Boundary hydrography: observed temperature and salinity from $(obc_src).")
         println("  This constrains what the incoming water IS, not how fast it is GOING -- " *
                 "the inflow speed still comes from [boundaries] u_inflow/v_inflow.")
@@ -682,27 +701,54 @@ end
     # carried as a constant. `surface_heat_flux` in the config is what decides whether the
     # flux is applied; the stress is always applied, since without it there is no momentum
     # input at all.
+    #
+    # `wind_file` is a parameter of this function now, not a free variable left over from the
+    # segment-1 scope. It was referenced here but never in scope, so `--all` died with
+    # "UndefVarError: wind_file not defined in Main" before ever reaching the flux.
+    wind_path = isempty(wind_file) ? joinpath(opts.input_dir, "wind_active.nc") : wind_file
     atmo_craft = if opts.atmospheric_source in (:era5, :era5_climatology, :mhw)
-        sx, sy, hx = build_bulk_surface_flux(wind_file)
+        if !isfile(wind_path)
+            error(
+                "Atmospheric forcing is requested but the surface-wind file $(wind_path) is " *
+                "missing. Run the data-ingestion segment, or disable atmospheric forcing.")
+        end
+        sx, sy, hx = build_bulk_surface_flux(wind_path)
         if isnothing(sx)
             error(
-                "Atmospheric forcing is requested but $(basename(wind_file)) has no bulk " *
+                "Atmospheric forcing is requested but $(basename(wind_path)) has no bulk " *
                 "flux inputs. Re-fetch the wind file so the surface state is included.")
         end
-        want_flux = opts.surface_heat_flux
-        if want_flux && isnothing(hx)
+        # Which heat flux to apply is decided by `[hydrodynamics] bulk_heat_flux`:
+        #   true  -> the bulk flux `hx` computed from the ERA5 surface state
+        #   false -> the constant `surface_heat_flux` (W m-2)
+        #
+        # This was previously decided by `surface_heat_flux != 0.0`, which was wrong twice
+        # over. `surface_heat_flux` is a VALUE in W m-2, so treating it as a switch conflates
+        # "no flux" with "a small real flux"; and the resulting `want_flux` was then used only
+        # to pick a printed message, while `heat_flux = hx` was returned unconditionally. So
+        # setting `surface_heat_flux = 0.0` did not disable the bulk flux -- it still drove the
+        # run -- and `bulk_heat_flux`, which is parsed and stored in `HydrodynamicOptions` and
+        # documented in the TOML, was never read at all. Both keys now do what they say.
+        want_bulk = opts.bulk_heat_flux
+        if want_bulk && isnothing(hx)
             error(
-                "[atmosphere] bulk heat flux is enabled but the ingested surface state is " *
-                "unavailable, so the flux cannot be computed. Disable surface_heat_flux or " *
-                "re-fetch the wind file.")
+                "[hydrodynamics] bulk_heat_flux = true but the ingested surface state in " *
+                "$(basename(wind_path)) is unavailable, so the bulk flux cannot be computed. " *
+                "Re-fetch the wind file, or set bulk_heat_flux = false to apply the constant " *
+                "`surface_heat_flux` instead."
+            )
         end
-        if want_flux
+        applied_flux = want_bulk ? hx : opts.surface_heat_flux
+        if want_bulk
             println("Atmospheric forcing: time-varying stress from ERA5 surface state, " *
                     "with a bulk net heat flux.")
+        elseif opts.surface_heat_flux != 0.0
+            println("Atmospheric forcing: time-varying stress from ERA5; constant heat flux " *
+                    "of $(opts.surface_heat_flux) W m-2 (bulk_heat_flux = false).")
         else
             println("Atmospheric forcing: time-varying stress from ERA5; heat flux disabled.")
         end
-        (stress_x = sx, stress_y = sy, heat_flux = hx)
+        (stress_x = sx, stress_y = sy, heat_flux = applied_flux)
     else
         nothing
     end
@@ -736,6 +782,9 @@ end
         lateral_boundary_relaxation = opts.boundary_method != :none,
         sponge_width = opts.sponge_layer_width,
         sponge_tau = opts.sponge_timescale,
+    # The prescribed tide is a VELOCITY and is relaxed toward, not forced as an acceleration.
+    # See the note in `build_hydrodynamic_model`.
+    tidal_tau = opts.tidal_relaxation_timescale,
         u_inflow = opts.u_inflow,
         v_inflow = opts.v_inflow,
         boundary_tracers = boundary_tracer_data,
@@ -935,8 +984,36 @@ function run_segment_simulation(;
     default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
     jld2_path, jld2_filename = resolve_hydro_model_path(opts, default_jld2)
 
-    # Inspect existing target hydrodynamic file
-    file_info = inspect_hydrodynamic_file(jld2_path, expected_stop_time = opts.sim_duration)
+    # Inspect existing target hydrodynamic file.
+    #
+    # A run extended into several `_partN` archives is inspected across ALL of them. Reading
+    # only the base path would report the span of the first increment, so a later extension
+    # would look like it is resuming from far earlier than it is -- and a run whose parts are
+    # complete would be judged incomplete, restarting work that was already done.
+    #
+    # The resolver requires the base archive to exist, which is right when it is actually
+    # reassembling parts but wrong here: a run that failed before writing any output leaves
+    # the grid file and possibly an empty `parts/` directory behind, and there is then no
+    # output to inspect. Asking the resolver in that state aborted the run with "Simulation
+    # output file not found" instead of starting fresh, so a failed run could not be re-run
+    # without manually deleting the directory. The base is therefore checked first, and a
+    # missing one is reported as the single non-existent path, which `inspect_hydrodynamic_file`
+    # records as `exists = false` and the fresh-start path below handles.
+    parts = isfile(jld2_path) ? resolve_hydro_model_paths(jld2_path) : [jld2_path]
+    infos = [inspect_hydrodynamic_file(p, expected_stop_time = opts.sim_duration) for p in parts]
+    file_info = if length(infos) == 1
+        infos[1]
+    else
+        (exists = any(i -> i.exists, infos),
+         is_complete = all(i -> i.is_complete, infos),
+         last_time = maximum(i -> i.last_time, infos),
+         n_timesteps = sum(i -> i.n_timesteps, infos))
+    end
+    if length(infos) > 1
+        println("Existing simulation spans $(length(infos)) part(s), " *
+                "reaching $(round(file_info.last_time / 3600.0, digits=2)) h " *
+                "over $(file_info.n_timesteps) snapshots.")
+    end
 
     # If track-only: require existing valid file with snapshots
     if opts.track_only
@@ -981,16 +1058,100 @@ function run_segment_simulation(;
     println("=================================================================")
     mkpath(opts.output_dir)
 
-    # If file exists but is incomplete
-    if file_info.exists && !file_info.is_complete
-        if opts.auto_restart
-            println("Found interrupted hydrodynamic simulation at: $(jld2_path)")
-            println("  (progress: $(round(file_info.last_time / 3600.0, digits=2)) of $(round(opts.sim_duration / 3600.0, digits=2)) hours)")
-            println("Resuming simulation gracefully from latest checkpoint...")
-        else
-            println("Found incomplete simulation at $(jld2_path), but auto-restart is disabled.")
-            println("Starting fresh simulation from t = 0...")
+    # Existing output: resume, extend, or discard.
+    #
+    # `sim_duration` is the END TIME measured from t = 0, not the length of the work still to
+    # do. That single decision makes extending a run require nothing but editing the number:
+    # the inputs are already cached under this scenario's input directory and are not
+    # re-downloaded, the model state is picked up from wherever it stopped, and raising
+    # `sim_duration` runs the extra time. Resuming an interrupted run and extending a finished
+    # one are therefore the same operation, and neither needs a separate flag.
+    #
+    # Two conditions must not loop, and they are different:
+    #
+    #   * the archive holds NO progress (stored time still zero) -- resuming cannot help, so
+    #     it is discarded immediately;
+    #   * the archive holds progress at T, but a previous attempt to continue from T already
+    #     failed. The file is unchanged by that attempt, so resuming from it reproduces the
+    #     same failure indefinitely. A small sidecar records the stored time at the moment each
+    #     resume was attempted; if it still matches, that continuation has been tried and the
+    #     archive is discarded.
+    #
+    # The sidecar needs no clearing. A successful continuation advances the archive's stored
+    # time past the recorded value, so the match simply stops happening; the next extension
+    # overwrites it. That is why a plain "last attempted time" is sufficient state -- the
+    # archive itself is the record of whether progress was made.
+    out_dir_target = dirname(jld2_path)
+    attempt_path = string(jld2_path, ".attempt")
+
+    discard_run!(reason) = begin
+        println(reason)
+        println("  Discarding the archive and its checkpoints; starting from t = 0.")
+        for f in (jld2_path, replace(jld2_path, r"\.jld2$" => "_grid.jld2"))
+            isfile(f) && rm(f; force = true)
         end
+        cpdir = joinpath(out_dir_target, "checkpoints")
+        isdir(cpdir) && for f in readdir(cpdir; join = true)
+            endswith(f, ".jld2") && rm(f; force = true)
+        end
+        isfile(attempt_path) && rm(attempt_path; force = true)
+        nothing
+    end
+
+    # `attempted_at` is the stored time of the last resume attempt, or NaN if none was recorded
+    # or the sidecar is unreadable. An unreadable sidecar is treated as "never attempted",
+    # which resumes rather than discards: losing an archive on the strength of a corrupt
+    # sidecar would be the worse failure.
+    attempted_at = NaN
+    if isfile(attempt_path)
+        attempted_at = try
+            parse(Float64, strip(read(attempt_path, String)))
+        catch
+            NaN
+        end
+    end
+    failed_before = !isnan(attempted_at) && attempted_at == file_info.last_time
+
+    resume = false
+    if file_info.exists && !file_info.is_complete && file_info.last_time <= 0
+        discard_run!("Existing output $(basename(jld2_path)) is incomplete with no recorded progress.")
+    elseif file_info.exists && failed_before && opts.auto_restart
+        discard_run!(
+            "A previous attempt to continue this run from t = " *
+            "$(round(file_info.last_time / 3600.0, digits=2)) h did not get any further " *
+            "(the archive's stored time is unchanged).")
+    elseif file_info.exists && !file_info.is_complete && opts.auto_restart
+        println("Found interrupted hydrodynamic simulation at: $(jld2_path)")
+        println("  (progress: $(round(file_info.last_time / 3600.0, digits=2)) of " *
+                "$(round(opts.sim_duration / 3600.0, digits=2)) hours)")
+        file_info.last_time >= opts.sim_duration &&
+            println("  Resuming to the configured end time $(round(opts.sim_duration / 3600.0, digits=2)) h " *
+                    "-- raise sim_duration to extend this run further.")
+        println("Resuming simulation gracefully from latest checkpoint...")
+        resume = true
+    elseif file_info.exists && !file_info.is_complete
+        println("Found incomplete simulation at $(jld2_path), but auto-restart is disabled.")
+        println("Starting fresh simulation from t = 0...")
+    elseif file_info.exists && file_info.is_complete && opts.auto_restart
+        if file_info.last_time >= opts.sim_duration
+            println("Existing run already reached $(round(file_info.last_time / 3600.0, digits=2)) h, " *
+                    "which is at or beyond the configured end time " *
+                    "$(round(opts.sim_duration / 3600.0, digits=2)) h.")
+            println("Raise sim_duration in the TOML to extend this run; nothing to do at the " *
+                    "current length.")
+        else
+            println("Extending the existing run from $(round(file_info.last_time / 3600.0, digits=2)) h " *
+                    "to $(round(opts.sim_duration / 3600.0, digits=2)) h.")
+            resume = true
+        end
+    end
+
+    # Record the attempt only when we are about to continue an existing archive, and only
+    # after the decision to resume has been made: a run that starts from t = 0 leaves the
+    # archive behind, and a stale sidecar must not be able to discard it on the next call.
+    if resume
+        mkpath(out_dir_target)
+        write(attempt_path, string(file_info.last_time))
     end
 
     out_dir_target = dirname(jld2_path)
@@ -999,6 +1160,38 @@ function run_segment_simulation(;
     # Checkpoint storage directory
     cp_dir_target = isempty(opts.checkpoint_dir) ?
         joinpath(out_dir_target, "checkpoints") : opts.checkpoint_dir
+
+    # Where this invocation writes its snapshots.
+    #
+    # Continuing an existing run gets a NEW `_partN` file rather than reopening the old one.
+    # `JLD2Writer` re-serialises `serialized/coriolis`, `buoyancy`, `closure` and the grid
+    # entries every time it opens a file, so reopening an archive it previously wrote raises
+    # `a group or dataset named rotation_rate is already present`; `overwrite_existing` only
+    # decides whether the file is deleted first, so there is no append mode to fall back on.
+    # Parts are therefore written once and never reopened, and `resolve_hydro_model_paths`
+    # stitches them on read.
+    #
+    # The boundary coincides with the resume point by construction: the run picks up from the
+    # checkpoint and writes the interval that follows it.
+    ext = splitext(jld2_filename)[2]
+    parts_dir = joinpath(out_dir_target, "parts")
+    write_dir = out_dir_target
+    write_filename = jld2_filename
+    if resume
+        # Parts go in a `parts/` subdirectory so a run that accumulates a dozen multi-GB
+        # files does not bury the inputs, checkpoints and figures beside them. The checkpoint
+        # directory deliberately stays at the top level: it is working state that gets cleaned
+        # up, not part of the record.
+        mkpath(parts_dir)
+        write_dir = parts_dir
+        stem = splitext(jld2_filename)[1]
+        n = 1
+        while isfile(joinpath(parts_dir, "$(stem)_part$(n)$(ext)"))
+            n += 1
+        end
+        println("Continuing into a new part: parts/$(stem)_part$(n)$(ext)")
+        write_filename = "$(stem)_part$(n)$(ext)"
+    end
 
     # Initial time step: start at 10% of the configured sim_dt to allow the
     # CFL wizard to safely ramp up from rest without violating barotropic CFL.
@@ -1014,8 +1207,8 @@ function run_segment_simulation(;
         target_cfl = opts.target_cfl,
         max_Δt = max_Δt,
         min_Δt = opts.min_dt_seconds,
-        output_dir = out_dir_target,
-        output_filename = jld2_filename,
+        output_dir = write_dir,
+        output_filename = write_filename,
         output_schedule = 50,
         progress_schedule = 20,
         enable_checkpoint = opts.enable_checkpoint,
@@ -1023,13 +1216,13 @@ function run_segment_simulation(;
         checkpoint_prefix = opts.checkpoint_prefix,
         checkpoint_schedule = opts.checkpoint_schedule > 0 ? opts.checkpoint_schedule : nothing,
         cleanup_checkpoints = opts.checkpoint_cleanup,
-        pickup = opts.auto_restart ? :auto : false
+        pickup = resume ? :auto : false
     )
 
     println("Integrating hydrostatic primitive equations...")
     run_hydrodynamic_simulation!(
         sim,
-        pickup = opts.auto_restart ? :auto : false,
+        pickup = resume ? :auto : false,
         verbose = true
     )
 
@@ -2653,6 +2846,7 @@ function main(args = ARGS)
     v_mode = base_opts.vertical_stretching_mode
     v_file = base_opts.vertical_grid_file
     atmo_src = base_opts.atmospheric_source
+    atmo_bulk_heat_flux = base_opts.bulk_heat_flux
     obc_src = base_opts.ocean_boundary_source
     obc_tp = base_opts.obc_type
     hydro_src = base_opts.hydrography_source
@@ -2664,6 +2858,7 @@ function main(args = ARGS)
     boundary_method = base_opts.boundary_method
     sponge_width = Float64(base_opts.sponge_layer_width)
     sponge_tau = Float64(base_opts.sponge_timescale)
+    tidal_tau = Float64(base_opts.tidal_relaxation_timescale)
     u_inflow_val = Float64(base_opts.u_inflow)
     v_inflow_val = Float64(base_opts.v_inflow)
 
@@ -2961,10 +3156,18 @@ function main(args = ARGS)
         error("Flags --hydro-only and --track-only are mutually exclusive. Choose one.")
     end
 
-    # Fast override for quick prototyping
+    # Fast override for quick prototyping.
+    #
+    # `nz` is deliberately NOT reduced. The horizontal can be coarsened for speed without
+    # changing what the column resolves, but the number of vertical layers determines the
+    # top cell thickness, which sets the time step and -- far more importantly -- decides
+    # whether the shallowest cell resolves the nursery band at all. Coarsening it silently
+    # was how `--quick` turned a configured nz = 10 into Nz = 5 and produced
+    # "Custom z_faces length 11 must equal Nz + 1 = 6" one segment later, with the real
+    # disagreement buried in a grid-construction error that named neither `nz` nor `--quick`.
     if is_quick
         n_parts = min(n_parts, is_snowcrab ? 50 : 25)
-        grid_dim = is_snowcrab ? (40, 40, 10) : (15, 15, 5)
+        grid_dim = is_snowcrab ? (40, 40, grid_dim[3]) : (15, 15, grid_dim[3])
         sim_dur = min(sim_dur, is_snowcrab ? 432000.0 : 3600.0)
         track_dur = min(track_dur, 86400.0 * 5)
         voronoi_n_units = min(voronoi_n_units, 200)
@@ -3054,6 +3257,12 @@ function main(args = ARGS)
         vertical_grid_file = v_file,
         resolution_scale = res_scale,
         atmospheric_source = atmo_src,
+        # `bulk_heat_flux` decides whether the heat flux is computed from the ingested
+        # atmospheric surface state or taken as the constant `surface_heat_flux`. It is read
+        # from the `[atmosphere]` section of the TOML, alongside `atmospheric_source`. Without
+        # this the field reverted to its default `true` and the bulk flux was applied even
+        # when the config set it to false.
+        bulk_heat_flux = atmo_bulk_heat_flux,
         ocean_boundary_source = obc_src,
         hydrography_source = hydro_src,
         hydrography_month = hydro_month,
@@ -3061,6 +3270,7 @@ function main(args = ARGS)
         boundary_method = boundary_method,
         sponge_layer_width = sponge_width,
         sponge_timescale = sponge_tau,
+    tidal_relaxation_timescale = tidal_tau,
         u_inflow = u_inflow_val,
         v_inflow = v_inflow_val,
         enable_voronoi = enable_voronoi,

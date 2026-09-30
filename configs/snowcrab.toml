@@ -99,8 +99,8 @@ resolution_scale = 2.5
 #
 # Resulting resolution (nz = 40): top cell 5.4 m, 7 cell centres in 0-50 m, 11 in 0-100 m,
 # 24 in 0-400 m, shallowest centre -2.7 m.
-nz_above = 0                             # unused in "csv" mode
-vertical_break_depth = -400.0            # unused in "csv" mode
+nz_above = 0                             # unused in "csv/depths" mode
+vertical_break_depth = -400.0            # unused in "csv/depths" mode
 
 [bathymetry]
 # The dataset is named once, as `bathy_source` in [data]; `ingest_library` says which library
@@ -124,7 +124,13 @@ forcing = "era5_climatology"     # A fixed typical year of weather, repeated; no
 climatology = true              # Repeat the weather cycle rather than running out of it
 variables = ["u10", "v10", "t2m", "ssrd", "strd"]  # Wind, air temperature, sunlight, and heat radiated back down
 drag_formulation = "garratt_1977"  # How strongly the wind drags on the surface; stronger wind means more drag
-bulk_heat_flux = true           # Work out the net heat gain from sunlight, outgoing heat, and evaporation
+    bulk_heat_flux = false          # See note below
+    # `build_bulk_surface_flux` needs the sea-surface temperature, and in Oceananigans 0.111.0
+    # a surface boundary condition cannot be given that tracer: declaring
+    # `field_dependencies = (:T,)` on a `ContinuousBoundaryFunction` raises StackOverflowError
+    # for every call signature, and omitting it means the condition is called as f(x, y, t)
+    # with no tracer. Set this false to apply the constant `surface_heat_flux` below instead.
+    # Restore to true only once a fixed Oceananigans makes that dependency lower.
 
 [boundaries]
 # The model is a rectangle of ocean cut out of a larger sea, so three of its edges are
@@ -177,8 +183,16 @@ tidal_u_amp = 0.25      # How strongly M2 pushes water along the shelf, m/s
 tidal_v_amp = 0.12      # How strongly M2 pushes it across the shelf, m/s
 s2_u_amp = 0.11         # The same for S2, along the shelf
 s2_v_amp = 0.05         # The same for S2, across the shelf
-tidal_period = 44712.0  # How long one M2 cycle lasts, in seconds (about 12.4 hours)
-tidal_phase = 0.0       # Where in its cycle the model starts, in radians
+  tidal_period = 44712.0  # How long one M2 cycle lasts, in seconds (about 12.4 hours)
+  tidal_phase = 0.0       # Where in its cycle the model starts, in radians
+  # The atlas gives a tidal VELOCITY (the amplitudes above are m/s, and the run reports the
+  # M2 boundary speed in m/s). A velocity cannot be fed to a momentum `Forcing`, which wants
+  # an acceleration in m/s^2: doing so injected `u_tide * dt` every step and diverged the run
+  # at iteration 80. The tide is instead relaxed toward, which is the correct expression of a
+  # prescribed oscillating velocity. This is the relaxation timescale in seconds, and it is a
+  # physics choice: small pins the flow to the tide and suppresses wind and buoyancy, large
+  # lets the tide contribute while the rest of the model evolves freely.
+  tidal_relaxation_timescale_seconds = 3600.0
 
 [bottom_boundary_layer]
 # Quadratic bottom drag with TKE mixing closure

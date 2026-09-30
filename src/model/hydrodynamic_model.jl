@@ -10,6 +10,7 @@ using Oceananigans.Units
 # `ContinuousForcing` lives in `Oceananigans.Forcings`, which Oceananigans `using`s
 # internally but does not re-export at top level. `ZeroForcing` is defined locally below,
 # so it is deliberately not imported here.
+using Oceananigans.BoundaryConditions: ContinuousBoundaryFunction
 using Oceananigans.Forcings: ContinuousForcing, MultipleForcings, Relaxation
 using ClimaOcean
 using Dates
@@ -82,6 +83,7 @@ function build_hydrodynamic_model(
     lateral_boundary_relaxation::Bool = false,
     sponge_width::Float64 = 0.35,
     sponge_tau::Float64 = 3600.0,
+    tidal_tau::Float64 = 3600.0,
     u_inflow::Float64 = -0.15,
     v_inflow::Float64 = 0.05,
     u_decay::Float64 = 200.0,
@@ -113,27 +115,72 @@ function build_hydrodynamic_model(
     # Surface kinematic boundary conditions, expressed the same way as the manual builder so
     # that `ocean_simulation` inherits them instead of inventing its own defaults.
     rho0_cp = 1025.0 * 3990.0
-    # A bulk surface heat flux depends on the sea-surface temperature, which is the tracer the
-    # flux is being applied to. Oceananigans hands a tracer to a flux boundary condition whose
-    # function accepts it, so the arity decides the call: a 3-argument function is treated as a
-    # flux that does not need the surface state, a 5-argument one receives (x, y, z, t, T).
-    kinematic_T_flux = if surface_heat_flux isa Function
-        if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
-            (x, y, z, t, T) -> -surface_heat_flux(x, y, t, T) / rho0_cp
+    # A bulk surface heat flux depends on the sea-surface temperature -- the very tracer the
+    # flux is being applied to.
+    #
+    # Declaring that dependency is the only correct way to express it: a
+    # `ContinuousBoundaryFunction` takes its field dependencies as a THIRD constructor
+    # argument, and with the default empty tuple the condition is invoked as `f(x, y, t)` with
+    # no tracer, so a `(x, y, t, T_surf)` flux can never see T. (The 2-argument
+    # `ContinuousBoundaryFunction` constructor does not exist in Oceananigans 0.111 at all.)
+    #
+    # But that correct form DOES NOT WORK in this build. Constructing a boundary function with
+    # `field_dependencies = (:T,)` raises `StackOverflowError` on this model, in
+    # `ContinuousBoundaryFunction` itself, while building the Face/Center condition stencil
+    # (Face, Center, Center and Center, Face variants). Verified in isolation on a 4x4x3
+    # grid with all four plausible call signatures -- (x,y,t,T), (x,y,z,t,T), (x,y,T),
+    # (x,y,z,T) -- and every one overflows, so this is not a wrong-argument-order problem that
+    # another signature would fix. It is the same class of failure already recorded in this
+    # file for `field_dependencies` on a `ContinuousForcing`.
+    #
+    # So a T-dependent surface flux has no working mechanism in this build, and the run is
+    # stopped rather than applying the flux against a substitute temperature. Substituting
+    # 0 K, or a fixed climatological value, would still produce plausible-looking output while
+    # silently changing the surface energy balance: the flux is
+    # `(1 - albedo) * sw_net - lw_net(T) - sens(T) - lat(T)`, so every term on the right of
+    # the longwave, sensible and latent partition would be evaluated at the wrong T.
+    #
+    # To run, set `[hydrodynamics] bulk_heat_flux = false`, which applies the configured
+    # constant `surface_heat_flux` (W/m^2) instead. Applying this flux correctly needs an
+    # Oceananigans version in which `field_dependencies` on a boundary function lowers, or a
+    # redesign that does not need T at the surface face.
+    T_flux_bc = if surface_heat_flux isa Function &&
+                   applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0)
+        error(
+            "A surface heat flux requiring the sea-surface temperature was supplied, but it " *
+            "cannot be applied in this Oceananigans build (0.111.0).\n" *
+            "`build_bulk_surface_flux` returns a (x, y, t, T_surf) flux. The only way to hand " *
+            "it T is a `ContinuousBoundaryFunction` with `field_dependencies = (:T,)`, and " *
+            "constructing one raises StackOverflowError here -- in `ContinuousBoundaryFunction` " *
+            "itself, for every call signature tried, and on a minimal grid as well as on this " *
+            "model. Without the declaration the condition is called as `f(x, y, t)` with no " *
+            "tracer at all, so the flux cannot see T.\n" *
+            "The run is stopped rather than substituting a temperature, because the flux " *
+            "partitions the surface energy balance as " *
+            "`(1 - albedo) * sw_net - lw_net(T) - sens(T) - lat(T)`: evaluating that at a " *
+            "stand-in T still yields a plausible-looking result while getting the longwave, " *
+            "sensible and latent terms wrong for the whole run.\n" *
+            "Set `[hydrodynamics] bulk_heat_flux = false` to apply the configured constant " *
+            "`surface_heat_flux` (W/m^2) instead."
+        )
+    elseif surface_heat_flux isa Function
+        kinematic_T_flux = if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
+            (x, y, z, t, S) -> -surface_heat_flux(x, y, z, t, S) / rho0_cp
         else
             (x, y, t) -> -surface_heat_flux(x, y, t) / rho0_cp
         end
+        FluxBoundaryCondition(kinematic_T_flux)
     elseif surface_heat_flux isa AbstractMatrix
-        -surface_heat_flux ./ rho0_cp
+        FluxBoundaryCondition(-surface_heat_flux ./ rho0_cp)
     else
-        -Float64(surface_heat_flux) / rho0_cp
+        FluxBoundaryCondition(-Float64(surface_heat_flux) / rho0_cp)
     end
 
     u_bc = surface_wind_stress_x isa BoundaryCondition ? surface_wind_stress_x :
            FluxBoundaryCondition(surface_wind_stress_x)
     v_bc = surface_wind_stress_y isa BoundaryCondition ? surface_wind_stress_y :
            FluxBoundaryCondition(surface_wind_stress_y)
-    T_bc = FluxBoundaryCondition(kinematic_T_flux)
+    T_bc = T_flux_bc
 
     bcs = Dict{Symbol, Any}(
         :u => FieldBoundaryConditions(; top = u_bc),
@@ -157,6 +204,15 @@ function build_hydrodynamic_model(
     # Extract values from NamedTuples properly.
     u_tide_val = isnothing(tidal_forcing) ? nothing : tidal_forcing.u
     v_tide_val = isnothing(tidal_forcing) ? nothing : tidal_forcing.v
+
+    # Relaxation rate and footprint for the tidal term. See the note where it is applied: the
+    # tidal field is a velocity and must be relaxed toward, not forced as an acceleration.
+    tidal_relax_rate = 1.0 / Float64(tidal_tau)
+    # The tide is applied across the whole domain, matching the footprint the old body-force
+    # version used. Restricting it to a boundary band would be the alternative, but that
+    # changes which parts of the domain the tide drives and is a modelling decision rather
+    # than a correction of the units error, so it is left alone here.
+    tidal_mask = (x, y, z) -> 1.0
 
     # Sponge relaxation, expressed as an Oceananigans `Relaxation`.
     #
@@ -202,28 +258,53 @@ function build_hydrodynamic_model(
         u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_target)
         v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_target)
 
+        # Tidal forcing is a RELAXATION TOWARD the prescribed tidal velocity, not a body force.
+        #
+        # `tidal_forcing_coefficients` reconstructs a velocity in m/s from the M2/S2 harmonic
+        # coefficients -- the config's own amplitudes are quoted that way (`tidal_u_amp = 0.25`
+        # m/s, and the run logs "M2 boundary speed amplitude: 0.0072 - 0.4456 m/s"). A
+        # `ContinuousForcing` on `u`/`v` is an ACCELERATION in m/s^2, so passing the velocity
+        # there injected `u_tide * dt` into the momentum equation every step: a 0.45 m/s tide
+        # with dt = 26.4 s added 11.9 m/s per step. That is what made the run diverge --
+        # max(|u|) climbed 0 -> 3.85 -> 10.85 -> 16.17 -> 20.46 m/s and tripped the 20 m/s
+        # watchdog at iteration 80, and max(|w|) reached 7 m/s, which no ocean flow produces.
+        # The units error is invisible in the output because a run that blows up still prints
+        # plausible-looking per-iteration velocities on the way.
+        #
+        # A relaxation is the correct expression of a prescribed oscillating velocity: it adds
+        # `(1/tau) * (u_tide(x, t) - u)`, so the target is a velocity and the model converges to
+        # the tide on the timescale `tidal_tau` rather than accumulating it. That timescale is
+        # a physics choice, not a numerical one -- small pins the flow to the tide and suppresses
+        # wind and buoyancy; large lets the tide contribute while the rest of the model evolves.
         if !isnothing(u_tide_val)
+            u_tide_target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t))
             u_forcing = MultipleForcings(
-                u_forcing, ContinuousForcing((x, y, z, t) -> Float64(u_tide_val(x, y, z, t)))
+                u_forcing,
+                Relaxation(rate = tidal_relax_rate, mask = tidal_mask, target = u_tide_target)
             )
         end
         if !isnothing(v_tide_val)
+            v_tide_target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t))
             v_forcing = MultipleForcings(
-                v_forcing, ContinuousForcing((x, y, z, t) -> Float64(v_tide_val(x, y, z, t)))
+                v_forcing,
+                Relaxation(rate = tidal_relax_rate, mask = tidal_mask, target = v_tide_target)
             )
         end
 
         composed_forcing = (; u = u_forcing, v = v_forcing)
     else
-        # No sponge: plain prescribed body forcing, called as f(x, y, z, t).
+        # No sponge. The same relaxation, with a mask of 1 everywhere: there is no lateral
+        # relaxation to compose with, so the tidal term stands alone.
         composed_forcing = (; u = ZeroForcing(), v = ZeroForcing())
         if !isnothing(u_tide_val)
             composed_forcing = merge(composed_forcing,
-                (; u = ContinuousForcing((x, y, z, t) -> Float64(u_tide_val(x, y, z, t)))))
+                (; u = Relaxation(rate = tidal_relax_rate, mask = tidal_mask,
+                                  target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t)))))
         end
         if !isnothing(v_tide_val)
             composed_forcing = merge(composed_forcing,
-                (; v = ContinuousForcing((x, y, z, t) -> Float64(v_tide_val(x, y, z, t)))))
+                (; v = Relaxation(rate = tidal_relax_rate, mask = tidal_mask,
+                                  target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t)))))
         end
     end
 
@@ -252,14 +333,28 @@ function build_hydrodynamic_model(
     # with currents (GLORYS) for (1), a dated series rather than a climatology for (2). It
     # does not need more code here; the code is not the missing part.
     if !isnothing(boundary_tracers) && sponge_active
-        if Base.get(ENV, "PARTICLETRACKING_USE_GPU", "0") == "1"
+        # Ask the GRID which architecture it is on, rather than reading a flag or an
+        # environment variable. An earlier version tested `ENV["PARTICLETRACKING_USE_GPU"]`,
+        # which nothing in the project ever sets: the GPU path comes from `--gpu` via
+        # `opts.use_gpu`. The guard therefore never fired, and a GPU run reached the kernel
+        # and died with an opaque LLVM error from `gpu__fill_bottom_and_top_halo!` instead of
+        # the sentence explaining why. A guard that cannot fire is worse than none, because
+        # it reads as protection.
+        #
+        # It then compared `Oceananigans.architecture(grid) === :gpu`, which is the same
+        # mistake one level down: in Oceananigans 0.111 `architecture` returns an
+        # ARCHITECTURE INSTANCE (`CPU()` or `GPU()`), not a Symbol, so `=== :gpu` is false
+        # even on a GPU grid. Verified directly: `architecture(g) isa CPU == true` while
+        # `architecture(g) === :gpu == false`. The test is an `isa` against `CPU`, which is
+        # the only thing that distinguishes the two devices.
+        if !(Oceananigans.architecture(grid) isa Oceananigans.CPU)
             error(
                 "Boundary hydrography was supplied, but a data-backed tracer sponge cannot be " *
-                "lowered into a GPU kernel: the interpolation object is not `isbits`. Refusing " *
-                "rather than skipping it, because a run that appears to carry observed " *
-                "boundary temperature and salinity but does not would be a silent physics " *
-                "error. Run this config on CPU, or set " *
-                "[boundaries] ocean_boundary_source = \"synthetic\" for the GPU run."
+                "lowered into a GPU kernel: the interpolation object captures a large array " *
+                "and is not `isbits`. Refusing rather than skipping it, because a run that " *
+                "appears to carry observed boundary temperature and salinity but does not " *
+                "would be a silent physics error. Re-run on CPU (drop `--gpu`), or set " *
+                "[boundaries] ocean_boundary_source = \"synthetic\" to run on GPU without it."
             )
         end
         for (nm, itp) in pairs(boundary_tracers)
@@ -581,11 +676,17 @@ end
 Wrap a `(depth, lat, lon)` array in a trilinear interpolator evaluable at model coordinates.
 
 `values` must already have WOA fill values mapped to `NaN`. Masked cells are repaired first so
-a query can never return `NaN` for a model cell sitting over land:
+Replace masked cells (`NaN`, produced from WOA23's `Missing` land/seabed mask) so that
+a query can never return `NaN` for a model cell sitting over land or below the seabed:
 
-* a depth column that is entirely `NaN` is replaced by the mean of the valid depths in that
-  column (zero if there are none);
-* any remaining interior `NaN` is replaced by the mean of all valid values.
+* below the deepest valid level in a column, the last valid value is **held**, not averaged;
+* an isolated interior gap is filled by linear interpolation between its neighbours;
+* a column with no valid depth at all takes the mean of the whole field, never zero.
+
+Holding rather than averaging matters because on a shelf domain most of the grid is masked.
+Averaging turned a column valid only in its top ~20 levels into one flat value all the way to
+5500 m, and a fully-masked column into literal `0.0` -- that is 0 K and 0 PSU, which in a
+TEOS-10 density is a large spurious freshening rather than a neutral filler.
 
 The vertical axis is clamped to the dataset's depth range by the caller, so the interpolator is
 only ever queried inside its bounds.
@@ -593,18 +694,53 @@ only ever queried inside its bounds.
 function build_woa_interpolator(values::AbstractArray, lon, lat, depth)
     nz, ny, nx = size(values)
 
+    # Mask repair, one column at a time, and deliberately NOT by averaging.
+    #
+    # WOA23 masks everything below the seabed and everything inland. On a shelf domain that is
+    # most of the grid, so the old policy -- fill each column with its own mean, and fill
+    # fully-masked columns with the mean of the whole field -- replaced the real water column
+    # with a flat plateau. A shelf column valid only in its top ~20 levels came back
+    # "measured" all the way to 5500 m at one averaged temperature, and a column with no valid
+    # depths at all came back as literal 0.0, i.e. 0 K and 0 PSU.
+    #
+    # Neither is a neutral placeholder. A 0 PSU column feeding a TEOS-10 density is a large
+    # spurious freshening, and a flat plateau destroys the stratification the grid exists to
+    # resolve. So the fill carries the last valid value downward instead:
+    #
+    #   * below the deepest valid level, hold that value (nearest-valid, not an average);
+    #   * a column with no valid depth at all takes the field mean, never zero;
+    #   * an isolated interior gap is filled by linear interpolation between its neighbours.
+    valid_all = filter(!isnan, values)
+    isempty(valid_all) && error(
+        "build_woa_interpolator: the field contains no valid values at all. It is empty or " *
+        "entirely masked, and there is nothing to fill from.")
+    field_mean = sum(valid_all) / length(valid_all)
+
     for j in 1:ny, i in 1:nx
         col = @view values[:, j, i]
-        all(isnan, col) || continue
-        valid = filter(!isnan, col)
-        isempty(valid) ? (col .= 0.0) : (col .= sum(valid) / length(valid))
-    end
-
-    nan_idx = findall(isnan, values)
-    if !isempty(nan_idx)
-        valid = filter(!isnan, values)
-        mean_valid = isempty(valid) ? 0.0 : sum(valid) / length(valid)
-        values[nan_idx] .= mean_valid
+        ok = findall(!isnan, col)
+        if isempty(ok)
+            col .= field_mean
+            continue
+        end
+        first_ok, last_ok = first(ok), last(ok)
+        # Below the seabed: hold the deepest observation.
+        for k in (last_ok + 1):nz
+            col[k] = col[last_ok]
+        end
+        # Interior gaps: linear between the surrounding valid levels.
+        for k in (first_ok + 1):(last_ok - 1)
+            isnan(col[k]) || continue
+            lo = k - 1
+            while lo >= first_ok && isnan(col[lo])
+                lo -= 1
+            end
+            hi = k + 1
+            while hi <= last_ok && isnan(col[hi])
+                hi += 1
+            end
+            col[k] = col[lo] + (col[hi] - col[lo]) * (k - lo) / (hi - lo)
+        end
     end
 
     # `values` is (depth, lat, lon) with each axis ascending, which is the order
@@ -761,9 +897,39 @@ function build_boundary_tracer_interpolators(T_path::AbstractString,
                                               S_path::AbstractString;
                                               T_name::AbstractString = "t_an",
                                               S_name::AbstractString = "s_an",
-                                              month::Int = 1)
-    Tv, lon, lat, depth = read_woa_variable(T_path, T_name; month = month)
-    Sv, lon_s, lat_s, depth_s = read_woa_variable(S_path, S_name; month = month)
+                                              month::Int = 1,
+                                              months::Union{Nothing, Vector{Int}} = nothing)
+    # `months` averages several monthly fields into one. This is what an "annual" boundary
+    # means, and it matters: the model interior is initialised from the ANNUAL WOA23
+    # climatology when `hydrography_month = 0`, so a boundary that quietly became JANUARY
+    # (as this did, via `month == 0 ? 1 : month`) is a different physical state from the one
+    # the interior starts in. Measured at the eastern open boundary the surface difference
+    # was -7.9 K, with a band-wide mean of -1.8 K, injected as a persistent density front
+    # across a 0.35-degree sponge: that is what drove max(|w|) to ~1.7 m/s. An annual mean of
+    # the same product is consistent with the annual initial condition by construction.
+    mlist = isnothing(months) ? [month] : months
+    mean_over_months(path, name) = begin
+        acc = nothing
+        cnt = nothing
+        lo = la = de = nothing
+        for m in mlist
+            V, lo_m, la_m, de_m = read_woa_variable(path, name; month = m)
+            if acc === nothing
+                (acc, cnt, lo, la, de) = (copy(V), Float64.(isfinite.(V)), lo_m, la_m, de_m)
+            else
+                (lo_m == lo && la_m == la && de_m == de) || error(
+                    "Monthly fields for $(name) are on different grids; month $(m) does not " *
+                    "match the others, so they cannot be averaged.")
+                acc .+= ifelse.(isfinite.(V), V, 0.0)
+                cnt .+= ifelse.(isfinite.(V), 1.0, 0.0)
+            end
+        end
+        V = ifelse.(cnt .> 0, acc ./ max.(cnt, 1.0), NaN)
+        (V, lo, la, de)
+    end
+
+    Tv, lon, lat, depth = mean_over_months(T_path, T_name)
+    Sv, lon_s, lat_s, depth_s = mean_over_months(S_path, S_name)
     (lon_s == lon && lat_s == lat && depth_s == depth) || error(
         "Boundary temperature and salinity are on different grids: $(basename(T_path)) has " *
         "$(length(lon))x$(length(lat))x$(length(depth)) and $(basename(S_path)) has " *
