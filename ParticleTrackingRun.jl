@@ -1241,7 +1241,8 @@ function run_segment_simulation(;
         min_Δt = opts.min_dt_seconds,
         output_dir = write_dir,
         output_filename = write_filename,
-        output_schedule = 50,
+        output_schedule = (opts.output_schedule_seconds > 0.0) ?
+            opts.output_schedule_seconds : 21600.0,
         progress_schedule = 20,
         enable_checkpoint = opts.enable_checkpoint,
         checkpoint_dir = cp_dir_target,

@@ -365,12 +365,12 @@ Astronomical tides are implemented as momentum body accelerations in the interio
 and target velocity vectors in open boundary relaxation sponge layers:
 - **Interior Momentum Acceleration**: $\boldsymbol{F}_{\text{tide}} = (F_u, F_v)$ in $\text{m s}^{-2}$,
   compensating bottom friction $r_{\text{drag}}$.
-- **Boundary Relaxation Forcing**: When utilizing `Oceananigans.BoundaryConditions.Relaxation`,
-  the target field is the tidal velocity vector $\boldsymbol{u}_{\text{target}} = (u_{\text{tide}}, v_{\text{tide}})$
-  in $\text{m s}^{-1}$, not the acceleration tendency.
 - **Selective Open Boundary Sponge Masking**: Sponge damping layers are applied strictly to open
   ocean boundaries (e.g., `:east`, `:south`, `:west`), masking land-adjacent boundaries (e.g., `:north`)
   to prevent artificial inflow generation and numerical boundary reflection.
+
+### 3. Hydrodynamic Field Serialization & Part Sizing
+Hydrodynamic fields are written to JLD2 archives according to `output_schedule_seconds` in the `[hydrodynamics]` section (defaulting to 21,600 s / 6 h). Intermediate segment runs serialize into segmented files under `parts/` (e.g. `hydrodynamics_..._part1.jld2`). Non-advective diagnostic fields ($\nu, \kappa, N^2, \zeta$) can be selectively included via `include_diagnostics` in `setup_hydrodynamic_simulation` to optimize storage for particle tracking.
 
 ```bash
 # Resume after interruption (default behaviour)

@@ -624,9 +624,10 @@ simulation = setup_hydrodynamic_simulation(
   target_cfl=0.2,
   output_dir="outputs",
   output_filename="nova_scotia_hydrodynamics.jld2",
-  output_schedule=100,
+  output_schedule=21600.0,
+  include_diagnostics=true,
   enable_checkpoint=true,
-  checkpoint_schedule=100,
+  checkpoint_schedule=21600.0,
   pickup=:auto)
   
 # 2. Execute hydrodynamic model integration with graceful interruption handling

@@ -67,7 +67,7 @@ julia --project=. -e "using Pkg; Pkg.instantiate()"
 ### Run the test suite
 
 ```bash
-julia --project=. test/runtests.jl          # 445 tests, ~3 min
+julia --project=. test/runtests.jl          # 600 tests, ~3.3 min
 ```
 
 ### Run the pipeline

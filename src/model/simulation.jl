@@ -169,14 +169,23 @@ function compute_advective_cfl(
     nz = base_g.Nz
     cfl_z = 0.0
     if hasproperty(base_g, :z) && hasproperty(base_g.z, :Δᵃᵃᶜ)
-        dz_vec = to_cpu_offset_array(base_g.z.Δᵃᵃᶜ)
-        w_int_cpu = Array(w_int)
-        for k in 1:nz
-            dz_k = Float64(dz_vec[k])
-            w_bot = maximum(abs, @view(w_int_cpu[:, :, k]))
-            w_top = maximum(abs, @view(w_int_cpu[:, :, k + 1]))
-            w_k = max(w_bot, w_top)
-            cfl_z = max(cfl_z, (w_k * Δt) / max(1.0, dz_k))
+        dz_raw = base_g.z.Δᵃᵃᶜ
+        if dz_raw isa Real
+            dz_k = Float64(dz_raw)
+            cfl_z = (w_max * Δt) / max(1.0, dz_k)
+        elseif dz_raw isa AbstractArray
+            dz_vec = to_cpu_offset_array(dz_raw)
+            w_int_cpu = Array(w_int)
+            for k in 1:nz
+                dz_k = Float64(dz_vec[k])
+                w_bot = maximum(abs, @view(w_int_cpu[:, :, k]))
+                w_top = maximum(abs, @view(w_int_cpu[:, :, k + 1]))
+                w_k = max(w_bot, w_top)
+                cfl_z = max(cfl_z, (w_k * Δt) / max(1.0, dz_k))
+            end
+        else
+            dz_approx = min_vertical_spacing(base_g)
+            cfl_z = (w_max * Δt) / max(1.0, dz_approx)
         end
     else
         dz_approx = min_vertical_spacing(base_g)
@@ -1130,6 +1139,9 @@ multistage schemes subject to the CFL condition:
 - `pickup::Union{Bool, Symbol, String, Int}`: Checkpoint pickup specification.
   `:auto` (default) detects the latest existing checkpoint in `checkpoint_dir`.
 - `watchdog::Bool`: Whether to attach a NaN/divergence early detection callback.
+- `include_diagnostics::Bool`: Whether to include secondary diagnostic fields
+  (mixing coefficients ν, κ, buoyancy frequency N², and vertical vorticity ζ) in
+  the JLD2 output snapshots (default `true`). Set `false` to reduce file size.
 - `divergence_velocity_limit::Real`: Maximum permissible fluid velocity threshold before
   raising divergence error (default 20.0 m/s).
 
@@ -1153,6 +1165,7 @@ function setup_hydrodynamic_simulation(
     output_dir::AbstractString = "outputs",
     output_filename::AbstractString = "nova_scotia_hydrodynamics.jld2",
     output_schedule::Union{Real, Int} = 100,
+    include_diagnostics::Bool = true,
     overwrite_existing::Union{Nothing, Bool} = nothing,
     enable_checkpoint::Bool = true,
     checkpoint_dir::Union{Nothing, AbstractString} = nothing,
@@ -1397,14 +1410,18 @@ function setup_hydrodynamic_simulation(
             outputs_dict[:η] = model.free_surface.η
         end
 
-        # Model-native vertical mixing, written on the tracer (centre) grid so the
-        # consumer never has to de-stagger or guess at halos for these fields.
-        merge!(outputs_dict, native_mixing_diagnostics(model))
+        if include_diagnostics
+            # Model-native vertical mixing, written on the tracer (centre) grid so the
+            # consumer never has to de-stagger or guess at halos for these fields.
+            merge!(outputs_dict, native_mixing_diagnostics(model))
 
-        # Model-native stratification (ρ, N²) and vorticity (ζ), evaluated by
-        # Oceananigans on the model's own grid rather than re-derived downstream.
-        strat_dict = native_stratification_diagnostics(model)
-        merge!(outputs_dict, strat_dict)
+            # Model-native stratification (ρ, N²) and vorticity (ζ), evaluated by
+            # Oceananigans on the model's own grid rather than re-derived downstream.
+            strat_dict = native_stratification_diagnostics(model)
+            merge!(outputs_dict, strat_dict)
+        else
+            strat_dict = Dict{Symbol, Any}()
+        end
 
         out_sched = if output_schedule isa Int
             IterationInterval(output_schedule)
@@ -1417,7 +1434,7 @@ function setup_hydrodynamic_simulation(
         # itself. Oceananigans runs `TimeStepCallsite` callbacks before the output writers on
         # each tick (see `Simulations/run.jl`), so sharing the writer's schedule guarantees ρ
         # is current at the moment it is written rather than one interval behind.
-        if haskey(strat_dict, :ρ)
+        if include_diagnostics && haskey(strat_dict, :ρ)
             sim.callbacks[:stratification] = Callback(
                 s -> refresh_stratification_diagnostics!(strat_dict, s.model),
                 out_sched
