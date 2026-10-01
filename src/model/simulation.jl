@@ -88,24 +88,36 @@ function min_vertical_spacing(base_g)
 end
 
 """
-    velocity_peak_location(sim, cart_idx::CartesianIndex) -> Tuple{Float64, Float64, Float64}
+    velocity_peak_location(sim_or_model, loc) -> Tuple{Float64, Float64, Float64}
 
-Extract geographical (longitude, latitude, depth in meters) coordinates of a field index
-from the simulation grid for localized diagnostic reporting.
+Extract geographical (longitude, latitude, depth in meters) coordinates of an interior field
+index `loc` (a `CartesianIndex` or index tuple) from the simulation or model grid.
+Uses `extract_grid_coordinates` to retrieve halo-stripped coordinates matching interior fields.
 """
-function velocity_peak_location(sim, cart_idx::CartesianIndex)
-    base_g = sim.model.grid isa ImmersedBoundaryGrid ?
-             sim.model.grid.underlying_grid : sim.model.grid
-    i, j, k = Tuple(cart_idx)
-    lon_val = Float64(base_g.λᶠᵃᵃ[min(i, base_g.Nx + 1)])
-    lat_val = Float64(base_g.φᵃᶠᵃ[min(j, base_g.Ny + 1)])
-    dep_val = if hasproperty(base_g, :z) && hasproperty(base_g.z, :cᵃᵃᶠ)
-        z_arr = Array(parent(base_g.z.cᵃᵃᶠ))
-        Float64(z_arr[min(k, length(z_arr))])
-    else
-        Float64(base_g.Lz) * (k / base_g.Nz) - abs(Float64(base_g.Lz))
-    end
-    return (lon_val, lat_val, dep_val)
+function velocity_peak_location(sim_or_model, loc)
+    grid = hasproperty(sim_or_model, :model) ? sim_or_model.model.grid :
+           hasproperty(sim_or_model, :grid) ? sim_or_model.grid : sim_or_model
+    lons, lats, depths = extract_grid_coordinates(grid)
+    t = Tuple(loc)
+    i = max(1, min(t[1], length(lons)))
+    j = max(1, min(t[2], length(lats)))
+    k = max(1, min(t[3], length(depths)))
+    return (Float64(lons[i]), Float64(lats[j]), Float64(depths[k]))
+end
+
+"""
+    format_geographic_location(lon_deg::Real, lat_deg::Real, depth_m::Real) -> String
+
+Format longitude, latitude, and depth into a clear, unambiguous geographical string
+with cardinal direction suffixes (`°W`/`°E`, `°S`/`°N`).
+"""
+function format_geographic_location(lon_deg::Real, lat_deg::Real, depth_m::Real)
+    lon_abs = abs(round(Float64(lon_deg), digits = 2))
+    lat_abs = abs(round(Float64(lat_deg), digits = 2))
+    dep_val = round(Float64(depth_m), digits = 1)
+    lon_dir = lon_deg < 0 ? "°W" : "°E"
+    lat_dir = lat_deg < 0 ? "°S" : "°N"
+    return "$(lon_abs)$(lon_dir), $(lat_abs)$(lat_dir), $(dep_val)m"
 end
 
 function compute_advective_cfl(
@@ -345,28 +357,6 @@ function inspect_hydrodynamic_checkpoint(filepath::AbstractString)
     end
 end
 
-"""
-    velocity_peak_location(s::Simulation, loc) -> (lon, lat, depth)
-
-Geographic location of interior index `loc` in a simulation, for the divergence watchdog.
-
-Oceananigans no longer exposes per-cell metric objects on the grid (`grid.metrics.lon_metrics`
-was removed), so the coordinates come from `extract_grid_coordinates`, which is the accessor
-this package already uses everywhere else. It returns halo-stripped 1D vectors, matching the
-halo-stripped velocity interior the watchdog reduces over, so `loc` indexes them directly.
-
-Each index is clamped into range because a velocity interior that has been restricted to the
-footprint shared by `u` and `v` can be one element longer than a coordinate vector along an
-axis; clamping reports the nearest real cell rather than raising an out-of-bounds error while
-already handling a divergence.
-"""
-function velocity_peak_location(s, loc)
-    lons, lats, depths = extract_grid_coordinates(s.model.grid)
-    i = clamp(loc[1], 1, length(lons))
-    j = clamp(loc[2], 1, length(lats))
-    k = clamp(loc[3], 1, length(depths))
-    return (Float64(lons[i]), Float64(lats[j]), Float64(depths[k]))
-end
 
 """
     checkpoint_halos(f, data_size) -> NTuple{3,Int}
@@ -1248,7 +1238,7 @@ function setup_hydrodynamic_simulation(
         w_max, loc_w = findmax(abs, w_int)
         w_loc_txt = try
             lon_w, lat_w, dep_w = velocity_peak_location(s, loc_w)
-            " (at $(round(lon_w, digits=2))°E, $(round(lat_w, digits=2))°N, $(round(dep_w, digits=1))m)"
+            " (at $(format_geographic_location(lon_w, lat_w, dep_w)))"
         catch
             ""
         end
@@ -1374,20 +1364,19 @@ function setup_hydrodynamic_simulation(
             spd_max, loc = findmax(spd)
             if isnan(spd_max) || isinf(spd_max) || spd_max > divergence_velocity_limit
                 lon_loc, lat_loc, dep_loc = velocity_peak_location(s, loc)
+                loc_str = format_geographic_location(lon_loc, lat_loc, dep_loc)
                 error(
                     "Numerical divergence detected at iteration $(iteration(s)), " *
                     "time $(prettytime(s)). Velocity magnitude u_max = $(spd_max) m/s " *
-                    "(limit: $(divergence_velocity_limit) m/s) at " *
-                    "lon=$(round(lon_loc, digits=2)) lat=$(round(lat_loc, digits=2)) " *
-                    "depth=$(round(dep_loc, digits=1)) m."
+                    "(limit: $(divergence_velocity_limit) m/s) at $(loc_str)."
                 )
             elseif spd_max > 5.0 && (iteration(s) % 50 == 0)
                 lon_loc, lat_loc, dep_loc = velocity_peak_location(s, loc)
+                loc_str = format_geographic_location(lon_loc, lat_loc, dep_loc)
                 @warn(
                     "Elevated interior velocity magnitude: max(|u|,|v|) = " *
                     "$(round(spd_max, digits=2)) m/s at iteration $(iteration(s)) ($(prettytime(s))), " *
-                    "located at lon=$(round(lon_loc, digits=2)) lat=$(round(lat_loc, digits=2)) " *
-                    "depth=$(round(dep_loc, digits=1)) m."
+                    "located at $(loc_str)."
                 )
             end
         end
