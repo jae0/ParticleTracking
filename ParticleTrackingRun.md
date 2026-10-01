@@ -333,12 +333,44 @@ julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=work/snow
    prognostic state ($u, v, w, T, S, \eta$, clock) into
    `<checkpoint_dir>/<prefix>_iteration<N>.jld2`. With `cleanup_checkpoints = true`, only
    the newest file is retained, preventing storage exhaustion on long integrations.
+   On Windows platforms, file removal traps transient OS sharing locks (`EBUSY` / `IOError`)
+   with explicit garbage collection (`GC.gc()`), deferring removal across iterations rather
+   than crashing multi-day integrations.
 2. **Emergency checkpointing on interruption** — `run_hydrodynamic_simulation!` traps
    `InterruptException` (`Ctrl+C`, SLURM walltime) and flushes state before exiting cleanly.
 3. **Seamless resumption** — with `auto_restart = true` the runner inspects the diagnostic
    timeseries and checkpoint directory; if $t_{\text{last}} < t_{\text{stop}}$ it picks up
    from the newest checkpoint and appends new output without overwriting existing records.
    `--no-restart` / `--force-new` forces a fresh integration from $t=0$.
+
+---
+
+## Numerical Stability, Adaptive CFL & Boundary Forcing Assumptions
+
+### 1. Layer-Resolved Vertical Courant–Friedrichs–Lewy (CFL) Condition
+In vertically stretched coordinates (e.g. surface layer $\Delta z_1 \approx 10\text{ m}$ vs deep basin
+$\Delta z_k \approx 300\text{ m}$), evaluating the vertical advective Courant number against a single
+surface layer thickness $\min(\Delta z)$ introduces an artificial $30\times$ penalty for deep vertical
+velocities. The adaptive CFL controller evaluates layer-resolved vertical grid spacing:
+
+$$\text{CFL}_z = \max_{i, j, k} \left( \frac{|w_{i,j,k}| \Delta t}{\Delta z_k} \right)$$
+
+where $\Delta z_k = z_{F, k+1} - z_{F, k}$ is the true vertical grid spacing at vertical cell $k$.
+The overall 3D advective CFL number is computed as:
+
+$$\text{CFL} = \left( \max \frac{|u|}{\Delta x} + \max \frac{|v|}{\Delta y} + \max_{k} \frac{|w_k|}{\Delta z_k} \right) \Delta t \le \text{CFL}_{\text{target}}$$
+
+### 2. Barotropic Tidal Forcing vs Boundary Relaxation
+Astronomical tides are implemented as momentum body accelerations in the interior,
+and target velocity vectors in open boundary relaxation sponge layers:
+- **Interior Momentum Acceleration**: $\boldsymbol{F}_{\text{tide}} = (F_u, F_v)$ in $\text{m s}^{-2}$,
+  compensating bottom friction $r_{\text{drag}}$.
+- **Boundary Relaxation Forcing**: When utilizing `Oceananigans.BoundaryConditions.Relaxation`,
+  the target field is the tidal velocity vector $\boldsymbol{u}_{\text{target}} = (u_{\text{tide}}, v_{\text{tide}})$
+  in $\text{m s}^{-1}$, not the acceleration tendency.
+- **Selective Open Boundary Sponge Masking**: Sponge damping layers are applied strictly to open
+  ocean boundaries (e.g., `:east`, `:south`, `:west`), masking land-adjacent boundaries (e.g., `:north`)
+  to prevent artificial inflow generation and numerical boundary reflection.
 
 ```bash
 # Resume after interruption (default behaviour)

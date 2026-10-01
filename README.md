@@ -155,9 +155,16 @@ Before each run the fully resolved configuration is written to
 
 The `0.25` defaults are placeholders, not fitted values.
 
-**Vertical grid.** `vertical_stretching_mode = "two_segment"` splits the column at
-`vertical_break_depth`, giving a surface-refined upper segment and a coarse lower one, so the
-10–400 m active layer is resolved while the deep basin is still represented.
+**Vertical grid & adaptive CFL.** `vertical_stretching_mode = "two_segment"` splits the column at
+`vertical_break_depth`, giving a surface-refined upper segment (e.g. $\Delta z \approx 10\text{ m}$)
+and a coarse lower segment (e.g. $\Delta z \approx 300\text{ m}$). Adaptive CFL time stepping evaluates
+vertical stability locally across each layer ($\text{CFL}_z = \max_k [|w_k| \Delta t / \Delta z_k]$)
+to prevent artificial time step collapse from deep vertical motion.
+
+**Boundary forcing & sponge relaxation.** Interior astronomical tides are forced as momentum
+accelerations $\boldsymbol{F}_{\text{tide}}$ compensating bottom drag, while open boundary relaxation
+targets physical tidal velocity vectors $\boldsymbol{u}_{\text{target}}$ ($\text{m s}^{-1}$) across
+active ocean boundaries, with landward boundaries masked to avoid spurious wave reflection.
 
 ---
 

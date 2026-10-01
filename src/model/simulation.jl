@@ -473,10 +473,38 @@ function verify_checkpoint_compatibility(
     return is_compat
 end
 
-# Windows-safe checkpoint cleanup:
-# On Windows, recently accessed or written JLD2 archives may encounter sharing violations (EBUSY).
-# Rather than allowing an unhandled IOError to abort a multi-day simulation, we safely retry
-# after garbage collection and gracefully defer removal to subsequent checkpoint intervals.
+"""
+    Oceananigans.OutputWriters.cleanup_checkpoints(
+        checkpointer::Checkpointer
+    ) -> Nothing
+
+Prune older intermediate checkpoint files generated during time integration,
+retaining exclusively the latest written snapshot.
+
+# Algorithmic Strategy and Error Recovery
+Standard Unix file removal (`rm`) can fail on Windows filesystems when JLD2 file
+descriptors remain momentarily pinned by the OS kernel or memory-mapped buffers,
+throwing an `IOError` corresponding to an `EBUSY` sharing violation. 
+
+To prevent simulation aborts during multi-day model integrations, this method:
+1. Identifies all checkpoints matching `prefix*.jld2` in `checkpointer.dir`.
+2. Excludes `latest_checkpoint_filepath` from eviction.
+3. Attempts immediate deletion with `rm(filepath; force=true)`.
+4. Upon encountering an `IOError`, executes `GC.gc()` to force cleanup of dead
+   file handles and re-attempts deletion.
+5. If file locking persists, logs a warning and leaves the intermediate file
+   intact, deferring eviction to subsequent checkpoint periods.
+
+# Inputs
+- `checkpointer::Checkpointer`: Oceananigans checkpoint writer instance.
+
+# Outputs
+- `Nothing`.
+
+# References
+- Oceananigans.jl OutputWriters: https://clima.github.io/OceananigansDocumentation/
+- Julia Base Filesystem API: https://docs.julialang.org/en/v1/base/file/
+"""
 function Oceananigans.OutputWriters.cleanup_checkpoints(checkpointer::Checkpointer)
     prefix = Oceananigans.OutputWriters.checkpoint_superprefix(checkpointer.prefix)
     filepaths = Oceananigans.OutputWriters.glob(prefix * "*.jld2", checkpointer.dir)
