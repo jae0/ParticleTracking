@@ -1352,7 +1352,7 @@ function setup_hydrodynamic_simulation(
             end
             return nothing
         end
-        sim.callbacks[:wizard] = Callback(adapt_fn, IterationInterval(1))
+        sim.callbacks[:wizard] = Callback(adapt_fn, IterationInterval(5))
     end
 
     # 3. Numerical stability watchdog callback
@@ -1393,7 +1393,7 @@ function setup_hydrodynamic_simulation(
                 )
             end
         end
-        sim.callbacks[:watchdog] = Callback(stability_check, IterationInterval(10))
+        sim.callbacks[:watchdog] = Callback(stability_check, IterationInterval(50))
     end
 
     # 4. Field output writing
