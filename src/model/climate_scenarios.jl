@@ -199,6 +199,7 @@ function get_climate_scenario_deltas(
             "Historical / present-day climatological baseline"
         return (
             ΔT_surface = 0.0,
+            ΔT_cil = 0.0,
             ΔT_deep = 0.0,
             ΔS_surface = 0.0,
             Δwind_factor = 1.0,
@@ -207,6 +208,7 @@ function get_climate_scenario_deltas(
     elseif scenario == :ssp126
         return (
             ΔT_surface = 1.1 * time_factor,
+            ΔT_cil = 0.7 * time_factor,
             ΔT_deep = 0.5 * time_factor,
             ΔS_surface = -0.25 * time_factor,
             Δwind_factor = 1.0 + 0.05 * time_factor,
@@ -215,6 +217,7 @@ function get_climate_scenario_deltas(
     elseif scenario == :ssp245
         return (
             ΔT_surface = 1.8 * time_factor,
+            ΔT_cil = 1.2 * time_factor,
             ΔT_deep = 0.9 * time_factor,
             ΔS_surface = -0.45 * time_factor,
             Δwind_factor = 1.0 + 0.10 * time_factor,
@@ -223,6 +226,7 @@ function get_climate_scenario_deltas(
     elseif scenario == :ssp370
         return (
             ΔT_surface = 2.6 * time_factor,
+            ΔT_cil = 1.8 * time_factor,
             ΔT_deep = 1.4 * time_factor,
             ΔS_surface = -0.65 * time_factor,
             Δwind_factor = 1.0 + 0.15 * time_factor,
@@ -231,6 +235,7 @@ function get_climate_scenario_deltas(
     elseif scenario == :ssp585
         return (
             ΔT_surface = 3.5 * time_factor,
+            ΔT_cil = 2.4 * time_factor,
             ΔT_deep = 1.9 * time_factor,
             ΔS_surface = -0.85 * time_factor,
             Δwind_factor = 1.0 + 0.20 * time_factor,
@@ -239,6 +244,7 @@ function get_climate_scenario_deltas(
     elseif scenario == :marine_heatwave || scenario == :mhw
         return (
             ΔT_surface = 3.5,
+            ΔT_cil = 1.0,
             ΔT_deep = 0.2,
             ΔS_surface = -0.1,
             Δwind_factor = 0.8,
@@ -311,7 +317,8 @@ function apply_climate_scenario!(
     model;
     scenario::Symbol = :ssp245,
     year::Int = 2050,
-    mixed_layer_depth::Real = 30.0
+    cil_depth::Real = 75.0,
+    deep_depth::Real = 250.0
 )
     deltas = get_climate_scenario_deltas(scenario, year = year)
 
@@ -320,12 +327,26 @@ function apply_climate_scenario!(
     Tdata = Array(interior(model.tracers.T))
     Sdata = Array(interior(model.tracers.S))
 
-    # z is negative downward, so exp(z/h) decays from 1 at the surface towards 0 with depth.
     @inbounds for k in 1:base.Nz
         z = Float64(Oceananigans.Grids.znode(k, base, Center()))
-        weight = exp(z / Float64(mixed_layer_depth))
-        ΔT = deltas.ΔT_deep + (deltas.ΔT_surface - deltas.ΔT_deep) * weight
-        ΔS = deltas.ΔS_surface * weight
+        
+        # 3-Layer Vertical Stratification for the Scotian Shelf
+        if z >= -cil_depth
+            # Surface to Cold Intermediate Layer (CIL)
+            f = z / -cil_depth
+            ΔT = deltas.ΔT_surface * (1.0 - f) + deltas.ΔT_cil * f
+            ΔS = deltas.ΔS_surface * (1.0 - f)
+        elseif z >= -deep_depth
+            # CIL to Deep slope water
+            f = (z + cil_depth) / (-deep_depth + cil_depth)
+            ΔT = deltas.ΔT_cil * (1.0 - f) + deltas.ΔT_deep * f
+            ΔS = 0.0
+        else
+            # Below Deep boundary
+            ΔT = deltas.ΔT_deep
+            ΔS = 0.0
+        end
+
         Tdata[:, :, k] .+= ΔT
         Sdata[:, :, k] .+= ΔS
     end

@@ -371,7 +371,7 @@ function build_hydrodynamic_model(
     merged_forcing = isempty(forcing) ? composed_forcing : merge(forcing, NamedTuple(additions))
 
     eff_closure = closure !== nothing ? closure : closure_scheme
-    active_closure = if eff_closure === nothing
+    vertical_closure = if eff_closure === nothing
         VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = Float64(ν), κ = Float64(κ))
     elseif eff_closure isa Symbol
         eff_closure in (:nemotke, :catke, :tke) ? CATKEVerticalDiffusivity() :
@@ -379,6 +379,8 @@ function build_hydrodynamic_model(
     else
         eff_closure
     end
+    horizontal_closure = HorizontalScalarDiffusivity(ν = 100.0, κ = 100.0)
+    active_closure = (vertical_closure, horizontal_closure)
 
     kwargs = Dict{Symbol, Any}(
         :Δt => Float64(Δt),

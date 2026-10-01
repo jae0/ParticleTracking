@@ -959,6 +959,7 @@ function run_segment_climate(;
     deltas = get_climate_scenario_deltas(opts.scenario, year = opts.projection_year)
     println("Climate Scenario: $(deltas.description) [Year $(opts.projection_year)]")
     println("  Surface Temperature Anomaly: +$(round(deltas.ΔT_surface, digits=2)) °C")
+    println("  CIL Temperature Anomaly:     +$(round(deltas.ΔT_cil, digits=2)) °C")
     println("  Deep Temperature Anomaly:    +$(round(deltas.ΔT_deep, digits=2)) °C")
     println("  Surface Salinity Anomaly:    $(round(deltas.ΔS_surface, digits=2)) PSU")
     println("  Atmospheric Wind Factor:     x$(round(deltas.Δwind_factor, digits=2))")
@@ -977,11 +978,7 @@ function run_segment_climate(;
     mort_cold = larval_thermal_mortality_rate(t_cold)
     mort_warm = larval_thermal_mortality_rate(t_warm)
 
-    println("Snow Crab Larval Thermal Ecology:")
-    println("  Baseline (T = $(t_cold)°C): PLD = $(round(pld_cold, digits=1)) days, " *
-            "Mortality = $(round(mort_cold*100, digits=2)) %/day")
-    println("  Warmed   (T = $(round(t_warm, digits=1))°C): PLD = $(round(pld_warm, digits=1)) days, " *
-            "Mortality = $(round(mort_warm*100, digits=2)) %/day")
+    # (Snow Crab Larval Thermal Ecology printout removed as it is not relevant to hydrodynamics phase)
 
     return (
         deltas = deltas,

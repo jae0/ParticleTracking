@@ -216,8 +216,8 @@ sim_duration_hours = 2880.0           # 120 days
 sim_dt_seconds = 60.0               # Initial time step (seconds); adaptive limiter adjusts
                                      # dynamically using layer-resolved vertical Courant numbers.
 adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
-target_cfl = 0.35                   # Target advective CFL (0.35 is optimal for 3D WENO5)
-target_wave_cfl = 0.35              # Target wave CFL
+target_cfl = 0.70                   # Target advective CFL (0.70 is stable for 3D WENO5)
+target_wave_cfl = 0.70              # Target wave CFL
 max_dt_seconds = 300.0              # Maximum time step ceiling (seconds)
 min_dt_seconds = 1.0                # Minimum allowable time step floor (seconds)
 coriolis_latitude = 44.5            # Reference Coriolis latitude (°N)
