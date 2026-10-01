@@ -1965,6 +1965,47 @@ function read_wind_stress(filepath::AbstractString)
 end
 
 """
+    TimeSeriesSurfaceStress{N}
+
+Bitstype surface kinematic stress time-series evaluator for atmospheric boundary forcing.
+
+Evaluates surface kinematic wind stress \$\\tau(t)\$ from a discrete sequence of \$N\$ values
+spaced by `tstep` seconds over a cyclic period of `horizon` seconds:
+```math
+\\tau(t) = \\tau_{\\text{values}}[k], \\quad k = 1 + \\left\\lfloor \\frac{t \\pmod H}{\\Delta t} \\right\\rfloor
+```
+where \$H\$ is `horizon` and \$\\Delta t\$ is `tstep`.
+
+A concrete `isbits` struct is used rather than an anonymous closure so that the boundary
+condition lowers into GPU kernels without passing heap-allocated host array references
+or invalid device memory pointers.
+
+# Fields
+- `values::NTuple{N, Float64}`: Time-series stress values of length \$N\$.
+- `horizon::Float64`: Cyclic sequence period in seconds.
+- `tstep::Float64`: Time interval between consecutive samples in seconds.
+"""
+struct TimeSeriesSurfaceStress{N} <: Function
+    values::NTuple{N, Float64}
+    horizon::Float64
+    tstep::Float64
+end
+
+Adapt.adapt_structure(to, s::TimeSeriesSurfaceStress) = s
+
+@inline function (s::TimeSeriesSurfaceStress{N})(x, y, t) where {N}
+    if s.horizon <= 0.0 || N <= 1
+        return @inbounds s.values[1]
+    end
+    t_mod = mod(Float64(t), s.horizon)
+    k = Int(floor(t_mod / s.tstep)) + 1
+    k_idx = k > N ? 1 : (k < 1 ? 1 : k)
+    return @inbounds s.values[k_idx]
+end
+
+@inline (s::TimeSeriesSurfaceStress{N})(x, y, z, t) where {N} = s(x, y, t)
+
+"""
     build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
 
 Read a surface-wind file and return `(stress_x, stress_y, heat_flux)` callables on
@@ -2013,14 +2054,26 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
         at(k) = Float64(ta[1, 1, k])
         sp(k) = Float64(ps[1, 1, k])
         rhu(k) = Float64(rh[1, 1, k]) / 100
-        cf(k) = clamp(Float64(cc[1, 1, k]) / 100, 0.0, 1.0)
         swd(k) = Float64(sw[1, 1, k])
+
+        function cf(k)
+            c = Float64(cc[1, 1, k]) / 100.0
+            if c < 0.0 || c > 1.0
+                error("Cloud fraction $(c) at time index $(k) out of physical range [0, 1].")
+            end
+            return c
+        end
 
         tstep = nt > 1 ? (tvec[end] - tvec[1]) / (nt - 1) : 3600.0
         horizon = nt > 1 ? tvec[end] - tvec[1] : 3600.0
-        # The archive is shorter than most runs, so the sequence cycles.
-        kof(t) = horizon <= 0 ? 1 :
-                 clamp(Int(floor(mod(Float64(t), horizon) / tstep)) + 1, 1, nt)
+
+        function kof(t)
+            if horizon <= 0.0 || nt <= 1
+                return 1
+            end
+            k = Int(floor(mod(Float64(t), horizon) / tstep)) + 1
+            return k > nt ? 1 : (k < 1 ? 1 : k)
+        end
 
         sigma = 5.670374419e-8
         rho_a, cp_a, Lv = 1.225, 1005.0, 2.501e6
@@ -2046,9 +2099,12 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
             return sw_net - lw_net - sens - lat
         end
 
-        return ((x, y, t) -> Float64(tx[1, 1, kof(t)]),
-                (x, y, t) -> Float64(ty[1, 1, kof(t)]),
-                heat_flux)
+        tx_tuple = ntuple(k -> Float64(tx[1, 1, k]), nt)
+        ty_tuple = ntuple(k -> Float64(ty[1, 1, k]), nt)
+        stress_x = TimeSeriesSurfaceStress{nt}(tx_tuple, horizon, tstep)
+        stress_y = TimeSeriesSurfaceStress{nt}(ty_tuple, horizon, tstep)
+
+        return (stress_x, stress_y, heat_flux)
     finally
         close(ds)
     end

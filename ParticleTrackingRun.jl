@@ -112,6 +112,12 @@ Decoupled Hydrodynamics & Multi-Cohort Tracking:
   --checkpoints-dir=<dir> Custom directory for storing restart checkpoints.
   --run-id=<string>       Unique cohort run identifier for DuckDB persistence and figures.
 
+Tidal Forcing & External Datasets:
+  --tides                 Enable astronomical tidal velocity forcing (requires TPXO9 solution).
+  --no-tides              Disable tidal forcing (default when solution is absent).
+  --tides-source=<src>    Tidal forcing source ("tpxo9_atlas", "tpxo9", "analytic").
+  --fetch-tides           Download and extract the TPXO9 global tidal solution.
+
 Individual Segment Flags:
   --data                  Run environmental data ingestion (Segment 1).
   --grid                  Run grid and immersed boundary construction (Segment 2).
@@ -391,6 +397,19 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
         println("Using existing real surface winds file: $wind_file")
     end
 
+    if opts.enable_tides
+        src_str = lowercase(strip(String(opts.tides_source)))
+        if !(src_str in ("analytic", "synthetic", "none", "off", "false"))
+            tides_file = replace(data_source(:tides).cache, "<output_dir>" => opts.output_dir)
+            if !isfile(tides_file)
+                println("Retrieving tidal solution ($(opts.tides_source))...")
+                fetch_input(:tides, opts.output_dir)
+            else
+                println("Using existing real tidal solution file: $tides_file")
+            end
+        end
+    end
+
     # The stress is read back out of the file that was actually fetched. Deriving it from
     # hard-coded reference winds would make the fetch decorative: the numbers driving the
     # model would not come from the ingested product at all.
@@ -520,7 +539,8 @@ function run_segment_grid(;
     immersed_grid = build_immersed_grid_from_real_data(
         base_grid,
         target_bathy,
-        min_water_depth = 27.0
+        min_water_depth = abs(opts.inshore_depth),
+        mask_bay_of_fundy = opts.mask_bay_of_fundy
     )
 
     println("Grid summary:")
@@ -589,47 +609,57 @@ function run_segment_model(;
     # The atlas is read from this run's containerised inputs directory; see `fetch_input` and
     # the :tides entry in DATA_SOURCES for how to obtain it and what the alternatives are.
     tidal_forcing = if opts.enable_tides
-        tides_file = replace(data_source(:tides).cache, "<output_dir>" => opts.output_dir)
-        if !isfile(tides_file)
-            error(
-                "[hydrodynamics] enable_tides is true but the tidal solution is missing:\n" *
-                "  $(tides_file)\n" *
-                "Obtain it with `fetch_input(:tides, \"$(opts.output_dir)\")`, or set " *
-                "enable_tides = false. There is deliberately no fallback to a uniform " *
-                "body-force approximation: that was what made this configuration diverge, and " *
-                "a run that silently used a different tidal solution than its provenance " *
-                "file records is the failure this project is trying to prevent.")
+        src_str = lowercase(strip(String(opts.tides_source)))
+        if !(src_str in ("analytic", "synthetic", "none", "off", "false"))
+            tides_file = replace(data_source(:tides).cache, "<output_dir>" => opts.output_dir)
+            if !isfile(tides_file)
+                println("Tidal solution missing at $(tides_file); retrieving via fetch_input(:tides)...")
+                fetch_input(:tides, opts.output_dir)
+            end
+            if !isfile(tides_file)
+                error(
+                    "[hydrodynamics] enable_tides is true and tides_source is '$(opts.tides_source)', " *
+                    "but the tidal solution could not be retrieved:\n" *
+                    "  $(tides_file)\n" *
+                    "Obtain it with `fetch_input(:tides, \"$(opts.output_dir)\")` or `--fetch-tides`, " *
+                    "or set enable_tides = false (or pass `--no-tides`). There is deliberately no fallback to a " *
+                    "uniform body-force approximation: that was what made this configuration diverge, " *
+                    "and a run that silently used a different tidal solution than its provenance " *
+                    "file records is the failure this project is trying to prevent.")
+            end
+            # Honour `[tides] constituents`. An empty list in a config that disables tides is not an
+            # error; it simply means no constituents were requested, and the branch that reads
+            # harmonics is not reached.
+            cons = opts.tidal_constituents
+            println("Reading tidal harmonics from $(basename(tides_file)) " *
+                    "(constituents: $(join(cons, ", ")))...")
+            h = read_tidal_velocity_harmonics(
+                tides_file;
+                constituents = cons,
+                lon_range = opts.domain_lon,
+                lat_range = opts.domain_lat,
+            )
+            # The forcing is reduced to a small `isbits` coefficient grid BEFORE it reaches the
+            # model. A closure that searches the atlas arrays at call time is not GPU-safe and
+            # fails to compile in gpu_compute_hydrostatic_free_surface_Gu!.
+            # Grid size is bounded by GPU kernel *parameter* memory: the coefficient tuple is
+            # passed by value into every invocation, so 16x12x2x4 doubles (12 KB) is rejected
+            # with "Kernel invocation uses too much parameter memory". 6x4 gives 192 doubles
+            # (~1.5 KB), which fits comfortably. The tidal field varies on scales of degrees and
+            # the domain is ~18 deg across, so 3 deg spacing still resolves the 0.007 m/s southern
+            # boundary from the 0.45 m/s Fundy -- the contrast that caused the original blowup.
+            coeff = TidalCoefficientGrid(h, (opts.domain_lon[1], opts.domain_lon[2]),
+                                         (opts.domain_lat[1], opts.domain_lat[2]);
+                                         nx = 6, ny = 4)
+            f = tidal_velocity_coefficients(coeff)
+            edge = boundary_tidal_forcing(h; edges = (:east, :south, :west), sample_stride = 4)
+            amps = vcat(edge[:east].uamp[1, :], edge[:south].uamp[1, :], edge[:west].uamp[1, :])
+            println("  M2 boundary speed amplitude: ", round(minimum(amps), digits = 4), " - ",
+                    round(maximum(amps), digits = 4), " m/s")
+            f
+        else
+            nothing
         end
-        # Honour `[tides] constituents`. An empty list in a config that disables tides is not an
-        # error; it simply means no constituents were requested, and the branch that reads
-        # harmonics is not reached.
-        cons = opts.tidal_constituents
-        println("Reading tidal harmonics from $(basename(tides_file)) " *
-                "(constituents: $(join(cons, ", ")))...")
-        h = read_tidal_velocity_harmonics(
-            tides_file;
-            constituents = cons,
-            lon_range = opts.domain_lon,
-            lat_range = opts.domain_lat,
-        )
-        # The forcing is reduced to a small `isbits` coefficient grid BEFORE it reaches the
-        # model. A closure that searches the atlas arrays at call time is not GPU-safe and
-        # fails to compile in gpu_compute_hydrostatic_free_surface_Gu!.
-        # Grid size is bounded by GPU kernel *parameter* memory: the coefficient tuple is
-        # passed by value into every invocation, so 16x12x2x4 doubles (12 KB) is rejected
-        # with "Kernel invocation uses too much parameter memory". 6x4 gives 192 doubles
-        # (~1.5 KB), which fits comfortably. The tidal field varies on scales of degrees and
-        # the domain is ~18 deg across, so 3 deg spacing still resolves the 0.007 m/s southern
-        # boundary from the 0.45 m/s Fundy -- the contrast that caused the original blowup.
-        coeff = TidalCoefficientGrid(h, (opts.domain_lon[1], opts.domain_lon[2]),
-                                     (opts.domain_lat[1], opts.domain_lat[2]);
-                                     nx = 6, ny = 4)
-        f = tidal_forcing_coefficients(coeff)
-        edge = boundary_tidal_forcing(h; edges = (:east, :south, :west), sample_stride = 4)
-        amps = vcat(edge[:east].uamp[1, :], edge[:south].uamp[1, :], edge[:west].uamp[1, :])
-        println("  M2 boundary speed amplitude: ", round(minimum(amps), digits = 4), " - ",
-                round(maximum(amps), digits = 4), " m/s")
-        f
     else
         nothing
     end
@@ -793,7 +823,9 @@ end
         κ = 1e-2,
         tracers = (:T, :S),
         lon_range = opts.domain_lon,
-        lat_range = opts.domain_lat
+        lat_range = opts.domain_lat,
+        mask_bay_of_fundy = opts.mask_bay_of_fundy,
+        active_boundaries = (:east, :south, :west)
     )
 
     # Initial thermal and haline stratification.
@@ -2774,6 +2806,21 @@ function main(args = ARGS)
     # `configuration_to_options` so both the library and the driver see it.
     base_opts = configuration_to_options(cfg)
 
+    if any(a -> a == "--fetch-tides" || a == "--fetch-tide", args)
+        target_dir = base_opts.output_dir
+        for a in args
+            if startswith(a, "--output-dir=")
+                target_dir = String(split(a, "=", limit = 2)[2])
+            elseif startswith(a, "-o=")
+                target_dir = String(split(a, "=", limit = 2)[2])
+            end
+        end
+        println("Fetching TPXO9 tidal solution into $(target_dir)...")
+        p = fetch_input(:tides, target_dir)
+        println("Tidal solution successfully verified at: $(p)")
+        return
+    end
+
     lon_range = base_opts.domain_lon
     lat_range = base_opts.domain_lat
     depth_range = base_opts.domain_z
@@ -2788,6 +2835,7 @@ function main(args = ARGS)
     vertical_depths = base_opts.vertical_depths
     inshore_depth = base_opts.inshore_depth
     shelf_slope = base_opts.shelf_slope
+    mask_bay_of_fundy = base_opts.mask_bay_of_fundy
     enable_tides = base_opts.enable_tides
     tidal_u = Float64(base_opts.tidal_u_amp)
     tidal_v = Float64(base_opts.tidal_v_amp)
@@ -2943,6 +2991,13 @@ function main(args = ARGS)
         enable_tides = true
     elseif "--no-tides" in args
         enable_tides = false
+    end
+    for a in args
+        if startswith(a, "--tides-source=")
+            tides_source = strip(String(split(a, "=", limit = 2)[2]))
+        elseif startswith(a, "--tide-source=")
+            tides_source = strip(String(split(a, "=", limit = 2)[2]))
+        end
     end
     if "--adaptive-cfl" in args
         adaptive_cfl = true
@@ -3122,6 +3177,10 @@ function main(args = ARGS)
             obc_src = Symbol(split(a, "=")[2])
         elseif startswith(a, "--obc-type=")
             obc_tp = Symbol(split(a, "=")[2])
+        elseif a == "--mask-bay-of-fundy" || a == "--mask-fundy"
+            mask_bay_of_fundy = true
+        elseif a == "--no-mask-bay-of-fundy" || a == "--no-mask-fundy"
+            mask_bay_of_fundy = false
         elseif startswith(a, "--seed=")
             seed = parse(Int, split(a, "=")[2])
         elseif startswith(a, "--voronoi-units=") || startswith(a, "--n-units=")
@@ -3187,6 +3246,7 @@ function main(args = ARGS)
         vertical_depths = vertical_depths,
         inshore_depth = inshore_depth,
         shelf_slope = shelf_slope,
+        mask_bay_of_fundy = mask_bay_of_fundy,
         enable_tides = enable_tides,
         tidal_u_amp = tidal_u,
         tidal_v_amp = tidal_v,

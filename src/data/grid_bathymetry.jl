@@ -1439,12 +1439,74 @@ end
 
 
 """
+    is_in_bay_of_fundy(lon::Real, lat::Real) -> Bool
+
+Determine whether geographic coordinates `(lon, lat)` in degrees East and North fall
+within the hypertidal Bay of Fundy, Minas Basin, or Chignecto Bay exclusion zone.
+
+# Mathematical & Geographic Formulation
+The Bay of Fundy is a semi-enclosed macro-tidal funnel characterized by near-resonant
+semi-diurnal tidal amplification (\$M_2\$ period \$\\approx 12.42\\text{ h}\$, natural basin
+period \$\\approx 13\\text{ h}\$, Greenberg 1979; Garrett 1972). In regional shelf
+simulations focused on offshore species (e.g. snow crab *Chionoecetes opilio*, which
+exclusively inhabit depths of 50 to 350 m and benthic temperatures below 6 °C), resolving
+active hydrodynamics in the hypertidal shallows creates severe vertical Courant number
+penalties (\$\\text{CFL}_z = |w| \\Delta t / \\Delta z_{\\min}\$) due to staircased immersed
+boundaries in 10-20 m water depth.
+
+The exclusion boundary isolates the embayment northwest of the Nova Scotia peninsula:
+```math
+\\mathcal{D}_{\\text{Fundy}} = \\left\\{ (\\lambda, \\phi) \\in [-67.3, -64.0] \\times [44.4, 46.0] \\mid 
+\\phi > 44.4, \\; \\lambda \\le \\Lambda_{\\text{east}}(\\phi) \\right\\}
+```
+where the eastern terrestrial constraint \$\\Lambda_{\\text{east}}(\\phi)\$ prevents intrusion
+onto the Atlantic South Shore of Nova Scotia (Mahone Bay, St. Margarets Bay) or the
+Northumberland Strait across the Isthmus of Chignecto:
+- \$\\Lambda_{\\text{east}}(\\phi) = -65.6^\\circ\\text{E}\$ for \$\\phi \\le 44.8^\\circ\\text{N}\$
+- \$\\Lambda_{\\text{east}}(\\phi) = -65.2^\\circ\\text{E}\$ for \$44.8^\\circ\\text{N} < \\phi \\le 45.1^\\circ\\text{N}\$
+- \$\\Lambda_{\\text{east}}(\\phi) = -64.2^\\circ\\text{E}\$ for \$\\phi \\ge 45.7^\\circ\\text{N}\$
+
+# Inputs
+- `lon::Real`: Longitude in degrees East (e.g., -65.5).
+- `lat::Real`: Latitude in degrees North (e.g., 45.2).
+
+# Outputs
+- `Bool`: `true` if coordinates lie inside the Bay of Fundy exclusion zone, `false` otherwise.
+
+# References
+- Garrett, C. (1972). Tidal resonance in the Bay of Fundy and Gulf of Maine.
+  *Nature*, 238(5365), 441-443.
+- Greenberg, D. A. (1979). A numerical model investigation of tidal phenomena in the Bay of
+  Fundy and Gulf of Maine. *Marine Geodesy*, 2(2), 161-187.
+"""
+@inline function is_in_bay_of_fundy(lon::Real, lat::Real)::Bool
+    if lat < 44.4 || lat > 46.0
+        return false
+    end
+    if lon < -67.3 || lon > -64.0
+        return false
+    end
+    if lat <= 44.8 && lon > -65.6
+        return false
+    end
+    if lat <= 45.1 && lon > -65.2
+        return false
+    end
+    if lat >= 45.7 && lon > -64.2
+        return false
+    end
+    return true
+end
+
+"""
     build_immersed_grid_from_real_data(
         grid::LatitudeLongitudeGrid,
         bathymetry_filepath::AbstractString;
         varname::Union{Nothing, AbstractString} = nothing,
         lon_var::Union{Nothing, AbstractString} = nothing,
-        lat_var::Union{Nothing, AbstractString} = nothing
+        lat_var::Union{Nothing, AbstractString} = nothing,
+        min_water_depth::Real = 10.0,
+        mask_bay_of_fundy::Bool = false
     )
 
 Construct an `ImmersedBoundaryGrid` by interpolating real-world bathymetry
@@ -1453,8 +1515,8 @@ Construct an `ImmersedBoundaryGrid` by interpolating real-world bathymetry
 # Mathematical Formulation
 Extracts continuous coordinates \$\\lambda_{\\text{raw}}, \\phi_{\\text{raw}}\$ and
 seafloor elevations \$z_{\\text{raw}}\$, applies 2D bilinear regridding onto model
-target cells \$\\lambda_{\\text{grid}}, \\phi_{\\text{grid}}\$, and constructs the
-immersed boundary.
+target cells \$\\lambda_{\\text{grid}}, \\phi_{\\text{grid}}\$, applies regional masking
+if enabled, and constructs the immersed boundary.
 
 # Inputs
 - `grid::LatitudeLongitudeGrid`: Target Oceananigans computational grid.
@@ -1463,6 +1525,8 @@ immersed boundary.
 - `lon_var::Union{Nothing, String}`: Longitude variable name (auto-detects if nothing).
 - `lat_var::Union{Nothing, String}`: Latitude variable name (auto-detects if nothing).
 - `min_water_depth::Real`: Minimum depth floor in meters for wet coastal water columns (default 10.0m).
+- `mask_bay_of_fundy::Bool`: Mask Bay of Fundy shallows to solid land (0.0 m) to prevent
+  hypertidal resonance and small time steps (default false).
 
 # Outputs
 - `ImmersedBoundaryGrid`: Computational grid containing the interpolated real seafloor.
@@ -1479,7 +1543,8 @@ function build_immersed_grid_from_real_data(
     varname::Union{Nothing, AbstractString} = nothing,
     lon_var::Union{Nothing, AbstractString} = nothing,
     lat_var::Union{Nothing, AbstractString} = nothing,
-    min_water_depth::Real = 10.0
+    min_water_depth::Real = 10.0,
+    mask_bay_of_fundy::Bool = false
 )
     if !isfile(bathymetry_filepath)
         error("Real bathymetry file not found: $(bathymetry_filepath)")
@@ -1553,6 +1618,17 @@ function build_immersed_grid_from_real_data(
     regridded_topo = regrid_2d_field(raw_lon, raw_lat, raw_elevation,
                                      target_lons, target_lats)
 
+    if mask_bay_of_fundy
+        n_masked = 0
+        for j in 1:ny, i in 1:nx
+            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
+                regridded_topo[i, j] = 0.0
+                n_masked += 1
+            end
+        end
+        @info "Bay of Fundy masking active: set $(n_masked) cells to solid land (0.0 m)."
+    end
+
     # Condition bathymetry: level emerged land to 0.0, floor shallow wet cells,
     # and apply conservative Laplacian smoothing on wet cells to eliminate subgrid 2Δx
     # pinnacles and single-cell shelf-edge cliffs while preserving land masks
@@ -1563,6 +1639,14 @@ function build_immersed_grid_from_real_data(
         alpha = 0.5,
         h_min = h_floor
     )
+
+    if mask_bay_of_fundy
+        for j in 1:ny, i in 1:nx
+            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
+                conditioned_topo[i, j] = 0.0
+            end
+        end
+    end
 
     return build_immersed_grid(grid, conditioned_topo)
 end
@@ -1606,9 +1690,9 @@ function extract_grid_coordinates(grid)
         )
     end
 
-    # Geographic horizontal coordinates (degrees), halo region stripped.
-    lons = collect(Float64, cpu_g.λᶜᵃᵃ)[cpu_g.Hx+1 : cpu_g.Hx+nx]
-    lats = collect(Float64, cpu_g.φᵃᶜᵃ)[cpu_g.Hy+1 : cpu_g.Hy+ny]
+    # Geographic horizontal coordinates (degrees), halo region stripped (interior indices 1:nx, 1:ny).
+    lons = [Float64(cpu_g.λᶜᵃᵃ[i]) for i in 1:nx]
+    lats = [Float64(cpu_g.φᵃᶜᵃ[j]) for j in 1:ny]
 
     # Vertical coordinate (metres) is genuinely metric, so `znode` is appropriate.
     depths = [Float64(Oceananigans.Grids.znode(k, cpu_g, Oceananigans.Grids.Center()))

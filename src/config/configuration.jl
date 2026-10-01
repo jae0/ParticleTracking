@@ -410,6 +410,7 @@ struct HydrodynamicOptions
     cv_molt                  :: Float64  # coefficient of variation for molt thresholds (default 0.25)
     cv_mortality             :: Float64  # coefficient of variation for mortality (default 0.25)
     cv_settlement            :: Float64  # coefficient of variation for settlement HSI (default 0.25)
+    mask_bay_of_fundy        :: Bool     # whether Bay of Fundy shallows are masked to land
 end
 
 function HydrodynamicOptions(;
@@ -523,7 +524,8 @@ function HydrodynamicOptions(;
     settlement_stochastic    :: Bool = true,
     cv_molt                  :: Real = 0.25,
     cv_mortality             :: Real = 0.25,
-    cv_settlement            :: Real = 0.25
+    cv_settlement            :: Real = 0.25,
+    mask_bay_of_fundy        :: Bool = false
 )
     resolved_cp_prefix = if !isempty(strip(checkpoint_prefix)) && checkpoint_prefix != "checkpoint"
         String(checkpoint_prefix)
@@ -649,7 +651,8 @@ function HydrodynamicOptions(;
         settlement_stochastic,
         Float64(cv_molt),
         Float64(cv_mortality),
-        Float64(cv_settlement)
+        Float64(cv_settlement),
+        mask_bay_of_fundy
     )
 end
 
@@ -924,6 +927,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # from here rather than hardcoded, so a config can actually shape its own seabed.
     inshore_depth = Float64(get_val("bathymetry", "inshore_depth", -20.0))
     shelf_slope   = Float64(get_val("bathymetry", "shelf_slope", 500.0))
+    mask_bay_of_fundy = Bool(get_val("bathymetry", "mask_bay_of_fundy", false))
 
     # Tidal body forcing. `constituents` is an empty list in a config that disables tides, so
     # an empty read is not an error; it simply means no constituents were requested.
@@ -1110,7 +1114,11 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         v_file = dst
     end
     atmo_src = Symbol(lowercase(String(get_val("atmosphere", "forcing", "era5_climatology"))))
-    obc_src = Symbol(lowercase(String(get_val("boundaries", "ocean_boundary_source", "glorys12v1"))))
+    obc_src_val = get_val("boundaries", "ocean_boundary_source", nothing)
+    if isnothing(obc_src_val)
+        obc_src_val = get_val("boundaries", "parent_ocean", "glorys12v1")
+    end
+    obc_src = Symbol(lowercase(String(obc_src_val)))
     obc_tp = Symbol(lowercase(String(get_val("boundaries", "obc_type", "flather_chapman"))))
 
     # Initial 3-D hydrography (T, S). Read from `[data]`, independent of the
@@ -1263,6 +1271,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         cv_molt = cv_molt,
         cv_mortality = cv_mortality,
         cv_settlement = cv_settlement,
+        mask_bay_of_fundy = mask_bay_of_fundy,
         overrides...
     )
 end
@@ -1316,7 +1325,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "bathymetry" => Dict{String, Any}(
             "inshore_depth" => opts.inshore_depth,
-            "shelf_slope" => opts.shelf_slope
+            "shelf_slope" => opts.shelf_slope,
+            "mask_bay_of_fundy" => opts.mask_bay_of_fundy
         ),
         "tides" => Dict{String, Any}(
             "enable_tides" => opts.enable_tides,
@@ -1571,6 +1581,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :wind_time_iso             => opts.wind_time_iso,
         :inshore_depth            => opts.inshore_depth,
         :shelf_slope              => opts.shelf_slope,
+        :mask_bay_of_fundy        => opts.mask_bay_of_fundy,
         :atmospheric_source       => opts.atmospheric_source,
         :drag_formulation         => :garratt_1977,
         :bulk_heat_flux           => true,

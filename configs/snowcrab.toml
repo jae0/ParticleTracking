@@ -111,6 +111,10 @@ ingest_library = "numerical_earth"      # Use NumericalEarth.jl for ingestion an
 resolution_arcsec = 15          # 15 arc-second resolution (~500 m at mid-latitudes)
 inshore_depth = -20.0           # Coastal boundary depth (meters)
 shelf_slope = 500.0             # Bathymetric continental slope scale (meters)
+mask_bay_of_fundy = true        # Mask hypertidal Bay of Fundy shallows to solid land (0.0 m)
+                                # to eliminate spurious vertical velocities (w ~ 1.3 m/s) and
+                                # unlock large adaptive time steps (dt ~ 30-60 s). Snow crab
+                                # inhabit 50-350 m shelf waters and do not enter the bay.
 
 [atmosphere]
 # What the weather does to the sea surface: wind stirring it, sunlight warming it, and the
@@ -138,8 +142,10 @@ drag_formulation = "garratt_1977"  # How strongly the wind drags on the surface;
 # doing just outside those lines. The band next to each edge is eased back toward those
 # outside conditions over about an hour, so the middle of the domain stays free to do its own
 # thing.
-parent_ocean = "glorys_climatology"     # Long-term monthly ocean climatology
-ocean_boundary_source = "glorys12v1"    # A real global reconstruction at about 9 km resolution
+# Lateral boundary hydrography source: "glorys12v1" (Copernicus Marine 1/12° reanalysis),
+# "woa23" (NOAA climatology), or "synthetic" (unconstrained).
+# `parent_ocean` is supported as an alias for `ocean_boundary_source`.
+ocean_boundary_source = "glorys12v1"    # Global reanalysis subset via Copernicus Marine (~9 km)
 # This is the one input in this file that needs an account. GLORYS12V1 comes from Copernicus
 # Marine, which is free but asks you to register, and then read a username and key from
 # ~/.copernicusmarine/credentials. Without that file the download is refused and the run
@@ -174,6 +180,10 @@ embedding_lat_max = 48.5         # Northern edge
 # Atlantic. The alternative ("analytic") builds the tides from the amplitude numbers below
 # instead, with nothing downloaded and the same tide everywhere in the domain -- fine for
 # checking the machinery, not for a realistic tide.
+# Tidal forcing switch. When true, the TPXO9 global harmonic velocity solution
+# (u_tpxo9.v1.nc) is retrieved automatically into inputs/tpxo9/ via HTTP range stream.
+# Set false to disable tidal forcing.
+enable_tides = true
 tides_source = "tpxo9_atlas"
 # The two tides that together make the spring-neap cycle: M2 and S2 each arrive about twice
 # a day, and the two line up roughly every two weeks to give the biggest tides ("springs")
@@ -203,21 +213,13 @@ bbl_mixing_closure = "tke"          # Benthic boundary layer turbulent kinetic e
 [hydrodynamics]
 # Multi-year climatological simulation (2 years = 17,520 hours)
 sim_duration_hours = 2880.0           # 120 days
-sim_dt_seconds = 180.0              # Initial time step (seconds); the adaptive limiter will
-                                     # reduce this. The CFL now uses the SMALLEST vertical cell
-                                     # (~10 m), so expect ~2 s in practice, not 180 s.
+sim_dt_seconds = 60.0               # Initial time step (seconds); adaptive limiter adjusts
+                                     # dynamically using layer-resolved vertical Courant numbers.
 adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
-target_cfl = 0.20                   # Conservative target advective CFL
-target_wave_cfl = 0.20              # Target wave CFL
+target_cfl = 0.35                   # Target advective CFL (0.35 is optimal for 3D WENO5)
+target_wave_cfl = 0.35              # Target wave CFL
 max_dt_seconds = 300.0              # Maximum time step ceiling (seconds)
-min_dt_seconds = 1.0                # Minimum allowable time step (seconds).
-                                     # Must be below the CFL-limited step for the SURFACE cell,
-                                     # which is the binding constraint: dt ~= target_cfl * dz_min / w.
-                                     # For dz_min = 10 m, target_cfl = 0.2 and w ~ 1 m/s that is
-                                     # ~2.0 s, so a floor of 2.0 s left no headroom and the
-                                     # wizard could not stabilise the surface layer. A run that
-                                     # diverged at max(|u|) = 7.6 m/s did so because the floor
-                                     # clamped the step the wizard actually needed.
+min_dt_seconds = 1.0                # Minimum allowable time step floor (seconds)
 coriolis_latitude = 44.5            # Reference Coriolis latitude (°N)
 divergence_velocity_limit = 20.0    # Stability watchdog threshold (m/s)
 surface_heat_flux = 50.0            # Summer net surface heat flux (W/m²)

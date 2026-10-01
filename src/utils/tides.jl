@@ -506,8 +506,8 @@ function tidal_velocity_at(h::TidalVelocityHarmonics, i::Int, j::Int, t::Real)
     for k in eachindex(h.constituents)
         c = cos(h.omega[k] * t)
         s = sin(h.omega[k] * t)
-        u += h.uRe[k, j, i] * c - h.uIm[k, j, i] * s
-        v += h.vRe[k, j, i] * c - h.vIm[k, j, i] * s
+        u += h.uRe[k, j, i] * c + h.uIm[k, j, i] * s
+        v += h.vRe[k, j, i] * c + h.vIm[k, j, i] * s
     end
     return (u, v)
 end
@@ -1080,12 +1080,10 @@ function tidal_forcing_coefficients(g::TidalCoefficientGrid{N, NX, NY}) where {N
                  at(g.uRe, k, i, j + 1) * c + at(g.uRe, k, i + 1, j + 1) * d
             im = at(g.uIm, k, i, j) * a + at(g.uIm, k, i + 1, j) * b +
                  at(g.uIm, k, i, j + 1) * c + at(g.uIm, k, i + 1, j + 1) * d
-            # This is a MOMENTUM TENDENCY, not a velocity, and the factor of omega is what
-            # makes it one. d/dt [Re cos(wt) - Im sin(wt)] = -w Re sin(wt) - w Im cos(wt).
-            # Omitting it injects an acceleration a factor of omega (about 7e3) too large, which
-            # diverges within a handful of iterations.
+            # Momentum tendency (m/s^2):
+            # d/dt [Re cos(wt) + Im sin(wt)] = -w Re sin(wt) + w Im cos(wt)
             w = g.omega[k]
-            s += -w * (re * sin(w * t) + im * cos(w * t))
+            s += w * (-re * sin(w * t) + im * cos(w * t))
         end
         s
     end
@@ -1101,12 +1099,80 @@ function tidal_forcing_coefficients(g::TidalCoefficientGrid{N, NX, NY}) where {N
             im = at(g.vIm, k, i, j) * a + at(g.vIm, k, i + 1, j) * b +
                  at(g.vIm, k, i, j + 1) * c + at(g.vIm, k, i + 1, j + 1) * d
             w = g.omega[k]
-            s += -w * (re * sin(w * t) + im * cos(w * t))
+            s += w * (-re * sin(w * t) + im * cos(w * t))
         end
         s
     end
 
     return (u = u_f, v = v_f)
+end
+
+"""
+    tidal_velocity_coefficients(g::TidalCoefficientGrid) -> (u = f, v = g)
+
+Build `(x, y, z, t)` tidal velocity reconstruction functions in **metres per second** (\$m s^{-1}\$)
+from a [`TidalCoefficientGrid`](@ref) for use as relaxation targets in `Relaxation`.
+
+Reconstructs the harmonic velocity field with Greenwich phase lag:
+```math
+u(x, y, t) = \\sum_k \\left[ \\text{uRe}_k(x, y) \\cos(\\omega_k t) + \\text{uIm}_k(x, y) \\sin(\\omega_k t) \\right]
+```
+where \$\\text{uRe} = A_u \\cos g_u\$ and \$\\text{uIm} = A_u \\sin g_u\$, identically evaluating
+\$A_u \\cos(\\omega_k t - g_u)\$.
+
+Contains no allocations, searches, or non-isbits captures on the evaluation path,
+compiling natively into GPU free-surface kernels. Coordinates outside the grid return `0.0`.
+"""
+function tidal_velocity_coefficients(g::TidalCoefficientGrid{N, NX, NY}) where {N, NX, NY}
+    @inline at(A, k, i, j) = @inbounds A[k + N * ((j - 1) + g.ny * (i - 1))]
+
+    @inline function locate(x, y)
+        fx = (x - g.lon0) / g.dlon
+        fy = (y - g.lat0) / g.dlat
+        (fx < 0 || fy < 0 || fx > NX - 1 || fy > NY - 1) && return (0, 0, 0.0, 0.0)
+        i = clamp(floor(Int, fx) + 1, 1, NX - 1)
+        j = clamp(floor(Int, fy) + 1, 1, NY - 1)
+        return (i, j, fx - floor(fx), fy - floor(fy))
+    end
+
+    @inline w00(tx, ty) = (1 - tx) * (1 - ty)
+    @inline w10(tx, ty) = tx * (1 - ty)
+    @inline w01(tx, ty) = (1 - tx) * ty
+    @inline w11(tx, ty) = tx * ty
+
+    u_vel = @inline (x, y, z, t) -> begin
+        (i, j, tx, ty) = locate(x, y)
+        i == 0 && return 0.0
+        (a, b, c, d) = (w00(tx, ty), w10(tx, ty), w01(tx, ty), w11(tx, ty))
+        s = 0.0
+        for k in 1:N
+            re = at(g.uRe, k, i, j) * a + at(g.uRe, k, i + 1, j) * b +
+                 at(g.uRe, k, i, j + 1) * c + at(g.uRe, k, i + 1, j + 1) * d
+            im = at(g.uIm, k, i, j) * a + at(g.uIm, k, i + 1, j) * b +
+                 at(g.uIm, k, i, j + 1) * c + at(g.uIm, k, i + 1, j + 1) * d
+            w = g.omega[k]
+            s += re * cos(w * t) + im * sin(w * t)
+        end
+        s
+    end
+
+    v_vel = @inline (x, y, z, t) -> begin
+        (i, j, tx, ty) = locate(x, y)
+        i == 0 && return 0.0
+        (a, b, c, d) = (w00(tx, ty), w10(tx, ty), w01(tx, ty), w11(tx, ty))
+        s = 0.0
+        for k in 1:N
+            re = at(g.vRe, k, i, j) * a + at(g.vRe, k, i + 1, j) * b +
+                 at(g.vRe, k, i, j + 1) * c + at(g.vRe, k, i + 1, j + 1) * d
+            im = at(g.vIm, k, i, j) * a + at(g.vIm, k, i + 1, j) * b +
+                 at(g.vIm, k, i, j + 1) * c + at(g.vIm, k, i + 1, j + 1) * d
+            w = g.omega[k]
+            s += re * cos(w * t) + im * sin(w * t)
+        end
+        s
+    end
+
+    return (u = u_vel, v = v_vel)
 end
 
 """

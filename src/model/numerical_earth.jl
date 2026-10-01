@@ -14,6 +14,7 @@ using Dates
 using Statistics
 using LinearAlgebra
 using NCDatasets
+using NumericalEarth: regrid_bathymetry
 
 module DataWrangling
 
@@ -992,8 +993,7 @@ end
 
 end # module DataWrangling
 
-import .DataWrangling: regrid_bathymetry,
-                      load_regional_bathymetry,
+import .DataWrangling: load_regional_bathymetry,
                       get_bathymetry_interpolator,
                       OpenBoundaryConditions,
                       AtmosphericForcing,

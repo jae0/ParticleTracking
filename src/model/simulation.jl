@@ -18,6 +18,18 @@ using Oceananigans.Utils: prettytime
 using Oceananigans.OutputWriters: JLD2Writer, Checkpointer, checkpoint
 import Oceananigans.OutputWriters: cleanup_checkpoints
 using JLD2
+import OffsetArrays
+
+"""
+    to_cpu_offset_array(x)
+
+Safely transfer an array (including GPU `OffsetArray` / `CuArray`) to host memory as a
+standard CPU array while preserving index axes and avoiding disallowed GPU scalar indexing.
+"""
+to_cpu_offset_array(x::OffsetArrays.OffsetArray) =
+    OffsetArrays.OffsetArray(Array(parent(x)), axes(x))
+to_cpu_offset_array(x::AbstractArray) = Array(x)
+to_cpu_offset_array(x) = x
 
 # Import domain constants for fallback coordinate generation
 
@@ -75,6 +87,27 @@ function min_vertical_spacing(base_g)
     return Float64(base_g.Lz) / base_g.Nz
 end
 
+"""
+    velocity_peak_location(sim, cart_idx::CartesianIndex) -> Tuple{Float64, Float64, Float64}
+
+Extract geographical (longitude, latitude, depth in meters) coordinates of a field index
+from the simulation grid for localized diagnostic reporting.
+"""
+function velocity_peak_location(sim, cart_idx::CartesianIndex)
+    base_g = sim.model.grid isa ImmersedBoundaryGrid ?
+             sim.model.grid.underlying_grid : sim.model.grid
+    i, j, k = Tuple(cart_idx)
+    lon_val = Float64(base_g.λᶠᵃᵃ[min(i, base_g.Nx + 1)])
+    lat_val = Float64(base_g.φᵃᶠᵃ[min(j, base_g.Ny + 1)])
+    dep_val = if hasproperty(base_g, :z) && hasproperty(base_g.z, :cᵃᵃᶠ)
+        z_arr = Array(parent(base_g.z.cᵃᵃᶠ))
+        Float64(z_arr[min(k, length(z_arr))])
+    else
+        Float64(base_g.Lz) * (k / base_g.Nz) - abs(Float64(base_g.Lz))
+    end
+    return (lon_val, lat_val, dep_val)
+end
+
 function compute_advective_cfl(
     model,
     Δt::Real;
@@ -83,7 +116,8 @@ function compute_advective_cfl(
 )
     u_max = maximum(abs, interior(model.velocities.u))
     v_max = maximum(abs, interior(model.velocities.v))
-    w_max = maximum(abs, interior(model.velocities.w))
+    w_int = interior(model.velocities.w)
+    w_max = maximum(abs, w_int)
 
     # Estimate horizontal grid spacing (in meters)
     base_g = model.grid isa ImmersedBoundaryGrid ? model.grid.underlying_grid : model.grid
@@ -113,7 +147,30 @@ function compute_advective_cfl(
 
     cfl_x = (u_max * Δt) / max(1.0, dx_approx)
     cfl_y = (v_max * Δt) / max(1.0, dy_approx)
-    cfl_z = (w_max * Δt) / max(1.0, dz_approx)
+
+    # Layer-resolved vertical Courant number:
+    # On a vertically stretched grid, Δz varies by orders of magnitude (e.g. 10 m at the
+    # surface to 3000 m in the abyss). Pairing a deep-ocean vertical velocity peak with the
+    # surface layer thickness artificially inflates CFL_z by up to 300x. The physical
+    # stability criterion requires evaluating |w_k| against the local layer thickness Δz_k:
+    # CFL_z = max_k (max_{i,j}(|w_{i,j,k}|, |w_{i,j,k+1}|) * Δt / Δz_k).
+    nz = base_g.Nz
+    cfl_z = 0.0
+    if hasproperty(base_g, :z) && hasproperty(base_g.z, :Δᵃᵃᶜ)
+        dz_vec = to_cpu_offset_array(base_g.z.Δᵃᵃᶜ)
+        w_int_cpu = Array(w_int)
+        for k in 1:nz
+            dz_k = Float64(dz_vec[k])
+            w_bot = maximum(abs, @view(w_int_cpu[:, :, k]))
+            w_top = maximum(abs, @view(w_int_cpu[:, :, k + 1]))
+            w_k = max(w_bot, w_top)
+            cfl_z = max(cfl_z, (w_k * Δt) / max(1.0, dz_k))
+        end
+    else
+        dz_approx = min_vertical_spacing(base_g)
+        cfl_z = (w_max * Δt) / max(1.0, dz_approx)
+    end
+
     cfl_adv = max(cfl_x, cfl_y, cfl_z)
 
     # Frictional / quadratic drag Courant number
@@ -1159,7 +1216,14 @@ function setup_hydrodynamic_simulation(
         # which direction was actually limiting the step -- and a CFL of 6 against a 0.20
         # target is a scheme running far outside its stability limit, so knowing which
         # direction is responsible is the whole diagnosis.
-        w_max = maximum(abs, interior(s.model.velocities.w))
+        w_int = Array(interior(s.model.velocities.w))
+        w_max, loc_w = findmax(abs, w_int)
+        w_loc_txt = try
+            lon_w, lat_w, dep_w = velocity_peak_location(s, loc_w)
+            " (at $(round(lon_w, digits=2))°E, $(round(lat_w, digits=2))°N, $(round(dep_w, digits=1))m)"
+        catch
+            ""
+        end
         # The grid-metric breakdown is best-effort: the metric field names differ between the
         # underlying grid of an `ImmersedBoundaryGrid` and a bare `LatitudeLongitudeGrid`, and
         # guessing them wrong would turn a diagnostic into the very failure it is meant to
@@ -1170,14 +1234,26 @@ function setup_hydrodynamic_simulation(
             dz_min = min_vertical_spacing(base_g)
             r_earth = Float64(base_g.radius)
             dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
-            dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃᵃ[1:base_g.Ny + 1])))
-            lat_max_abs = max(abs(base_g.φᵃᶠᵃᵃ[1]), abs(base_g.φᵃᶠᵃᵃ[base_g.Ny + 1]))
+            dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃ[1:base_g.Ny + 1])))
+            lat_max_abs = max(abs(base_g.φᵃᶠᵃ[1]), abs(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
+            cflz_val = 0.0
+            if hasproperty(base_g, :z) && hasproperty(base_g.z, :Δᵃᵃᶜ)
+                dz_vec_p = to_cpu_offset_array(base_g.z.Δᵃᵃᶜ)
+                for k in 1:base_g.Nz
+                    dz_k = Float64(dz_vec_p[k])
+                    w_k = max(maximum(abs, @view(w_int[:, :, k])),
+                              maximum(abs, @view(w_int[:, :, k + 1])))
+                    cflz_val = max(cflz_val, (w_k * s.Δt) / max(1.0, dz_k))
+                end
+            else
+                cflz_val = (w_max * s.Δt) / max(1.0, dz_min)
+            end
             (dx_m = r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg),
              dy_m = r_earth * deg2rad(dlat_deg),
              dz_m = dz_min,
              cflx = (u_max * s.Δt) / max(1.0, r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg)),
              cfly = (v_max * s.Δt) / max(1.0, r_earth * deg2rad(dlat_deg)),
-             cflz = (w_max * s.Δt) / max(1.0, dz_min))
+             cflz = cflz_val)
         catch
             nothing
         end
@@ -1185,9 +1261,15 @@ function setup_hydrodynamic_simulation(
         # if eta grows without bound the barotropic velocity follows, and the divergence
         # watchdog (which only inspects u and v) reports the consequence, not the cause.
         eta_txt = try
-            if hasproperty(s.model, :free_surface) && hasproperty(s.model.free_surface, :η)
-                η = s.model.free_surface.η
-                " | η: $(round(minimum(interior(η)), digits=3))..$(round(maximum(interior(η)), digits=3)) m"
+            if hasproperty(s.model, :free_surface)
+                fs = s.model.free_surface
+                η_field = hasproperty(fs, :displacement) ? fs.displacement :
+                          hasproperty(fs, :η) ? fs.η : nothing
+                if η_field !== nothing
+                    " | η: $(round(minimum(interior(η_field)), digits=3))..$(round(maximum(interior(η_field)), digits=3)) m"
+                else
+                    ""
+                end
             else
                 ""
             end
@@ -1201,7 +1283,8 @@ function setup_hydrodynamic_simulation(
         @info(
             "Iter: $(iteration(s)) | Time: $(prettytime(s)) | " *
             "Δt: $(round(s.Δt, digits=1))s | max(|u|): $(round(u_max, digits=4)) m/s | " *
-            "max(|v|): $(round(v_max, digits=4)) m/s | max(|w|): $(round(w_max, digits=4)) m/s | " *
+            "max(|v|): $(round(v_max, digits=4)) m/s | " *
+            "max(|w|): $(round(w_max, digits=4)) m/s$(w_loc_txt) | " *
             "CFL: $(round(cfl_val, digits=3))" * metrics_txt * eta_txt
         )
     end

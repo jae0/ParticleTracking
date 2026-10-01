@@ -34,8 +34,13 @@ using DBInterface
 using NCDatasets
 using JLD2
 
-import Pkg
-Pkg.activate(joinpath(@__DIR__, ".."), io = devnull)
+if Base.find_package("Pkg") !== nothing
+    try
+        import Pkg
+        Pkg.activate(joinpath(@__DIR__, ".."), io = devnull)
+    catch
+    end
+end
 using ParticleTracking
 
 # The package requires a configuration: `load_configuration` errors when none is found, on
@@ -87,6 +92,17 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
 
         immersed = build_immersed_grid_from_real_data(base_grid, "inputs/test_bathy.nc")
         @test immersed isa ImmersedBoundaryGrid
+
+        # Bay of Fundy classifier and masking
+        @test is_in_bay_of_fundy(-65.0, 45.2) == true
+        @test is_in_bay_of_fundy(-63.5, 44.5) == false # Atlantic South Shore
+        @test is_in_bay_of_fundy(-60.0, 44.0) == false # Scotian Shelf
+        immersed_masked = build_immersed_grid_from_real_data(
+            base_grid,
+            "inputs/test_bathy.nc",
+            mask_bay_of_fundy = true
+        )
+        @test immersed_masked isa ImmersedBoundaryGrid
     end
 
     @testset "4. Hydrodynamic Model & Climate Scenarios" begin
@@ -1613,8 +1629,31 @@ test_grid = build_shelf_grid(
     # ZIP extraction, checked byte-for-byte against a known-good extraction. Also self-skips.
     include("zip_extract_test.jl")
 
+    # Surface wind stress time series and GPU-safe bitstype representation
+    @testset "TimeSeriesSurfaceStress" begin
+        vals = (0.01, 0.02, 0.03, 0.04)
+        horizon = 3600.0 * 4
+        tstep = 3600.0
+        stress = TimeSeriesSurfaceStress{4}(vals, horizon, tstep)
+
+        @test isbitstype(typeof(stress))
+        @test stress(0.0, 0.0, 0.0) == 0.01
+        @test stress(0.0, 0.0, 3600.0) == 0.02
+        @test stress(0.0, 0.0, -10.0, 7200.0) == 0.03
+        @test stress(0.0, 0.0, 10800.0) == 0.04
+        # Cyclic wrapping
+        @test stress(0.0, 0.0, horizon) == 0.01
+
+        # Oceananigans boundary condition wrapping
+        bc = FluxBoundaryCondition(stress)
+        @test bc isa BoundaryCondition
+    end
+
     # Inputs containerised under the run's output directory.
     include("containerisation_test.jl")
+
+    # Tidal harmonic velocity reconstruction and GPU-safe coefficient evaluation
+    include("tidal_coefficients_test.jl")
 
 end
 

@@ -90,7 +90,9 @@ function build_hydrodynamic_model(
     v_decay::Float64 = 500.0,
     lon_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
     lat_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
-    boundary_tracers::Union{Nothing, NamedTuple} = nothing
+    boundary_tracers::Union{Nothing, NamedTuple} = nothing,
+    mask_bay_of_fundy::Bool = false,
+    active_boundaries = (:east, :south, :west)
 )
     active_tracers = (enable_o2 && !(:O2 in tracers)) ? (tracers..., :O2) : tracers
 
@@ -208,11 +210,12 @@ function build_hydrodynamic_model(
     # Relaxation rate and footprint for the tidal term. See the note where it is applied: the
     # tidal field is a velocity and must be relaxed toward, not forced as an acceleration.
     tidal_relax_rate = 1.0 / Float64(tidal_tau)
-    # The tide is applied across the whole domain, matching the footprint the old body-force
-    # version used. Restricting it to a boundary band would be the alternative, but that
-    # changes which parts of the domain the tide drives and is a modelling decision rather
-    # than a correction of the units error, so it is left alone here.
-    tidal_mask = (x, y, z) -> 1.0
+    # The tide is applied across the domain. When mask_bay_of_fundy is active, the hypertidal
+    # shallows in the Bay of Fundy are masked to zero relaxation weight to prevent forcing
+    # unphysical velocity shears near the immersed land boundary.
+    tidal_mask = mask_bay_of_fundy ?
+        ((x, y, z) -> (is_in_bay_of_fundy(x, y) ? 0.0 : 1.0)) :
+        ((x, y, z) -> 1.0)
 
     # Sponge relaxation, expressed as an Oceananigans `Relaxation`.
     #
@@ -245,10 +248,16 @@ function build_hydrodynamic_model(
         )
 
         relax_rate = 1.0 / Float64(sponge_tau)
-        # Quadratic sponge weight, zero in the interior and 1 on the open boundary.
-        # `compute_sponge_gamma` is `@inline` and pure over `isbits` arguments.
+        # Quadratic sponge weight, zero in the interior and 1 on the designated open boundaries.
+        # Boundaries not in `active_boundaries` (e.g. northern continental margin) have zero weight.
+        act_b_syms = Tuple(Symbol(lowercase(string(b))) for b in active_boundaries)
+        act_e = :east in act_b_syms
+        act_w = :west in act_b_syms
+        act_n = :north in act_b_syms
+        act_s = :south in act_b_syms
         sponge_mask = (x, y, z) -> compute_sponge_gamma(
-            x, y, lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width
+            x, y, lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
+            act_e, act_w, act_n, act_s
         )
         # `ExponentialInflow` is the reference upstream profile; it is `isbits`, so capturing it
         # in these closures keeps the forcing lowerable into a kernel.
@@ -260,16 +269,15 @@ function build_hydrodynamic_model(
 
         # Tidal forcing is a RELAXATION TOWARD the prescribed tidal velocity, not a body force.
         #
-        # `tidal_forcing_coefficients` reconstructs a velocity in m/s from the M2/S2 harmonic
-        # coefficients -- the config's own amplitudes are quoted that way (`tidal_u_amp = 0.25`
-        # m/s, and the run logs "M2 boundary speed amplitude: 0.0072 - 0.4456 m/s"). A
-        # `ContinuousForcing` on `u`/`v` is an ACCELERATION in m/s^2, so passing the velocity
-        # there injected `u_tide * dt` into the momentum equation every step: a 0.45 m/s tide
-        # with dt = 26.4 s added 11.9 m/s per step. That is what made the run diverge --
-        # max(|u|) climbed 0 -> 3.85 -> 10.85 -> 16.17 -> 20.46 m/s and tripped the 20 m/s
-        # watchdog at iteration 80, and max(|w|) reached 7 m/s, which no ocean flow produces.
-        # The units error is invisible in the output because a run that blows up still prints
-        # plausible-looking per-iteration velocities on the way.
+        # `tidal_velocity_coefficients` reconstructs the true velocity in m/s from the M2/S2
+        # harmonic coefficients: u(t) = sum_k [Re_k cos(w_k t) + Im_k sin(w_k t)].
+        # A `ContinuousForcing` on `u`/`v` is an ACCELERATION in m/s^2; passing a velocity there
+        # injected `u_tide * dt` into the momentum equation every step, causing severe divergence.
+        # Conversely, passing an acceleration tendency into `Relaxation` damped interior
+        # velocities to zero.
+        #
+        # Relaxation toward the reconstructed velocity `(1/tau) * (u_tide - u)` provides the
+        # physically consistent formulation: the target is in m/s and converges on timescale `tidal_tau`.
         #
         # A relaxation is the correct expression of a prescribed oscillating velocity: it adds
         # `(1/tau) * (u_tide(x, t) - u)`, so the target is a velocity and the model converges to
@@ -326,42 +334,30 @@ function build_hydrodynamic_model(
     #      outside are not represented.
     #   3. It covers T and S only. A model carrying oxygen (`enable_o2`) relaxes the other
     #      tracers not at all.
-    #   4. It is CPU-only, because the targets are interpolation objects and therefore not
-    #      `isbits`; the GPU path refuses rather than silently dropping the sponge.
+    #   4. Boundary targets are materialized onto `CenterField(grid)` objects so they
+    #      execute natively on both CPU and GPU without run-time interpolation overhead
+    #      or non-isbits closure restrictions.
     #
     # Closing any of these needs a source that supplies the missing quantity -- a reanalysis
     # with currents (GLORYS) for (1), a dated series rather than a climatology for (2). It
     # does not need more code here; the code is not the missing part.
     if !isnothing(boundary_tracers) && sponge_active
-        # Ask the GRID which architecture it is on, rather than reading a flag or an
-        # environment variable. An earlier version tested `ENV["PARTICLETRACKING_USE_GPU"]`,
-        # which nothing in the project ever sets: the GPU path comes from `--gpu` via
-        # `opts.use_gpu`. The guard therefore never fired, and a GPU run reached the kernel
-        # and died with an opaque LLVM error from `gpu__fill_bottom_and_top_halo!` instead of
-        # the sentence explaining why. A guard that cannot fire is worse than none, because
-        # it reads as protection.
+        # The tracer sponge relaxes the boundary band toward observed temperature and
+        # salinity (WOA23 or GLORYS12V1). Rather than passing a host-bound closure capturing
+        # an interpolation object (which is not isbits and cannot be lowered into a GPU kernel),
+        # the target is materialized onto a `CenterField(grid)`.
         #
-        # It then compared `Oceananigans.architecture(grid) === :gpu`, which is the same
-        # mistake one level down: in Oceananigans 0.111 `architecture` returns an
-        # ARCHITECTURE INSTANCE (`CPU()` or `GPU()`), not a Symbol, so `=== :gpu` is false
-        # even on a GPU grid. Verified directly: `architecture(g) isa CPU == true` while
-        # `architecture(g) === :gpu == false`. The test is an `isa` against `CPU`, which is
-        # the only thing that distinguishes the two devices.
-        if !(Oceananigans.architecture(grid) isa Oceananigans.CPU)
-            error(
-                "Boundary hydrography was supplied, but a data-backed tracer sponge cannot be " *
-                "lowered into a GPU kernel: the interpolation object captures a large array " *
-                "and is not `isbits`. Refusing rather than skipping it, because a run that " *
-                "appears to carry observed boundary temperature and salinity but does not " *
-                "would be a silent physics error. Re-run on CPU (drop `--gpu`), or set " *
-                "[boundaries] ocean_boundary_source = \"synthetic\" to run on GPU without it."
-            )
-        end
+        # In Oceananigans, a `Field` target in `Relaxation` is directly adapted to a device
+        # array (`CuDeviceArray` on GPU, `Array` on CPU) and indexed as `target[i, j, k]`.
+        # This executes natively on both CPU and GPU architectures without run-time
+        # interpolation overhead in the tendency kernel.
         for (nm, itp) in pairs(boundary_tracers)
+            target_field = CenterField(grid)
+            set!(target_field, (x, y, z) -> Float64(itp(x, y, -z)))
             composed_forcing = merge(
                 composed_forcing,
                 (nm => Relaxation(rate = relax_rate, mask = sponge_mask,
-                                  target = (x, y, z, t) -> Float64(itp(x, y, -z))),)
+                                  target = target_field),)
             )
         end
     end
@@ -836,35 +832,32 @@ function _check_boundary_field_is_real(path::AbstractString, vals::AbstractArray
 end
 
 """
-    _temperature_offset_k(units) -> Float64
+    _temperature_to_celsius_offset(units) -> Float64
 
-Kelvin offset implied by a NetCDF temperature `units` string: 0 for an absolute scale
-(Kelvin), +273.15 for Celsius, and an error for anything else.
+Offset required to convert a NetCDF temperature `units` string to Celsius (°C):
+0.0 for an in-situ or potential temperature scale already in Celsius (°C),
+-273.15 for absolute temperature (Kelvin), and an error for anything else.
 
-The model stores absolute temperature, so a boundary field in degrees C must be shifted or
-the sponge relaxes the open edges to roughly 273 K and the domain gains a large spurious
-heat sink along them. Both sources in use -- WOA23 `t_an` and GLORYS `thetao` -- report
-`degrees_celsius` or `degrees_C`, so this conversion is load-bearing in every case and is
-not a special case for one provider.
-
-Reading the attribute rather than being told the unit is deliberate: a caller-supplied flag
-had to be set per source, and one of them was set wrong, which would have produced a 287 K
-boundary that still parsed and still ran.
+Oceananigans hydrostatic models with TEOS-10 equation of state store conservative
+temperature in degrees Celsius (°C), matching WOA23 climatological hydrography (`t_an`).
+Boundary hydrography sources in Celsius (such as GLORYS12V1 `thetao` and WOA23 `t_an`)
+require no offset (0.0). Sources provided in Kelvin require subtracting 273.15.
 """
-function _temperature_offset_k(units::AbstractString)
+function _temperature_to_celsius_offset(units::AbstractString)
     u = lowercase(strip(units))
     isempty(u) && error("Boundary temperature has no `units` attribute.")
-    (occursin("kelvin", u) || endswith(u, " k")) && return 0.0
-    # Matches degree_C, degrees_C, degC, degree Celsius and degree_celsius alike. An earlier
-    # version tested for the literal "degree_c", which is not a substring of "degrees_C" --
-    # the form GLORYS actually uses -- so the guard rejected a file whose units were correct
-    # and unambiguous. Being strict about the string rather than about the meaning is exactly
-    # how a safety check becomes an outage.
-    (occursin("celsius", u) || occursin(r"degree[s]?\s*_?\s*c\b", u)) && return 273.15
-    error("Boundary temperature has units \"$(units)\", which is neither Kelvin nor Celsius. " *
-          "Refusing rather than guessing, because a wrong offset would make the sponge relax " *
-          "the open edges to the wrong absolute temperature.")
+    (occursin("kelvin", u) || endswith(u, " k")) && return -273.15
+    (occursin("celsius", u) || occursin(r"degree[s]?\s*_?\s*c\b", u)) && return 0.0
+    error(
+        "Boundary temperature has units \"$(units)\", which is neither Kelvin nor Celsius. " *
+        "Refusing rather than guessing, because an unhandled unit would make the sponge " *
+        "relax the open edges to an erroneous temperature."
+    )
 end
+
+# Backward compatibility alias
+const _temperature_offset_k = _temperature_to_celsius_offset
+
 
 """
     build_boundary_tracer_interpolators(T_path, S_path; T_name, S_name)
@@ -941,7 +934,7 @@ function build_boundary_tracer_interpolators(T_path::AbstractString,
 
     t_offset = NCDatasets.NCDataset(T_path, "r") do ds
         haskey(ds, T_name) || error("$(basename(T_path)) has no variable $(T_name).")
-        _temperature_offset_k(get(ds[T_name].attrib, "units", ""))
+        _temperature_to_celsius_offset(get(ds[T_name].attrib, "units", ""))
     end
 
     # Land mask repair.
@@ -1150,55 +1143,76 @@ end
 @inline (r::LateralBoundaryRelaxation)(x, y, z, t) = 0.0
 
 """
-    compute_sponge_gamma(x, y, lon_min, lon_max, lat_min, lat_max, sponge_width) -> Float64
+    compute_sponge_gamma(
+        x, y, lon_min, lon_max, lat_min, lat_max, sponge_width;
+        active_east = true, active_west = true,
+        active_north = true, active_south = true
+    ) -> Float64
 
 Compute the quadratic sponge relaxation weight γ ∈ [0, 1] for multi-boundary
-relaxation following Price & Aumont (2011). Returns the maximum relaxation weight
-across all four boundaries (east, west, north, south).
+relaxation following Price & Aumont (2011). Evaluates only open boundaries designated
+by active flags, avoiding unphysical inward momentum relaxation against closed
+or land-bounded margins.
 """
+@inline function compute_sponge_gamma(
+    x::Real, y::Real,
+    lon_min::Real, lon_max::Real,
+    lat_min::Real, lat_max::Real,
+    sponge_width::Real,
+    active_east::Bool,
+    active_west::Bool,
+    active_north::Bool,
+    active_south::Bool
+)::Float64
+    # Eastern boundary (x → lon_max)
+    gamma_e = if !active_east || x <= (lon_max - sponge_width)
+        0.0
+    elseif x >= lon_max
+        1.0
+    else
+        ((x - (lon_max - sponge_width)) / sponge_width)^2
+    end
+
+    # Western boundary (x → lon_min)
+    gamma_w = if !active_west || x >= (lon_min + sponge_width)
+        0.0
+    elseif x <= lon_min
+        1.0
+    else
+        (((lon_min + sponge_width) - x) / sponge_width)^2
+    end
+
+    # Northern boundary (y → lat_max)
+    gamma_n = if !active_north || y <= (lat_max - sponge_width)
+        0.0
+    elseif y >= lat_max
+        1.0
+    else
+        ((y - (lat_max - sponge_width)) / sponge_width)^2
+    end
+
+    # Southern boundary (y → lat_min)
+    gamma_s = if !active_south || y >= (lat_min + sponge_width)
+        0.0
+    elseif y <= lat_min
+        1.0
+    else
+        (((lat_min + sponge_width) - y) / sponge_width)^2
+    end
+
+    return max(gamma_e, gamma_w, gamma_n, gamma_s)
+end
+
 @inline function compute_sponge_gamma(
     x::Real, y::Real,
     lon_min::Real, lon_max::Real,
     lat_min::Real, lat_max::Real,
     sponge_width::Real
 )::Float64
-    # Eastern boundary (x → lon_max)
-    gamma_e = if x >= lon_max
-        1.0
-    elseif x <= (lon_max - sponge_width)
-        0.0
-    else
-        ((x - (lon_max - sponge_width)) / sponge_width)^2
-    end
-
-    # Western boundary (x → lon_min)
-    gamma_w = if x <= lon_min
-        1.0
-    elseif x >= (lon_min + sponge_width)
-        0.0
-    else
-        (((lon_min + sponge_width) - x) / sponge_width)^2
-    end
-
-    # Northern boundary (y → lat_max)
-    gamma_n = if y >= lat_max
-        1.0
-    elseif y <= (lat_max - sponge_width)
-        0.0
-    else
-        ((y - (lat_max - sponge_width)) / sponge_width)^2
-    end
-
-    # Southern boundary (y → lat_min)
-    gamma_s = if y <= lat_min
-        1.0
-    elseif y >= (lat_min + sponge_width)
-        0.0
-    else
-        (((lat_min + sponge_width) - y) / sponge_width)^2
-    end
-
-    return max(gamma_e, gamma_w, gamma_n, gamma_s)
+    return compute_sponge_gamma(
+        x, y, lon_min, lon_max, lat_min, lat_max, sponge_width,
+        true, true, true, true
+    )
 end
 
 """

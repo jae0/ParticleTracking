@@ -336,7 +336,11 @@ function fetch_input(key::Symbol, output_dir::AbstractString; force::Bool = fals
 
     tmp = target * ".part"
     try
-        Downloads.download(url, tmp; progress = false)
+        Downloads.download(
+            url,
+            tmp;
+            progress = _download_progress_callback(string(key)),
+        )
     catch err
         rm(tmp; force = true)
         error(
@@ -351,58 +355,230 @@ function fetch_input(key::Symbol, output_dir::AbstractString; force::Bool = fals
 end
 
 """
+    _download_progress_callback(label::AbstractString) -> Function
+
+Construct a progress callback for `Downloads.download` that reports transfer
+progress and rate periodically without flooding the output stream.
+"""
+function _download_progress_callback(label::AbstractString)
+    last_time = Ref(time())
+    last_print = Ref(0.0)
+    last_bytes = Ref(0)
+    finished = Ref(false)
+    return function (total::Integer, now::Integer)
+        curr_time = time()
+        if (curr_time - last_print[]) >= 2.0 || (total > 0 && now >= total)
+            dt = curr_time - last_time[]
+            rate_mb = dt > 0.1 ? ((now - last_bytes[]) / (1024 * 1024)) / dt : 0.0
+            now_mb = round(now / (1024 * 1024); digits = 1)
+            if total > 0
+                tot_mb = round(total / (1024 * 1024); digits = 1)
+                pct = round(100.0 * now / total; digits = 1)
+                print("\r  [$(label)] $(now_mb) / $(tot_mb) MB ($(pct)%) " *
+                      "[$(round(rate_mb; digits = 2)) MB/s]    ")
+            else
+                print("\r  [$(label)] $(now_mb) MB [$(round(rate_mb; digits = 2)) MB/s]    ")
+            end
+            flush(stdout)
+            last_print[] = curr_time
+            last_time[] = curr_time
+            last_bytes[] = now
+            if total > 0 && now >= total && !finished[]
+                finished[] = true
+                println()
+            end
+        end
+    end
+end
+
+"""
+    _fetch_tpxo_velocity_range(archive_url, member, target) -> String
+
+Download single member `member` directly from remote ZIP archive at `archive_url`
+via HTTP range requests and inflate directly to `target`.
+"""
+function _fetch_tpxo_velocity_range(
+    archive_url::AbstractString,
+    member::AbstractString,
+    target::AbstractString,
+)
+    mkpath(dirname(target))
+
+    # Probe total length via HEAD request
+    io_head = IOBuffer()
+    resp = Downloads.request(archive_url; method = "HEAD", output = io_head)
+    total_len = 0
+    for (k, v) in resp.headers
+        if lowercase(k) == "content-length"
+            total_len = parse(Int, v)
+            break
+        end
+    end
+    total_len <= 0 && error("Content-Length header not returned by server")
+
+    # Fetch trailing 128 KB containing ZIP footer and Central Directory
+    tail_len = min(total_len, 131072)
+    tail_start = total_len - tail_len
+    io_tail = IOBuffer()
+    Downloads.download(
+        archive_url,
+        io_tail;
+        headers = ["Range" => "bytes=$(tail_start)-$(total_len - 1)"],
+    )
+    tail_bytes = take!(io_tail)
+
+    # Locate central directory offset
+    cd = 0
+    eocd = findlast(
+        i -> i + 3 <= length(tail_bytes) && _u32(tail_bytes, i) == 0x06054b50,
+        1:(length(tail_bytes) - 4),
+    )
+    if eocd !== nothing && _u32(tail_bytes, eocd + 16) != 0xFFFFFFFF
+        cd = Int(_u32(tail_bytes, eocd + 16))
+    else
+        e64 = findfirst(
+            i -> i + 3 <= length(tail_bytes) && _u32(tail_bytes, i) == 0x06064b50,
+            1:(length(tail_bytes) - 3),
+        )
+        e64 === nothing && error("Central directory record not found in archive footer")
+        cd = Int(_u64(tail_bytes, e64 + 48))
+    end
+
+    cd_bytes = if cd >= tail_start
+        tail_bytes[(cd - tail_start + 1):end]
+    else
+        io_cd = IOBuffer()
+        Downloads.download(
+            archive_url,
+            io_cd;
+            headers = ["Range" => "bytes=$(cd)-$(total_len - 1)"],
+        )
+        take!(io_cd)
+    end
+
+    # Search for member in Central Directory
+    i = 1
+    lho = csize = usize = 0
+    method = 0
+    while i + 45 <= length(cd_bytes) && _u32(cd_bytes, i) == 0x02014b50
+        c = Int(_u32(cd_bytes, i + 20))
+        u = Int(_u32(cd_bytes, i + 24))
+        m = _u16(cd_bytes, i + 8)
+        nlen = _u16(cd_bytes, i + 28)
+        elen = _u16(cd_bytes, i + 30)
+        clen = _u16(cd_bytes, i + 32)
+        name = String(cd_bytes[(i + 46):(i + 45 + nlen)])
+        if name == member
+            csize, usize, method = c, u, m
+            lho = Int(_u32(cd_bytes, i + 42))
+            break
+        end
+        i += 46 + nlen + elen + clen
+    end
+    csize == 0 && error("Member '$(member)' not located in central directory")
+
+    # Fetch local file header to compute exact data stream offset
+    io_lh = IOBuffer()
+    Downloads.download(
+        archive_url,
+        io_lh;
+        headers = ["Range" => "bytes=$(lho)-$(lho + 128)"],
+    )
+    lh = take!(io_lh)
+    _u32(lh, 1) != 0x04034b50 && error("Invalid local header signature at $(lho)")
+    ln = _u16(lh, 27)
+    le = _u16(lh, 29)
+    data_start = lho + 30 + ln + le
+    data_end = data_start + csize - 1
+
+    # Stream compressed payload to temporary buffer file
+    comp_file = target * ".deflate.part"
+    println("Streaming $(round(csize / (1024 * 1024), digits=1)) MB compressed tidal " *
+            "solution via HTTP Range...")
+    try
+        Downloads.download(
+            archive_url,
+            comp_file;
+            headers = ["Range" => "bytes=$(data_start)-$(data_end)"],
+            progress = _download_progress_callback("TPXO9 stream"),
+        )
+    catch err
+        rm(comp_file; force = true)
+        rethrow(err)
+    end
+
+    # Decompress deflate stream to destination file
+    println("Inflating $(member) to $(basename(target))...")
+    tmp_dest = target * ".part"
+    try
+        open(tmp_dest, "w") do out_io
+            open(comp_file, "r") do in_io
+                ds = CodecZlib.DeflateDecompressorStream(in_io)
+                try
+                    write(out_io, ds)
+                finally
+                    close(ds)
+                end
+            end
+        end
+        rm(comp_file; force = true)
+        mv(tmp_dest, target; force = true)
+    catch err
+        rm(tmp_dest; force = true)
+        rethrow(err)
+    end
+    return target
+end
+
+"""
     _fetch_tpxo_velocity(target; force = false, output_dir = ".") -> String
 
-Download the TPXO9 archive and extract the global velocity solution to `target`.
-
-Zenodo record 8074917 distributes a 4.4 GB ZIP (`TPXO9_datafiles.zip`). Only one member is
-wanted -- `TPXO9_datafiles/u_tpxo9.v1.nc`, 1.4 GB -- and it is not the first.
-
-The whole archive is downloaded and the member extracted locally, rather than fetching a single
-byte range for it. That is a deliberate trade: a byte-range fetch would be about five times
-faster, but it hard-codes a byte offset into one particular archive build, it needs an HTTP
-client this project does not otherwise depend on, and it fails obscurely if the record is ever
-re-zipped. A single `Downloads.download` plus a local extraction works with nothing beyond the
-dependencies the project already has, and the "anyone can regenerate this" promise is worth more
-than the minutes. The archive is cached beside the extracted file so a second run re-downloads
-nothing.
-
-`fetch_input` for tides is therefore as simple as any other input:
-
-```julia
-fetch_input(:tides, "work/snowcrab")   # downloads once, then reuses
-```
-
-The small *per-constituent* archives of the same model that are far easier to find are **not**
-used: those on Zenodo 22970362 span only lat -34.97..14.97, and the `*_remap*` members of
-8074917 are regional too. See the `:tides` entry in [`DATA_SOURCES`](@ref).
+Acquire the TPXO9 global harmonic velocity solution (`u_tpxo9.v1.nc`) at `target`.
 """
 function _fetch_tpxo_velocity(target::AbstractString; force::Bool = false)
     isfile(target) && !force && return target
     mkpath(dirname(target))
 
+    member = "TPXO9_datafiles/u_tpxo9.v1.nc"
     archive_url = "https://zenodo.org/api/records/8074917/files/TPXO9_datafiles.zip/content"
     archive = joinpath(dirname(target), "TPXO9_datafiles.zip")
 
+    # If full archive is already cached locally, extract directly from it
+    if isfile(archive) && !force
+        println("Extracting $(member) from local archive $(basename(archive))...")
+        _extract_zip_member(archive, member, target)
+        return target
+    end
+
+    # First attempt targeted HTTP range download (858 MB vs 4.4 GB full archive)
+    try
+        return _fetch_tpxo_velocity_range(archive_url, member, target)
+    catch err
+        @warn "Range download failed ($(sprint(showerror, err))); falling back to " *
+              "full archive download."
+    end
+
+    # Fallback: download complete 4.4 GB archive
     if !isfile(archive) || force
-        @info "Downloading the TPXO9 archive (4.4 GB) to $(archive). This is a one-time cost; " *
-              "the archive is kept beside the extracted file so later runs reuse it."
+        println("Downloading TPXO9 archive (4.4 GB) to $(archive)...")
         tmp = archive * ".part"
         try
-            Downloads.download(archive_url, tmp; progress = true)
+            Downloads.download(
+                archive_url,
+                tmp;
+                progress = _download_progress_callback("TPXO9 archive"),
+            )
         catch err
             rm(tmp; force = true)
             error(
-                "Could not download the TPXO9 archive:\n  $(archive_url)\n" *
+                "Could not download TPXO9 archive from $(archive_url):\n" *
                 "$(sprint(showerror, err))\n" *
-                "Place the file at $(archive) and re-run, or use one of the alternatives " *
-                "listed for :tides in DATA_SOURCES.")
+                "Place file at $(archive) or refer to DATA_SOURCES[:tides].")
         end
         mv(tmp, archive; force = true)
     end
 
-    @info "Extracting TPXO9_datafiles/u_tpxo9.v1.nc from $(basename(archive))"
-    member = "TPXO9_datafiles/u_tpxo9.v1.nc"
+    println("Extracting $(member) from $(basename(archive))...")
     _extract_zip_member(archive, member, target)
     return target
 end

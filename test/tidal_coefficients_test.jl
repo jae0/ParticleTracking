@@ -59,21 +59,32 @@ const TIDES = joinpath(ROOT, "work", "snowcrab", "inputs", "tpxo9", "u_tpxo9.v1.
             want = 0.0
             for k in eachindex(h.omega)
                 w = h.omega[k]
-                want += -w * (h.uRe[k, jb, ib] * sin(w * t) + h.uIm[k, jb, ib] * cos(w * t))
+                want += w * (-h.uRe[k, jb, ib] * sin(w * t) + h.uIm[k, jb, ib] * cos(w * t))
             end
             @test f.u(lon, lat, -50.0, t) ≈ want atol = 1e-15
         end
 
         @testset "it is a tendency, not a velocity" begin
-            # Amplitudes reach 0.45 m/s, so a velocity-valued forcing would be O(0.45). The
-            # tendency is smaller by omega ~ 1.4e-4, i.e. O(1e-4 m/s^2). Feeding the
-            # velocity instead diverged within ten iterations at 87 m/s.
             peak = 0.0
             for lon in -70.0:1.0:-54.0, lat in 41.0:1.0:48.0, t in (0.0, 5000.0, 12000.0)
                 peak = max(peak, abs(f.u(lon, lat, -50.0, t)))
             end
             @test peak > 0.0
             @test peak < 1e-2
+        end
+
+        @testset "tidal_velocity_coefficients returns velocity in m/s" begin
+            f_vel = tidal_velocity_coefficients(g)
+            @test isbitstype(typeof(f_vel.u))
+            @test f_vel.u(-80.0, 50.0, -10.0, 0.0) == 0.0
+
+            peak_v = 0.0
+            for lon in -70.0:1.0:-54.0, lat in 41.0:1.0:48.0, t in (0.0, 5000.0, 12000.0)
+                peak_v = max(peak_v, abs(f_vel.u(lon, lat, -50.0, t)))
+            end
+            # True tidal velocity on Scotian Shelf reaches 0.1 - 2.5 m/s
+            @test peak_v > 0.05
+            @test peak_v < 5.0
         end
     end
 end
