@@ -1655,6 +1655,9 @@ test_grid = build_shelf_grid(
     # Tidal harmonic velocity reconstruction and GPU-safe coefficient evaluation
     include("tidal_coefficients_test.jl")
 
+    # Halo and C-grid staggering removed when loading hydrodynamic archives
+    include("interior_centers_test.jl")
+
 end
 
 # Remove the configuration the suite installed, restoring any that was already there. This

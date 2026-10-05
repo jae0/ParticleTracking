@@ -1596,6 +1596,60 @@ function run_hydrodynamic_simulation!(
 end
 
 """
+    _interior_centers(raw, N, H; name = "field") -> Array{Float64}
+
+Map an array as written by `JLD2Writer` onto the `N = (N_1, ..., N_D)` interior cell centres.
+
+The stored length ``s_d`` along each dimension identifies the storage, given the interior
+count ``N_d`` and the halo width ``H_d`` from the grid sidecar:
+
+| ``s_d``             | storage                | operation                                     |
+|:--------------------|:-----------------------|:----------------------------------------------|
+| ``N_d``             | interior centres       | identity                                      |
+| ``N_d + 1``         | interior faces         | ``\\phi^c_i = (\\phi^f_i + \\phi^f_{i+1}) / 2``     |
+| ``N_d + 2H_d``      | centres with halo      | indices ``H_d + 1 : H_d + N_d``               |
+| ``N_d + 2H_d + 1``  | faces with halo        | faces ``H_d + 1 : H_d + N_d + 1``, then average |
+
+Assumes faces in a `Bounded` direction (``N_d + 1`` interior faces). A face-located field in a
+`Periodic` direction has ``N_d`` faces and is indistinguishable from a centred field by shape;
+it would be returned without the half-cell average.
+
+# Inputs
+- `raw::AbstractArray`: stored array, `ndims(raw) == D`.
+- `N::NTuple{D, Int}`: interior cell counts.
+- `H::NTuple{D, Int}`: halo widths.
+- `name`: label used in the error message.
+
+# Outputs
+- `Array{Float64, D}` of size `N`. Throws if any ``s_d`` matches none of the rows above, rather
+  than truncating to an arbitrary sub-block.
+"""
+function _interior_centers(raw::AbstractArray, N::NTuple{D, Int}, H::NTuple{D, Int};
+                           name::AbstractString = "field") where {D}
+    ndims(raw) == D || error(
+        "$(name): stored array has $(ndims(raw)) dimension(s), expected $(D).")
+    out = Float64.(raw)
+    for d in 1:D
+        s, n, h = size(out, d), N[d], H[d]
+        out = if s == n
+            out
+        elseif s == n + 1
+            0.5 .* (selectdim(out, d, 1:n) .+ selectdim(out, d, 2:(n + 1)))
+        elseif h > 0 && s == n + 2h
+            collect(selectdim(out, d, (h + 1):(h + n)))
+        elseif h > 0 && s == n + 2h + 1
+            0.5 .* (selectdim(out, d, (h + 1):(h + n)) .+
+                    selectdim(out, d, (h + 2):(h + n + 1)))
+        else
+            error("$(name): stored size $(size(raw)) does not match interior $(N) with " *
+                  "halo $(H) along dimension $(d) (length $(s); expected $(n), $(n + 1), " *
+                  "$(n + 2h) or $(n + 2h + 1)). Check the grid sidecar against the archive.")
+        end
+    end
+    return out
+end
+
+"""
     create_flow_interpolator_from_jld2(
         jld2_filepath::AbstractString;
         variables::Tuple = (:u, :v, :w, :T)
@@ -1639,9 +1693,20 @@ fails with `OutOfMemoryError` and the caller silently substitutes an analytical 
 scientifically wrong result, not a graceful degradation. Pass `t_window` (and/or `max_snapshots`) so
 the resident set matches the part of the record actually being interrogated.
 
+# Storage layout
+Fields are written with halos and on the staggered C-grid. Each stored array is reduced to
+interior cell centres by [`_interior_centers`](@ref), using the interior size and halo widths
+from the `<base>_grid.jld2` sidecar.
+
+# Multi-part runs
+Parts are merged on the physical time axis `timeseries/t`. Where two parts carry the same time
+(a seam, or a run restarted from t = 0), the snapshot from the most recently written part is
+kept.
+
 # References
 - Marshall, J., et al. (1997). *J. Geophys. Res. Oceans*, 102(C3), 5753-5766.
 """
+function create_flow_interpolator_from_jld2 end
 
 """
     resolve_hydro_model_paths(filepath::AbstractString) -> Vector{String}
@@ -1774,7 +1839,10 @@ if !isfile(jld2_filepath)
     # sorting on the time value is what actually guarantees a monotonic axis.
     want_all = [(pi, k) for pi in eachindex(parts) for k in eachindex(part_keys[pi])]
     all_t = [part_times[pi][k] for (pi, k) in want_all]
-    perm = sortperm(all_t)
+    # Ties in time are ordered latest part first, so the de-duplication below keeps the
+    # most recently written snapshot. At a true seam the two are the same state; after a
+    # restart from t = 0 the later part is the one that ran to completion.
+    perm = sortperm([(all_t[i], -want_all[i][1]) for i in eachindex(all_t)])
     want_all = want_all[perm]
     all_t = all_t[perm]
 
@@ -1786,7 +1854,8 @@ if !isfile(jld2_filepath)
         all_t[i] == all_t[i - 1] && (uniq[i] = false)
     end
     ndup = length(all_t) - sum(uniq)
-    ndup > 0 && println("  dropped $(ndup) duplicate time(s) at part seam(s).")
+    ndup > 0 && println("  dropped $(ndup) duplicate time(s) across parts " *
+                        "(kept the most recently written part at each).")
     want_all = want_all[uniq]
     all_t = all_t[uniq]
     isempty(all_t) && error(
@@ -1852,24 +1921,36 @@ if !isfile(jld2_filepath)
     Hy = isnothing(coords) ? 0 : coords.halo[2]
     Hz = isnothing(coords) ? 0 : coords.halo[3]
     if Nx == 0
+        # No sidecar: halos are unknown and taken as zero. The interior size is read from a
+        # cell-centred field when one exists, because `u` carries an extra x-face.
         jldopen(first_part, "r") do file
-            s2 = size(file["timeseries/u/$(part_keys[first(want)[1]][first(want)[2]])"])
+            key0 = part_keys[first(want)[1]][first(want)[2]]
+            ref = haskey(file, "timeseries/T") ? "timeseries/T/$(key0)" :
+                                                 "timeseries/u/$(key0)"
+            s2 = size(file[ref])
             Nx, Ny, Nz = s2[1], s2[2], s2[3]
         end
     end
 
     # Every part must describe the SAME grid. Asserted rather than trusted: stitching two
     # different grids would either throw obscurely or, worse, interleave them into an array
-    # that is internally consistent and physically meaningless.
+    # that is internally consistent and physically meaningless. The comparison is between
+    # STORED layouts (halo and staggering included), since that is what pass 2 reads;
+    # comparing a stored shape with the interior size rejects every haloed archive.
+    stored_layout(file, pi) = Tuple(
+        haskey(file, "timeseries/$(v)") ? size(file["timeseries/$(v)/$(part_keys[pi][1])"]) :
+                                          ()
+        for v in ("u", "v", "w", "T"))
+    ref_layout = jldopen(f -> stored_layout(f, 1), parts[1], "r")
     for (pi, p) in enumerate(parts)
-        jldopen(p, "r") do file
-            s2 = size(file["timeseries/u/$(part_keys[pi][1])"])
-            (s2[1], s2[2], s2[3]) == (Nx, Ny, Nz) || error(
-                "Simulation part $(basename(p)) has grid $(s2[1])x$(s2[2])x$(s2[3]) but " *
-                "$(basename(first_part)) has $(Nx)x$(Ny)x$(Nz). Parts of one simulation " *
-                "must share a grid; these cannot be stitched.")
-        end
+        lay = pi == 1 ? ref_layout : jldopen(f -> stored_layout(f, pi), p, "r")
+        lay == ref_layout || error(
+            "Simulation part $(basename(p)) stores (u, v, w, T) with sizes $(lay) but " *
+            "$(basename(parts[1])) stores $(ref_layout). Parts of one simulation must share " *
+            "a grid; these cannot be stitched.")
     end
+    NN = (Nx, Ny, Nz)
+    HH = (Hx, Hy, Hz)
 
     lon_raw = if isnothing(coords)
         isnothing(domain_lon) && error(
@@ -1916,43 +1997,23 @@ if !isfile(jld2_filepath)
     for (m, (pi, k)) in enumerate(want)
         jldopen(parts[pi], "r") do file
             key = part_keys[pi][k]
-            raw_u = Float64.(file["timeseries/u/$(key)"])
-            u_arr[:, :, :, m] = if size(raw_u) == (Nx, Ny, Nz)
-                raw_u
-            elseif size(raw_u, 1) == Nx + 1
-                0.5 .* (raw_u[1:Nx, 1:Ny, 1:Nz] .+ raw_u[2:Nx + 1, 1:Ny, 1:Nz])
-            else
-                raw_u[1:Nx, 1:Ny, 1:Nz]
-            end
-            raw_v = Float64.(file["timeseries/v/$(key)"])
-            v_arr[:, :, :, m] = if size(raw_v) == (Nx, Ny, Nz)
-                raw_v
-            elseif size(raw_v, 2) == Ny + 1
-                0.5 .* (raw_v[1:Nx, 1:Ny, 1:Nz] .+ raw_v[1:Nx, 2:Ny + 1, 1:Nz])
-            else
-                raw_v[1:Nx, 1:Ny, 1:Nz]
-            end
-            raw_w = haskey(file, "timeseries/w") ?
-                    Float64.(file["timeseries/w/$(key)"]) : zeros(Nx, Ny, Nz)
-            w_arr[:, :, :, m] = if size(raw_w) == (Nx, Ny, Nz)
-                raw_w
-            elseif size(raw_w, 3) == Nz + 1
-                0.5 .* (raw_w[1:Nx, 1:Ny, 1:Nz] .+ raw_w[1:Nx, 1:Ny, 2:Nz + 1])
-            else
-                raw_w[1:Nx, 1:Ny, 1:Nz]
-            end
-            raw_T = haskey(file, "timeseries/T") ?
-                    Float64.(file["timeseries/T/$(key)"]) : zeros(Nx, Ny, Nz)
-            T_arr[:, :, :, m] = if size(raw_T) == (Nx, Ny, Nz)
-                raw_T
-            elseif size(raw_T, 3) == Nz + 1
-                0.5 .* (raw_T[1:Nx, 1:Ny, 1:Nz] .+ raw_T[1:Nx, 1:Ny, 2:Nz + 1])
-            else
-                raw_T[1:Nx, 1:Ny, 1:Nz]
-            end
+            read3(v) = _interior_centers(file["timeseries/$(v)/$(key)"], NN, HH;
+                                         name = "$(basename(parts[pi])):$(v)@$(key)")
+            u_arr[:, :, :, m] = read3("u")
+            v_arr[:, :, :, m] = read3("v")
+            w_arr[:, :, :, m] = haskey(file, "timeseries/w") ? read3("w") : zeros(NN)
+            T_arr[:, :, :, m] = haskey(file, "timeseries/T") ? read3("T") : zeros(NN)
             if haskey(file, "timeseries/η")
                 have_eta = true
-                η_arr[:, :, m] = Float64.(file["timeseries/η/$(key)"])[1:Nx, 1:Ny]
+                raw_η = file["timeseries/η/$(key)"]
+                # The free surface is a single z-level; drop that singleton dimension.
+                if ndims(raw_η) == 3
+                    size(raw_η, 3) == 1 || error(
+                        "η@$(key): expected one vertical level, found size $(size(raw_η)).")
+                    raw_η = raw_η[:, :, 1]
+                end
+                η_arr[:, :, m] = _interior_centers(raw_η, (Nx, Ny), (Hx, Hy);
+                                                   name = "η@$(key)")
             end
         end
     end

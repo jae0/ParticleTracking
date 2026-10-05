@@ -1640,62 +1640,7 @@ function run_segment_metrics(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     trajectories = nothing
 )
-    target_trajs = if isnothing(trajectories)
-        target_run_id = !isempty(opts.run_id) ? opts.run_id :
-            "run_$(opts.scenario)_$(opts.projection_year)"
-        tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
-        track_cp = isfile(joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")) ?
-            joinpath(opts.output_dir, "larval_trajectories$(tag).jld2") :
-            joinpath(opts.output_dir, "larval_trajectories.jld2")
-
-        loaded = nothing
-        if opts.enable_duckdb && isfile(opts.duckdb_path)
-            db = open_duckdb_storage(opts.duckdb_path; read_only = true)
-            try
-                println("Loading particle trajectories from DuckDB for run '$(target_run_id)'...")
-                loaded = load_trajectories_namedtuple(db, target_run_id)
-            catch err
-                # fallback to JLD2
-            finally
-                close_duckdb_storage(db)
-            end
-        end
-
-        if !isnothing(loaded)
-            loaded
-        elseif isfile(track_cp)
-            println("Loading particle trajectories from checkpoint: $(track_cp)...")
-            saved = load(track_cp)
-            n_p, n_t = size(saved["lons"])
-            t_end = saved["times"][end]
-            (
-                lons = saved["lons"],
-                lats = saved["lats"],
-                depths = saved["depths"],
-                temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
-                degree_days = saved["degree_days"],
-                degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
-                survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
-                stages = saved["stages"],
-                alive = saved["alive"],
-                settlement_status = saved["settlement_status"],
-                settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
-                stage_survival = _ck_or(saved, "stage_survival", fill(1.0, n_p)),
-                ascent_duration = _ck_or(saved, "ascent_duration", fill(0.0, n_p)),
-                # Absent in checkpoints written before these were added, so the progression
-                # figures degrade to a "not recorded" panel instead of erroring.
-                cohort_molt_fraction = _ck_or(saved, "cohort_molt_fraction", zeros(3, n_t)),
-                molt_schedule = _ck_or(saved, "molt_schedule", nothing),
-                times = saved["times"],
-                ids = saved["ids"]
-            )
-        else
-            println("Trajectories checkpoint not found. Running Segment 6...")
-            run_segment_tracking(opts = opts).trajectories
-        end
-    else
-        trajectories
-    end
+    target_trajs = isnothing(trajectories) ? load_run_trajectories(opts) : trajectories
 
     println("\n=================================================================")
     println(" [Segment 7/8] Empirical Movement, Recruitment & Connectivity")
@@ -1957,6 +1902,137 @@ _ck_or(saved, key::AbstractString, default) =
     (haskey(saved, key) && !isnothing(saved[key])) ? saved[key] : default
 
 """
+    _trajectories_from_checkpoint(saved::Dict) -> NamedTuple
+
+Build the trajectory NamedTuple from a loaded `larval_trajectories*.jld2` dictionary.
+
+Fields that older checkpoints lack are filled with the same placeholders used before
+(`temperatures` 4 °C, `degree_days_timeseries` 40 °C·d, `survival_probability` 0.95). The
+stage diagnostics `cohort_molt_fraction` and `molt_schedule` are set to `nothing` when absent
+and are then rebuilt by [`_complete_stage_diagnostics`](@ref); a zero placeholder would plot
+as a cohort that never moults.
+"""
+function _trajectories_from_checkpoint(saved)
+    n_p, n_t = size(saved["lons"])
+    t_end = saved["times"][end]
+    return (
+        lons = saved["lons"],
+        lats = saved["lats"],
+        depths = saved["depths"],
+        temperatures = _ck_or(saved, "temperatures", fill(4.0, n_p, n_t)),
+        degree_days = saved["degree_days"],
+        degree_days_timeseries = _ck_or(saved, "degree_days_timeseries",
+                                        fill(40.0, n_p, n_t)),
+        survival_probability = _ck_or(saved, "survival_probability", fill(0.95, n_p, n_t)),
+        stages = saved["stages"],
+        alive = saved["alive"],
+        settlement_status = saved["settlement_status"],
+        settlement_age = _ck_or(saved, "settlement_age", fill(t_end, n_p)),
+        stage_survival = _ck_or(saved, "stage_survival", fill(1.0, n_p)),
+        ascent_duration = _ck_or(saved, "ascent_duration", fill(0.0, n_p)),
+        cohort_molt_fraction = _ck_or(saved, "cohort_molt_fraction", nothing),
+        molt_schedule = _ck_or(saved, "molt_schedule", nothing),
+        times = saved["times"],
+        ids = saved["ids"]
+    )
+end
+
+"""
+    _complete_stage_diagnostics(trajs::NamedTuple, opts) -> NamedTuple
+
+Add `molt_schedule` and `cohort_molt_fraction` to a trajectory set that lacks them, such as one
+read back from DuckDB, which stores per-particle rows only.
+
+Both are deterministic functions of the run configuration and the stored degree-days, so they
+are recomputed rather than approximated:
+
+- `molt_schedule = molt_schedule(cv_molt = opts.cv_molt)`. Segment 6 calls
+  `track_larval_cohort` without degree-day thresholds, so the run used the shared defaults
+  (65, 130, 200 °C·d); if Segment 6 starts passing thresholds, pass them here too.
+- `cohort_molt_fraction[:, j] = cohort_molt_fraction(schedule, D̄_j)` with
+  ``\\bar D_j = N_p^{-1} \\sum_p D_{p,j}``, the cohort-mean degree-day at step `j`. This is the
+  formula `track_larval_cohort` applies, and `degree_days_timeseries[:, j]` holds the same
+  per-larva values it averages (dead larvae carry their last value).
+
+Fields already present are left unchanged. When molting is disabled the run recorded no
+schedule, so nothing is added and the figure reports it as not recorded.
+"""
+function _complete_stage_diagnostics(trajs::NamedTuple, opts)
+    has(k) = hasproperty(trajs, k) && !isnothing(getproperty(trajs, k))
+    opts.enable_molting || return trajs
+
+    sched = has(:molt_schedule) ? trajs.molt_schedule : molt_schedule(cv_molt = opts.cv_molt)
+    extra = has(:molt_schedule) ? NamedTuple() : (molt_schedule = sched,)
+
+    if !has(:cohort_molt_fraction)
+        dds = trajs.degree_days_timeseries
+        n_p, n_t = size(dds)
+        cm = Matrix{Float64}(undef, 3, n_t)
+        for j in 1:n_t
+            cm[:, j] .= cohort_molt_fraction(sched, sum(view(dds, :, j)) / n_p)
+        end
+        extra = merge(extra, (cohort_molt_fraction = cm,))
+    end
+    return isempty(extra) ? trajs : merge(trajs, extra)
+end
+
+"""
+    load_run_trajectories(opts::HydrodynamicOptions) -> NamedTuple
+
+Load the trajectory set of the configured run for Segments 7 and 8.
+
+Sources, in order:
+1. DuckDB (`opts.duckdb_path`, run id `opts.run_id` or `run_<scenario>_<year>`). If the JLD2
+   checkpoint describes the same cohort (equal `ids` and `times`), the checkpoint is used
+   instead, because it also holds `stage_survival`, `ascent_duration` and the true
+   `settlement_age`, none of which DuckDB stores.
+2. The JLD2 checkpoint `larval_trajectories[_<run_id>].jld2`.
+3. Neither present: Segment 6 is run.
+
+The result is passed through [`_complete_stage_diagnostics`](@ref), so every source yields the
+same set of stage fields.
+"""
+function load_run_trajectories(opts::HydrodynamicOptions)
+    target_run_id = !isempty(opts.run_id) ? opts.run_id :
+        "run_$(opts.scenario)_$(opts.projection_year)"
+    tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
+    tagged_cp = joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")
+    track_cp = isfile(tagged_cp) ? tagged_cp :
+               joinpath(opts.output_dir, "larval_trajectories.jld2")
+
+    from_db = nothing
+    if opts.enable_duckdb && isfile(opts.duckdb_path)
+        db = open_duckdb_storage(opts.duckdb_path; read_only = true)
+        try
+            println("Loading particle trajectories from DuckDB for run '$(target_run_id)'...")
+            from_db = load_trajectories_namedtuple(db, target_run_id)
+        catch err
+            println("  DuckDB load failed ($(sprint(showerror, err))); trying the checkpoint.")
+        finally
+            close_duckdb_storage(db)
+        end
+    end
+
+    from_cp = isfile(track_cp) ? _trajectories_from_checkpoint(load(track_cp)) : nothing
+
+    trajs = if !isnothing(from_db) && !isnothing(from_cp) &&
+               Int.(from_cp.ids) == Int.(from_db.ids) &&
+               Float64.(from_cp.times) == Float64.(from_db.times)
+        println("  using the matching checkpoint $(track_cp) (holds the full stage record).")
+        from_cp
+    elseif !isnothing(from_db)
+        from_db
+    elseif !isnothing(from_cp)
+        println("Loading particle trajectories from checkpoint: $(track_cp)...")
+        from_cp
+    else
+        println("Trajectories checkpoint not found. Running Segment 6...")
+        run_segment_tracking(opts = opts).trajectories
+    end
+    return _complete_stage_diagnostics(trajs, opts)
+end
+
+"""
     run_segment_visualize(;
         opts::HydrodynamicOptions,
         trajectories=nothing
@@ -1973,62 +2049,7 @@ function run_segment_visualize(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     trajectories = nothing
 )
-    target_trajs = if isnothing(trajectories)
-        target_run_id = !isempty(opts.run_id) ? opts.run_id :
-            "run_$(opts.scenario)_$(opts.projection_year)"
-        tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
-        track_cp = isfile(joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")) ?
-            joinpath(opts.output_dir, "larval_trajectories$(tag).jld2") :
-            joinpath(opts.output_dir, "larval_trajectories.jld2")
-
-        loaded = nothing
-        if opts.enable_duckdb && isfile(opts.duckdb_path)
-            db = open_duckdb_storage(opts.duckdb_path; read_only = true)
-            try
-                println("Loading particle trajectories from DuckDB for run '$(target_run_id)'...")
-                loaded = load_trajectories_namedtuple(db, target_run_id)
-            catch err
-                # fallback to JLD2
-            finally
-                close_duckdb_storage(db)
-            end
-        end
-
-        if !isnothing(loaded)
-            loaded
-        elseif isfile(track_cp)
-            println("Loading particle trajectories from checkpoint: $(track_cp)...")
-            saved = load(track_cp)
-            n_p, n_t = size(saved["lons"])
-            t_end = saved["times"][end]
-            (
-                lons = saved["lons"],
-                lats = saved["lats"],
-                depths = saved["depths"],
-                temperatures = get(saved, "temperatures", fill(4.0, n_p, n_t)),
-                degree_days = saved["degree_days"],
-                degree_days_timeseries = get(saved, "degree_days_timeseries", fill(40.0, n_p, n_t)),
-                survival_probability = get(saved, "survival_probability", fill(0.95, n_p, n_t)),
-                stages = saved["stages"],
-                alive = saved["alive"],
-                settlement_status = saved["settlement_status"],
-                settlement_age = get(saved, "settlement_age", fill(t_end, n_p)),
-                stage_survival = _ck_or(saved, "stage_survival", fill(1.0, n_p)),
-                ascent_duration = _ck_or(saved, "ascent_duration", fill(0.0, n_p)),
-                # Absent in checkpoints written before these were added, so the progression
-                # figures degrade to a "not recorded" panel instead of erroring.
-                cohort_molt_fraction = _ck_or(saved, "cohort_molt_fraction", zeros(3, n_t)),
-                molt_schedule = _ck_or(saved, "molt_schedule", nothing),
-                times = saved["times"],
-                ids = saved["ids"]
-            )
-        else
-            println("Trajectories checkpoint not found. Running Segment 6...")
-            run_segment_tracking(opts = opts).trajectories
-        end
-    else
-        trajectories
-    end
+    target_trajs = isnothing(trajectories) ? load_run_trajectories(opts) : trajectories
 
     println("\n=================================================================")
     println(" [Segment 8/8] Scientific Visualizations & Spatial Figures")
