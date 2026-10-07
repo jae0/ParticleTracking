@@ -226,12 +226,10 @@ mortality_cold_sensitivity = 0.01
 [storage]
 # All output for this configuration lands under outputs/default/, and the resolved
 # configuration is copied there as `resolved_config.toml` for provenance.
-output_dir = "outputs/default"
-output_filename = "default.jld2"
+output_path = "outputs/default/default.jld2"
+storage_backend = "zarr"
 output_schedule_seconds = 3600.0
 checkpoint_fields = ["u", "v", "w", "T", "S"]
-enable_duckdb = true
-duckdb_path = "outputs/default/default.duckdb"
 enable_checkpoint = true
 checkpoint_prefix = "default_checkpoint"
 checkpoint_schedule_seconds = 3600.0

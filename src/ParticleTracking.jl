@@ -30,25 +30,28 @@ The module provides:
 module ParticleTracking
 
 using
-  Random,
-  CairoMakie,
-  CUDA,
-  Adapt,
-  NCDatasets,
-  Downloads,
-  DuckDB,
-  DataFrames,
-  DBInterface,
-  Dates,
-  Statistics,
-  LinearAlgebra,
-  TOML,
-  JLD2,
-  TaylorSeries,
-  Interpolations,
-  NumericalEarth,
-  ClimaOcean,
-  Distributions
+   Random,
+   CairoMakie,
+   CUDA,
+   Adapt,
+   NCDatasets,
+   Downloads,
+   DataFrames,
+   DBInterface,
+   Dates,
+   Statistics,
+   LinearAlgebra,
+   TOML,
+   JLD2,
+   TaylorSeries,
+   Interpolations,
+   NumericalEarth,
+   ClimaOcean,
+   Distributions,
+   GeoData
+
+# Local manifest module that re-exports GeoData's manifest framework
+using .Manifest
 
 using Oceananigans.Units
 using Oceananigans.Utils: prettytime
@@ -67,7 +70,7 @@ using Oceananigans
 #             simulation drivers, native diagnostics
 #   config/   TOML options, and provenance
 #   biology/  larval transport, DVM, molting, mortality, settlement
-#   analysis/ Voronoi units, empirical metrics, DuckDB storage
+#   analysis/ Voronoi units, empirical metrics, Zarr storage
 #   output/   plots, animations, interactive maps
 # ============================================================================
 include("model/numerical_earth.jl")
@@ -84,9 +87,13 @@ include("model/simulation.jl")
 include("biology/larval_behavior.jl")
 include("analysis/empirical_analysis.jl")
 include("analysis/voronoi_tessellation.jl")
-include("analysis/storage_duckdb.jl")
+include("analysis/larval_storage.jl")
 include("output/visualization.jl")
 include("output/biology_diagnostics.jl")
+
+# GeoData integration (optional - included as a submodule that requires GeoData to be loaded)
+# Users can access via ParticleTracking.GeoDataIntegration after loading GeoData
+include("data/geodata/geodata_integration.jl")
 
 # Exported APIs
 export
@@ -108,41 +115,33 @@ export
     # Architecture and device resolution
     resolve_architecture,
 
-    # Provenance registry for every physical input (keyless source first)
-    DATA_SOURCES,
-    DataSource,
-    data_source,
-    describe_data_sources,
-    data_provenance,
-    file_digest,
-    input_dir,
-    fetch_input,
+     # Provenance registry for every physical input (keyless source first)
+     # Now imported from GeoData.Data.GeoDataManifest via ParticleTracking.Manifest
+     DATA_SOURCES,
+     DataSource,
+     data_source,
+     describe_data_sources,
+     data_provenance,
+     file_digest,
+     input_dir,
+     fetch_input,
 
-    # Open real-world data and regridding
-    fetch_open_bathymetry,
-    fetch_etopo2022_bathymetry,
-    fetch_open_surface_winds,
-    fetch_surface_winds,
-    fetch_bathymetry,
-    fetch_open_meteo_surface_winds,
-    fetch_natural_earth_coastline,
-    read_wind_stress,
-    build_bulk_surface_flux,
-    TimeSeriesSurfaceStress,
-    fetch_open_woa_climatology,
-    fetch_boundary_hydrography,
-    build_boundary_tracer_interpolators,
-    copernicus_credentials,
-    fetch_hycom_boundary,
-    fetch_woa23_hydrography,
-    fetch_copernicus_surface_winds,
-    fetch_copernicus_physics_subset,
-    fetch_copernicus_hydrography_with_fallback,
-    project_python,
-    copernicusmarine_executable,
-    copernicus_login_reminder,
-    wind_speed_to_kinematic_stress,
-    regrid_2d_field,
+     # Open real-world data and regridding
+     fetch_open_bathymetry,
+     fetch_etopo2022_bathymetry,
+     fetch_open_surface_winds,
+     fetch_surface_winds,
+     fetch_bathymetry,
+     fetch_open_meteo_surface_winds,
+     fetch_natural_earth_coastline,
+     read_wind_stress,
+     build_bulk_surface_flux,
+     TimeSeriesSurfaceStress,
+     fetch_open_woa_climatology,
+     fetch_boundary_hydrography,
+     build_boundary_tracer_interpolators,
+     wind_speed_to_kinematic_stress,
+     regrid_2d_field,
 
     # Grid, bathymetry & coastline geometry
     REGIONAL_COASTLINE,
@@ -277,23 +276,19 @@ export
     compute_tesselated_connectivity_matrix,
     export_voronoi_geojson,
 
-    # DuckDB analytical storage, scenario management & model averaging
-    open_duckdb_storage,
-    close_duckdb_storage,
-    close_all_duckdb_storage!,
-    initialize_duckdb_schema!,
-    save_simulation_run!,
-    load_run_configuration,
-    list_simulation_runs,
-    load_trajectories_df,
-    load_trajectories_namedtuple,
-    load_all_scenario_trajectories,
-    save_hydrodynamic_field!,
-    load_hydrodynamic_field,
-    load_gridded_dispersal,
-    load_connectivity_matrix,
-    compare_scenarios,
-    compute_ensemble_model_average,
+    # Zarr analytical storage (via GeoData), scenario management & model averaging
+    open_larval_storage,
+    close_larval_storage,
+    initialize_larval_storage_schema!,
+    save_larval_simulation_run!,
+    list_larval_simulation_runs,
+    load_larval_trajectories,
+    load_larval_recruitment_metrics,
+    load_larval_connectivity,
+    load_larval_gridded_dispersal,
+    load_larval_hydrodynamic_fields,
+    compare_larval_scenarios,
+    compute_larval_ensemble_model_average,
 
     # Visualization, interactive maps & scenario comparison
     plot_particle_trajectories,

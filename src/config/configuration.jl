@@ -168,8 +168,11 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
   Defaults to `false`, so the run fails loudly instead of quietly running somewhere other than
   where `use_gpu` said it would.
 - `interactive_map::Bool`: Whether to export interactive HTML5 Leaflet map.
-- `enable_duckdb::Bool`: Whether to persist simulation data to DuckDB.
-- `duckdb_path::String`: DuckDB file path.
+- `output_path::AbstractString`: Base path for simulation outputs. Extension determines format:
+  - `.zarr` or directory: Zarr storage via GeoData
+  - `.jld2`: Direct JLD2 file for hydrodynamic outputs
+  - No extension: treated as directory for JLD2 files (legacy behavior)
+- `storage_backend::String`: Storage backend for larval data ("zarr" or "geoparquet").
 - `config_file::String`: Source configuration file path.
 - `bathy_source::String`: Which bathymetry product to ingest; the run always reads the product
   named here rather than choosing between a real and a synthetic mode.
@@ -177,7 +180,6 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `shelf_slope::Float64`: Total seabed rise across the shelf (m).
 - `output_schedule_seconds::Float64`: Field-output cadence. Independent of
   `checkpoint_schedule`, which is the state-checkpoint cadence; the two may legitimately differ.
-- `output_dir::String`: Directory for simulation artifacts and figures.
 - `input_dir::String`: Directory for raw and processed bathymetry/wind files.
 - `seed::Int`: Random number generator seed.
 - `hydro_model_file::String`: Target hydrodynamic JLD2 checkpoint path (input/output).
@@ -189,7 +191,7 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `checkpoint_dir::String`: Directory where state checkpoints are archived.
 - `checkpoint_cleanup::Bool`: Whether older intermediate checkpoints are automatically deleted.
 - `auto_restart::Bool`: Automatically detect and pick up from existing checkpoints if available.
-- `run_id::String`: Unique cohort identifier for DuckDB persistence and figures.
+- `run_id::String`: Unique cohort identifier for Zarr persistence and figures.
 - `vertical_stretching_mode::Symbol`: Vertical grid stretching mode (:tanh, :uniform, or :csv).
 - `vertical_grid_file::String`: Path to CSV file specifying vertical layer boundary faces.
 - `resolution_scale::Float64`: Horizontal grid resolution scale multiplier / divisor.
@@ -255,26 +257,24 @@ struct HydrodynamicOptions
     buffer_km                :: Float64
     release_depth_mode       :: Symbol
     bottom_release_offset    :: Tuple{Float64, Float64}
-    enable_initial_ascent    :: Bool
-    ascent_speed             :: Float64
-    ascent_target_depth      :: Float64
-    use_gpu                  :: Bool
-    fallback_to_cpu          :: Bool
-    interactive_map          :: Bool
-    enable_duckdb            :: Bool
-    duckdb_path              :: String
-    config_file              :: String
-    output_dir               :: String
-    input_dir                :: String
-    seed                     :: Int
-    hydro_model_file         :: String
-    hydro_only               :: Bool
-    track_only               :: Bool
-    reuse_hydro              :: Bool
-    enable_checkpoint        :: Bool
-    checkpoint_prefix        :: String
-    checkpoint_schedule      :: Float64
-    output_schedule_seconds  :: Float64
+     enable_initial_ascent    :: Bool
+     ascent_speed             :: Float64
+     ascent_target_depth      :: Float64
+     use_gpu                  :: Bool
+     fallback_to_cpu          :: Bool
+     interactive_map          :: Bool
+     config_file              :: String
+     seed                     :: Int
+     hydro_model_file         :: String
+     hydro_only               :: Bool
+     track_only               :: Bool
+     reuse_hydro              :: Bool
+     enable_checkpoint        :: Bool
+     checkpoint_prefix        :: String
+     checkpoint_schedule      :: Float64
+     output_schedule_seconds  :: Float64
+     output_path              :: AbstractString
+     storage_backend          :: String
     checkpoint_dir           :: String
     checkpoint_cleanup       :: Bool
     auto_restart             :: Bool
@@ -460,8 +460,8 @@ function HydrodynamicOptions(;
     use_gpu               :: Bool = false,
     fallback_to_cpu       :: Bool = false,
     interactive_map       :: Bool = true,
-    enable_duckdb         :: Bool = true,
-    duckdb_path           :: AbstractString = joinpath("outputs", "particle_tracking.duckdb"),
+    enable_zarr         :: Bool = true,
+    zarr_path           :: AbstractString = joinpath("outputs", "particle_tracking.zarr"),
     config_file           :: AbstractString = find_default_config_path(),
     output_dir            :: AbstractString = "outputs",
     input_dir             :: AbstractString = "inputs",
@@ -587,13 +587,8 @@ function HydrodynamicOptions(;
         use_gpu,
         fallback_to_cpu,
         interactive_map,
-        enable_duckdb,
-        String(duckdb_path),
         String(config_file),
-        String(output_dir),
-        String(input_dir),
         seed,
-        String(hydro_model_file),
         hydro_only,
         track_only,
         reuse_hydro,
@@ -607,7 +602,9 @@ function HydrodynamicOptions(;
         String(run_id),
         vertical_stretching_mode,
         Int(nz_above),
-        Float64(vertical_break_depth),
+         String(output_path),
+         String(storage_backend),
+         Float64(vertical_break_depth),
         String(vertical_grid_file),
         Float64[Float64(d) for d in vertical_depths],
         Float64(resolution_scale),
@@ -827,15 +824,15 @@ function get_default_configuration()::Dict{String, Any}
             "settlement_max_depth" => -50.0,
             "settlement_max_temp" => 6.0
         ),
-        "storage" => Dict{String, Any}(
-            "enable_duckdb" => true,
-            "duckdb_path" => "outputs/particle_tracking.duckdb",
-            "enable_checkpoint" => true,
-            "checkpoint_prefix" => "checkpoint_ParticleTracking",
-            "checkpoint_schedule_seconds" => 21600.0,
-            "checkpoint_dir" => "outputs/checkpoints",
-            "checkpoint_cleanup" => true
-        ),
+         "storage" => Dict{String, Any}(
+             "output_path" => joinpath("outputs", "particle_tracking.jld2"),
+             "storage_backend" => "zarr",
+             "enable_checkpoint" => true,
+             "checkpoint_prefix" => "checkpoint_ParticleTracking",
+             "checkpoint_schedule_seconds" => 21600.0,
+             "checkpoint_dir" => "outputs/checkpoints",
+             "checkpoint_cleanup" => true
+         ),
         "tessellation" => Dict{String, Any}(
             "enable_voronoi" => false,
             "n_units" => 5000,
@@ -1025,26 +1022,30 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     anim_fmt     = String(get_val("visualization", "anim_format", "mp4"))
     anim_depth   = Float64(get_val("visualization", "anim_depth", -2.5))
     anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
-    anim_out_path = String(get_val("visualization", "anim_output_path", ""))
+     anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
-    enable_duckdb = Bool(get_val("storage", "enable_duckdb", true))
-    duckdb_path   = String(get_val("storage", "duckdb_path", "outputs/particle_tracking.duckdb"))
+     output_path = String(get_val("storage", "output_path", joinpath("outputs", "particle_tracking.jld2")))
+     storage_backend = String(get_val("storage", "storage_backend", "zarr"))
+     
+     enable_checkpoint = Bool(get_val("storage", "enable_checkpoint", true))
+     checkpoint_prefix = String(get_val("storage", "checkpoint_prefix", "checkpoint_ParticleTracking"))
+     checkpoint_schedule_seconds = Float64(get_val("storage", "checkpoint_schedule_seconds", 21600.0))
+     checkpoint_dir = String(get_val("storage", "checkpoint_dir", "outputs/checkpoints"))
+     checkpoint_cleanup = Bool(get_val("storage", "checkpoint_cleanup", true))
+     
+     # Ingested data lives in `<output_path>` directory's `inputs` subdirectory, beside this
+     # run's outputs, provenance and resolved config. It is deliberately NOT configurable and
+     # NOT shared between runs: a single top-level `inputs/` let a run with a changed domain
+     # silently reuse another domain's bathymetry, which is exactly the quiet mismatch
+     # `resolved_config.toml` and `data_provenance.json` exist to expose. The cost is disk --
+     # a dataset is fetched once per scenario rather than once per machine -- and that is the
+     # intended trade, because it makes each scenario a self-contained, shareable directory.
+     input_dir  = joinpath(dirname(output_path), "inputs")
+     seed       = Int(get_val("paths", "seed", 42))
 
-    output_dir = String(get_val("storage", "output_dir", "outputs"))
-    # Ingested data lives in `<output_dir>/inputs`, beside this run's outputs, provenance and
-    # resolved config. It is deliberately NOT configurable and NOT shared between runs: a
-    # single top-level `inputs/` let a run with a changed domain silently reuse another
-    # domain's bathymetry, which is exactly the quiet mismatch `resolved_config.toml` and
-    # `data_provenance.json` exist to expose. The cost is disk -- a dataset is fetched once
-    # per scenario rather than once per machine -- and that is the intended trade, because it
-    # makes each scenario a self-contained, shareable directory.
-    input_dir  = joinpath(output_dir, "inputs")
-    seed       = Int(get_val("paths", "seed", 42))
-
-    hydro_file = String(get_val("hydrodynamics", "hydro_model_file",
-                                get_val("storage", "output_filename", "")))
-    hydro_only = Bool(get_val("hydrodynamics", "hydro_only", false))
-    track_only = Bool(get_val("hydrodynamics", "track_only", false))
+     hydro_file = String(get_val("hydrodynamics", "hydro_model_file", ""))
+     hydro_only = Bool(get_val("hydrodynamics", "hydro_only", false))
+     track_only = Bool(get_val("hydrodynamics", "track_only", false))
     reuse_hydro = Bool(get_val("hydrodynamics", "reuse_hydro", false))
     run_id_val = String(get_val("storage", "run_id", ""))
 
@@ -1206,9 +1207,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         ascent_target_depth = asc_target,
         use_gpu = use_gpu,
         fallback_to_cpu = fallback_cpu,
-        interactive_map = interactive,
-        enable_duckdb = enable_duckdb,
-        duckdb_path = duckdb_path,
+         interactive_map = interactive,
+        zarr_path = zarr_path,
         output_dir = output_dir,
         input_dir = input_dir,
         seed = seed,
@@ -1385,8 +1385,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "storage" => Dict{String, Any}(
             "output_dir" => opts.output_dir,
-            "enable_duckdb" => opts.enable_duckdb,
-            "duckdb_path" => opts.duckdb_path,
+            "enable_zarr" => opts.enable_zarr,
+            "zarr_path" => opts.zarr_path,
             "run_id" => opts.run_id,
             "enable_checkpoint" => opts.enable_checkpoint,
             "checkpoint_prefix" => opts.checkpoint_prefix,
@@ -1482,23 +1482,23 @@ struct HydrodynamicConfig
     sim_duration_seconds     :: Float64
     sim_dt_seconds           :: Float64
     adaptive_cfl             :: Bool
-    target_cfl               :: Float64
-    target_wave_cfl          :: Float64
-    max_dt_seconds           :: Float64
-    min_dt_seconds           :: Float64
-    coriolis_latitude        :: Float64
-    divergence_limit         :: Float64
-    output_dir               :: String
-    output_filename          :: String
-    output_schedule_seconds  :: Float64
-    enable_checkpoint        :: Bool
-    checkpoint_prefix        :: String
-    checkpoint_schedule      :: Float64
-    checkpoint_dir           :: String
-    checkpoint_cleanup       :: Bool
-    auto_restart             :: Bool
-    use_gpu                  :: Bool
-    fallback_to_cpu          :: Bool
+     target_cfl               :: Float64
+     target_wave_cfl          :: Float64
+     max_dt_seconds           :: Float64
+     min_dt_seconds           :: Float64
+      coriolis_latitude        :: Float64
+       divergence_limit         :: Float64
+       output_path              :: AbstractString
+       output_schedule_seconds  :: Float64
+       enable_checkpoint        :: Bool
+       checkpoint_prefix        :: AbstractString
+       checkpoint_schedule      :: Real
+       checkpoint_dir           :: AbstractString
+       checkpoint_cleanup       :: Bool
+       auto_restart             :: Bool
+       use_gpu                  :: Bool
+       fallback_to_cpu          :: Bool
+       storage_backend          :: String
 end
 
 """
@@ -1542,8 +1542,8 @@ struct LarvalDispersalConfig
     cv_molt                  :: Float64
     cv_mortality             :: Float64
     cv_settlement            :: Float64
-    enable_duckdb            :: Bool
-    duckdb_path              :: String
+    enable_zarr            :: Bool
+    zarr_path              :: String
     run_id                   :: String
     seed                     :: Int
 end
@@ -1606,26 +1606,24 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :adaptive_cfl             => opts.adaptive_cfl,
         :target_cfl               => opts.target_cfl,
         :target_wave_cfl          => 0.20,
-        :max_dt_seconds           => opts.max_dt,
-        # Was hardcoded to 2.0, so the second options struct (built from this dict at the call
-        # site below) always carried 2.0 regardless of what the TOML asked for. Use the value
-        # that was actually parsed.
-        :min_dt_seconds           => opts.min_dt_seconds,
-        :coriolis_latitude        => 44.5,
-        :divergence_limit         => 20.0,
-        :output_dir               => opts.output_dir,
-        :output_filename          => isempty(opts.hydro_model_file) ?
-                                     "hydrodynamics_output.jld2" :
-                                     basename(opts.hydro_model_file),
-        :output_schedule_seconds  => opts.output_schedule_seconds,
-        :enable_checkpoint        => opts.enable_checkpoint,
-        :checkpoint_prefix        => opts.checkpoint_prefix,
-        :checkpoint_schedule      => opts.checkpoint_schedule,
-        :checkpoint_dir           => opts.checkpoint_dir,
-        :checkpoint_cleanup       => opts.checkpoint_cleanup,
-        :auto_restart             => opts.auto_restart,
-        :use_gpu                  => opts.use_gpu,
-        :fallback_to_cpu          => opts.fallback_to_cpu
+         :max_dt_seconds           => opts.max_dt,
+         # Was hardcoded to 2.0, so the second options struct (built from this dict at the call
+         # site below) always carried 2.0 regardless of what the TOML asked for. Use the value
+         # that was actually parsed.
+         :min_dt_seconds           => opts.min_dt_seconds,
+         :coriolis_latitude        => 44.5,
+         :divergence_limit         => 20.0,
+         :output_path              => opts.output_path,
+         :storage_backend          => opts.storage_backend,
+         :output_schedule_seconds  => opts.output_schedule_seconds,
+         :enable_checkpoint        => opts.enable_checkpoint,
+         :checkpoint_prefix        => opts.checkpoint_prefix,
+         :checkpoint_schedule      => opts.checkpoint_schedule,
+         :checkpoint_dir           => opts.checkpoint_dir,
+         :checkpoint_cleanup       => opts.checkpoint_cleanup,
+         :auto_restart             => opts.auto_restart,
+         :use_gpu                  => opts.use_gpu,
+         :fallback_to_cpu          => opts.fallback_to_cpu
     )
     for (k, v) in kwargs
         d[k] = v
@@ -1650,12 +1648,12 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         Bool(d[:adaptive_cfl]), Float64(d[:target_cfl]),
         Float64(d[:target_wave_cfl]), Float64(d[:max_dt_seconds]),
         Float64(d[:min_dt_seconds]), Float64(d[:coriolis_latitude]),
-        Float64(d[:divergence_limit]), String(d[:output_dir]),
-        String(d[:output_filename]), Float64(d[:output_schedule_seconds]),
-        Bool(d[:enable_checkpoint]), String(d[:checkpoint_prefix]),
-        Float64(d[:checkpoint_schedule]), String(d[:checkpoint_dir]),
-        Bool(d[:checkpoint_cleanup]), Bool(d[:auto_restart]),
-        Bool(d[:use_gpu]), Bool(d[:fallback_to_cpu])
+         Float64(d[:divergence_limit]), String(d[:output_path]),
+         String(d[:storage_backend]), Float64(d[:output_schedule_seconds]),
+         Bool(d[:enable_checkpoint]), String(d[:checkpoint_prefix]),
+         String(d[:checkpoint_schedule]), String(d[:checkpoint_dir]),
+         Bool(d[:checkpoint_cleanup]), Bool(d[:auto_restart]),
+         Bool(d[:use_gpu]), Bool(d[:fallback_to_cpu])
     )
 end
 
@@ -1700,8 +1698,8 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         :cv_molt                  => opts.cv_molt,
         :cv_mortality             => opts.cv_mortality,
         :cv_settlement            => opts.cv_settlement,
-        :enable_duckdb            => opts.enable_duckdb,
-        :duckdb_path              => opts.duckdb_path,
+        :enable_zarr            => opts.enable_zarr,
+        :zarr_path              => opts.zarr_path,
         :run_id                   => opts.run_id,
         :seed                     => opts.seed
     )
@@ -1726,9 +1724,9 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         Float64(d[:mortality_cold_thresh]), Float64(d[:mortality_cold_sens]),
         Float64(d[:settlement_min_depth]), Float64(d[:settlement_max_depth]),
         Float64(d[:settlement_max_temp]), Bool(d[:settlement_stochastic]),
-        Float64(d[:cv_molt]), Float64(d[:cv_mortality]), Float64(d[:cv_settlement]),
-        Bool(d[:enable_duckdb]),
-        String(d[:duckdb_path]), String(d[:run_id]), Int(d[:seed])
-    )
+         Float64(d[:cv_molt]), Float64(d[:cv_mortality]), Float64(d[:cv_settlement]),
+         Bool(d[:enable_checkpoint]), String(d[:output_path]),
+         String(d[:storage_backend]), Int(d[:seed])
+     )
 end
 

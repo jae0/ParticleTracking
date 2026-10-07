@@ -2,14 +2,22 @@
     grid_bathymetry.jl
 
 Grid construction and immersed boundary setup for shelf hydrodynamic modeling.
+
+ParticleTracking-specific functions requiring Oceananigans grid types.
+All generic geospatial operations (bathymetry I/O, regridding, coastline, marine cell
+extraction, smoothing, buffering) are in GeoData.Data.
 """
 
 using Oceananigans
 using Oceananigans.Grids: Face, Center, znode
 using Oceananigans.Architectures: architecture, on_architecture, CPU, GPU
+using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, GridFittedBottom
 using NCDatasets
 using Interpolations
 using NumericalEarth: ETOPO2022, regrid_bathymetry, smooth_topography!, BoundingBox
+using GeoData
+using GeoData.Data
+using Random
 
 """
     build_shelf_grid(;
@@ -23,28 +31,6 @@ using NumericalEarth: ETOPO2022, regrid_bathymetry, smooth_topography!, Bounding
     )
 
 Construct a `LatitudeLongitudeGrid` for regional shelf hydrodynamics with specified architecture.
-
-# Mathematical & Physical Formulation
-The grid discretizes the spherical curvilinear coordinate system
-\$( \\lambda, \\phi, z )\$ representing longitude, latitude, and vertical depth on CPU or GPU.
-```math
-\\lambda \\in [\\lambda_{\\min}, \\lambda_{\\max}], \\quad
-\\phi \\in [\\phi_{\\min}, \\phi_{\\max}], \\quad
-z \\in [z_{\\text{bottom}}, z_{\\text{surface}}]
-```
-
-# Inputs
-- `architecture`: Architecture descriptor (`:cpu`, `:gpu`, `:cuda`, or `AbstractArchitecture`).
-- `lon_range::Tuple{Real, Real}`: Longitude bounds in degrees East.
-- `lat_range::Tuple{Real, Real}`: Latitude bounds in degrees North.
-- `z_range::Tuple{Real, Real}`: Vertical bounds in meters (bottom, top).
-- `z_faces::Union{Nothing, AbstractVector, Function}`: Custom stretched vertical face coordinates.
-- `grid_size::Tuple{Int, Int, Int}`: Number of grid cells `(Nx, Ny, Nz)`.
-- `topology::Tuple`: Oceananigans boundary topology (default Bounded in all 3 dirs).
-- `fallback_to_cpu::Bool`: If true, falls back to CPU when GPU is requested on non-CUDA systems.
-
-# Outputs
-- `LatitudeLongitudeGrid`: Discretized computational grid on specified architecture.
 """
 function build_shelf_grid(;
     architecture = :cpu,
@@ -52,11 +38,11 @@ function build_shelf_grid(;
     lat_range::Tuple{Real, Real} = (40.0, 48.5),
     z_range::Tuple{Real, Real} = (-3500.0, 0.0),
     z_faces::Union{Nothing, AbstractVector, Function} = nothing,
-       grid_size::Tuple{Int, Int, Int} = (50, 50, 10),
-       halo::Tuple{Int, Int, Int} = (7, 7, 5),
-       topology::Tuple = (Bounded, Bounded, Bounded),
-       fallback_to_cpu::Bool = false
-   )
+    grid_size::Tuple{Int, Int, Int} = (50, 50, 10),
+    halo::Tuple{Int, Int, Int} = (7, 7, 5),
+    topology::Tuple = (Bounded, Bounded, Bounded),
+    fallback_to_cpu::Bool = false
+)
     if lon_range[1] >= lon_range[2]
         error("Invalid longitude range: $(lon_range). lon_min must be < lon_max.")
     end
@@ -124,12 +110,6 @@ function load_vertical_grid_csv(filepath::AbstractString)::Vector{Float64}
         end
     end
     if !issorted(faces)
-        # A positive-downward file (0, 10, 20, ... 5000) is *ascending* and therefore passes this
-        # check, but Oceananigans expects z faces negative and ascending (deepest first, surface
-        # last). An inverted axis silently produces nonsense grid metrics: the split-explicit
-        # free-surface substepping computes a NaN CFL and the run dies with
-        # `InexactError: Int64(NaN)` several segments later, far from the cause. Reject the wrong
-        # convention here, with a message naming it.
         if issorted(faces; rev = true)
             error(
                 "Vertical grid file $(filepath) is written positive-downward (first face " *
@@ -139,7 +119,6 @@ function load_vertical_grid_csv(filepath::AbstractString)::Vector{Float64}
         end
         error("Parsed vertical grid faces from $(filepath) are not monotonically sorted.")
     end
-    # Surface must be 0 m. Anything else means the column is offset or the wrong convention.
     abs(last(faces)) <= 1e-6 || error(
         "Vertical grid faces from $(filepath) must end at 0.0 m (the surface); got " *
         "$(last(faces)) m.")
@@ -149,572 +128,233 @@ function load_vertical_grid_csv(filepath::AbstractString)::Vector{Float64}
     return faces
 end
 
-
 """
-    load_bathymetry_from_netcdf(filepath::AbstractString, varname::AbstractString="elevation")
+    build_immersed_grid(
+        grid::LatitudeLongitudeGrid,
+        bathymetry::Union{AbstractMatrix, AbstractString};
+        varname::AbstractString = "elevation"
+    )
 
-Extract a 2D bathymetry matrix and coordinate vectors from a NetCDF dataset.
-
-# Inputs
-- `filepath::AbstractString`: Path to the bathymetry NetCDF file.
-- `varname::AbstractString`: Name of the elevation variable (default "elevation").
-
-# Outputs
-- `NamedTuple`: `(elevation = Matrix{Float64}, lon = Vector{Float64}, lat = Vector{Float64})`
-
-The returned `elevation` matrix always has shape `(n_lon, n_lat)` (i.e.,
-indexed as `elev[i_lon, j_lat]`), regardless of the on-disk dimension order.
-CF-compliant and ERDDAP files typically store arrays as `(lat, lon)`, detected
-via `dimnames` and corrected with `permutedims`.
+Wrap a base `LatitudeLongitudeGrid` with an `ImmersedBoundaryGrid` using
+`GridFittedBottom` representing ocean seafloor topography.
 """
-function load_bathymetry_from_netcdf(
-    filepath::AbstractString,
+function build_immersed_grid(
+    grid::LatitudeLongitudeGrid,
+    bathymetry::Union{AbstractMatrix, AbstractString};
     varname::AbstractString = "elevation"
 )
-    if !isfile(filepath)
-        error("Bathymetry file does not exist: $(filepath)")
+    topo_matrix::Matrix{Float64} = if bathymetry isa AbstractString
+        GeoData.Data.load_bathymetry_geodata(bathymetry).elevation
+    else
+        Matrix{Float64}(bathymetry)
     end
 
-    return NCDatasets.Dataset(filepath, "r") do ds
-        # Detect elevation variable
-        actual_var = if haskey(ds, varname)
-            varname
-        else
-            candidates = ["elevation", "altitude", "topo", "z",
-                          "bedrock_altitude", "Band1"]
-            found = findfirst(c -> haskey(ds, c), candidates)
-            if isnothing(found)
-                available = collect(keys(ds))
-                error("Elevation variable '$(varname)' not found in " *
-                      "$(filepath). Available: $(available)")
-            end
-            candidates[found]
-        end
+    nx, ny, _ = size(grid)
+    t_nx, t_ny = size(topo_matrix)
 
-        raw_elev = Array{Float64}(ds[actual_var][:, :])
-
-        # Detect longitude coordinate variable
-        lon_candidates = ["lon", "longitude", "x", "nav_lon"]
-        lon_var = findfirst(c -> haskey(ds, c), lon_candidates)
-        if isnothing(lon_var)
-            available = collect(keys(ds))
-            error("Longitude coordinate variable not found in bathymetry file $(filepath). " *
-                  "Searched candidate names: $(lon_candidates). Available variables: $(available)")
-        end
-        lon_coords = collect(Float64, ds[lon_candidates[lon_var]][:])
-
-        # Detect latitude coordinate variable
-        lat_candidates = ["lat", "latitude", "y", "nav_lat"]
-        lat_var = findfirst(c -> haskey(ds, c), lat_candidates)
-        if isnothing(lat_var)
-            available = collect(keys(ds))
-            error("Latitude coordinate variable not found in bathymetry file $(filepath). " *
-                  "Searched candidate names: $(lat_candidates). Available variables: $(available)")
-        end
-        lat_coords = collect(Float64, ds[lat_candidates[lat_var]][:])
-
-        # Guarantee elevation layout is (n_lon, n_lat): CF-compliant and ERDDAP
-        # files store arrays as (lat, lon) — first dimension is latitude.
-        # Detect this via dimnames and apply permutedims when necessary.
-        dim_names = NCDatasets.dimnames(ds[actual_var])
-        lat_like  = ["lat", "latitude", "y", "nav_lat"]
-        needs_transpose = (length(dim_names) >= 1 &&
-                           lowercase(string(dim_names[1])) in lat_like)
-        elevation_data = needs_transpose ? permutedims(raw_elev, (2, 1)) : raw_elev
-
-        if !isempty(lon_coords) && !isempty(lat_coords)
-            expected = (length(lon_coords), length(lat_coords))
-            if size(elevation_data) != expected
-                @warn "load_bathymetry_from_netcdf: elevation matrix " *
-                      "size $(size(elevation_data)) does not match coordinate " *
-                      "lengths $(expected) after transposition. " *
-                      "Verify dimension ordering in $(filepath)."
-            end
-        end
-
-        return (
-            elevation = elevation_data,
-            lon = lon_coords,
-            lat = lat_coords
+    if (nx != t_nx) || (ny != t_ny)
+        error(
+            "Bathymetry dimensions ($(t_nx), $(t_ny)) do not match grid horizontal " *
+            "dimensions ($(nx), $(ny))."
         )
     end
-end
 
-"""
-    write_bathymetry_netcdf(bathy, filepath; varname = "elevation") -> String
-
-Persist a bathymetry `NamedTuple` `(lon, lat, elevation)` to a CF-style NetCDF file that
-round-trips through [`load_bathymetry_from_netcdf`](@ref).
-
-Arrays are written as `(longitude, latitude)` with `elevation` indexed `[i_lon, j_lat]`,
-matching the in-memory convention used throughout this package. Coordinates are written as
-1-D variables named `longitude` and `latitude`; the loader also accepts the CF-preferred
-`lat`/`lon` aliases.
-
-# Inputs
-- `bathy`: `NamedTuple` with `lon`, `lat`, and `elevation` fields.
-- `filepath`: Destination NetCDF path (parent directories are created).
-- `varname`: Name of the elevation variable in the output file.
-
-# Outputs
-- `String`: The written filepath.
-"""
-function write_bathymetry_netcdf(
-    bathy,
-    filepath::AbstractString;
-    varname::AbstractString = "elevation"
-)::String
-    hasproperty(bathy, :lon) || error("bathy must have a :lon field")
-    hasproperty(bathy, :lat) || error("bathy must have a :lat field")
-    hasproperty(bathy, :elevation) || error("bathy must have an :elevation field")
-
-    lons = Float64.(bathy.lon)
-    lats = Float64.(bathy.lat)
-    elev = Float64.(bathy.elevation)
-
-    size(elev) == (length(lons), length(lats)) || error(
-        "elevation size $(size(elev)) must equal (length(lon), length(lat)) = " *
-        "($(length(lons)), $(length(lats)))"
-    )
-
-    mkpath(dirname(abspath(filepath)))
-
-    ds = NCDatasets.Dataset(filepath, "c")
-    try
-        NCDatasets.defDim(ds, "longitude", length(lons))
-        NCDatasets.defDim(ds, "latitude", length(lats))
-        lon_v = NCDatasets.defVar(ds, "longitude", Float64, ("longitude",))
-        lat_v = NCDatasets.defVar(ds, "latitude", Float64, ("latitude",))
-        z_v = NCDatasets.defVar(ds, varname, Float64, ("longitude", "latitude"),
-                                fillvalue = Float32(NaN))
-        lon_v[:] = lons
-        lat_v[:] = lats
-        z_v[:, :] = elev
-    finally
-        # NCDatasets variables are closed with the dataset; no per-variable close.
-        close(ds)
-    end
-
-    return String(filepath)
-end
-
-"""
-    get_bathymetry_interpolator(bathymetry; varname="elevation") -> Function
-
-Construct a continuous 2D spatial bilinear interpolation function `(lon, lat) -> z_bed`
-from a bathymetry dataset (`NamedTuple` with `:lon, :lat, :elevation`), NetCDF file path,
-or direct function.
-
-# Mathematical Formulation
-Given grid points \$(\\lambda_i, \\phi_j)\$ with seabed elevation \$z_{i,j}\$, the interpolated
-seabed elevation at \$(\\lambda, \\phi)\$ within cell \$[\\lambda_i, \\lambda_{i+1}] \\times [\\phi_j, \\phi_{j+1}]\$ is:
-```math
-z(\\lambda, \\phi) = (1 - t_\\lambda)(1 - t_\\phi) z_{i,j} + t_\\lambda(1 - t_\\phi) z_{i+1,j}
-                   + (1 - t_\\lambda) t_\\phi z_{i,j+1} + t_\\lambda t_\\phi z_{i+1,j+1}
-```
-where:
-```math
-t_\\lambda = \\frac{\\lambda - \\lambda_i}{\\lambda_{i+1} - \\lambda_i}, \\quad
-t_\\phi = \\frac{\\phi - \\phi_j}{\\phi_{j+1} - \\phi_j}
-```
-
-# Inputs
-- `bathymetry`: Function `(lon, lat) -> z`, `NamedTuple` `(lon, lat, elevation)`, or
-  NetCDF filepath `AbstractString`.
-- `varname::AbstractString`: Variable name if reading from NetCDF (default "elevation").
-
-# Outputs
-- `Function`: `(lon::Real, lat::Real) -> Float64` returning seabed elevation in meters
-  (\$z \\le 0\$ for ocean, \$z > 0\$ for land).
-"""
-function get_bathymetry_interpolator(
-    bathymetry::Union{Function, NamedTuple, AbstractString};
-    varname::AbstractString = "elevation"
-)
-    if bathymetry isa Function
-        return bathymetry
-    end
-
-    bathy_data = if bathymetry isa AbstractString
-        load_bathymetry_from_netcdf(bathymetry, varname)
-    else
-        bathymetry
-    end
-
-    if !hasproperty(bathy_data, :lon) || !hasproperty(bathy_data, :lat) || !hasproperty(bathy_data, :elevation)
-        error("Bathymetry data NamedTuple must contain :lon, :lat, and :elevation fields. " *
-              "Received keys: $(keys(bathy_data))")
-    end
-
-    lons = Float64.(bathy_data.lon)
-    lats = Float64.(bathy_data.lat)
-    elev = Float64.(bathy_data.elevation)
-
-    n_lon = length(lons)
-    n_lat = length(lats)
-
-    if n_lon < 2 || n_lat < 2
-        error("Bathymetry grid requires >= 2x2 grid points. Found $(n_lon) longitudes x $(n_lat) latitudes. " *
-              "Check whether bathymetry coordinates are empty or corrupted.")
-    end
-
-    if size(elev) != (n_lon, n_lat)
-        if size(elev) == (n_lat, n_lon)
-            elev = permutedims(elev, (2, 1))
-        else
-            error("Bathymetry elevation matrix size $(size(elev)) does not match coordinate dimensions " *
-                  "(n_lon=$(n_lon), n_lat=$(n_lat)).")
-        end
-    end
-
-    if !issorted(lons) || !issorted(lats)
-        error("Bathymetry coordinates must be monotonically increasing for spatial interpolation. " *
-              "lons sorted: $(issorted(lons)), lats sorted: $(issorted(lats)).")
-    end
-
-    # Bilinear interpolation delegated to Interpolations.jl, with flat extrapolation so
-    # queries marginally outside the surveyed box clamp to the nearest edge cell rather
-    # than returning NaN.
-    itp = interpolate((lons, lats), elev, Gridded(Interpolations.Linear()))
-    itp_flat = extrapolate(itp, Interpolations.Flat())
-
-    return function (lon::Real, lat::Real)
-        return Float64(itp_flat(Float64(lon), Float64(lat)))
-    end
-end
-
-"""
-    regrid_bathymetry_from_etopo(grid;
-        minimum_depth = 0.0,
-        interpolation_passes = 1,
-        major_basins = 1,
-        cache = true) -> Field
-
-Regridded seafloor bottom height (m, negative in the ocean) for `grid`, obtained from the
-`NumericalEarth.jl` ETOPO 2022 15-arcsec global relief dataset.
-
-This is the supported replacement for hand-rolled bathymetic regridding: `NumericalEarth`
-downloads and caches the dataset, builds its native grid, interpolates in one or more
-progressively coarsening passes, enforces a minimum wet-cell depth, removes minor basins,
-and returns an Oceananigans `Field{Center,Center,Nothing}` on `grid`.
-
-# Inputs
-- `grid`: Target `LatitudeLongitudeGrid` (or an `ImmersedBoundaryGrid`'s underlying grid).
-- `minimum_depth`: Positive minimum depth (m) for wet cells; shallower cells become land.
-- `interpolation_passes`: Number of progressive interpolation passes. Coarsening passes
-  double as a smoothing filter; use 1 to preserve the native ETOPO detail.
-- `major_basins`: Number of independent submerged basins to retain. `1` keeps only the
-  largest connected wet region, which removes spurious inland seas; use `Inf` to keep all.
-- `cache`: Reuse the on-disk regridded-bathymetry cache across runs.
-
-# Outputs
-- `Field{Center, Center, Nothing}`: Bottom height in metres, on `grid`.
-"""
-function regrid_bathymetry_from_etopo(
-    grid;
-    minimum_depth::Real = 0.0,
-    interpolation_passes::Integer = 1,
-    major_basins::Real = 1,
-    cache::Bool = true
-)
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    return regrid_bathymetry(base_g;
-        dataset = ETOPO2022(),
-        minimum_depth = Float64(minimum_depth),
-        interpolation_passes = Int(interpolation_passes),
-        major_basins = Float64(major_basins),
-        cache = cache
-    )
-end
-
-"""
-    etopo_bathymetry_interpolator(grid; kwargs...) -> Function
-
-Continuous `(lon, lat) -> z_bed` sampler (metres; `z <= 0` in the ocean) built from
-`NumericalEarth.jl`'s ETOPO 2022 dataset regridded onto `grid`.
-
-Regrids bathymetry once with [`regrid_bathymetry_from_etopo`](@ref), then returns a
-bilinear sampler over the regridded field so that repeated point queries (larval
-placement, settlement checks) are cheap and do not re-trigger dataset downloads.
-
-# Inputs
-- `grid`: Target grid defining the spatial extent and resolution.
-- `kwargs...`: Forwarded to [`regrid_bathymetry_from_etopo`](@ref).
-
-# Outputs
-- `Function`: `(lon::Real, lat::Real) -> Float64` seafored elevation in metres.
-"""
-function etopo_bathymetry_interpolator(grid; kwargs...)
-    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    z = regrid_bathymetry_from_etopo(base_g; kwargs...)
-
-    lons = collect(Float64, base_g.λᶜᵃᵃ)[base_g.Hx+1 : base_g.Hx+base_g.Nx]
-    lats = collect(Float64, base_g.φᵃᶜᵃ)[base_g.Hy+1 : base_g.Hy+base_g.Ny]
-    elev = Array(interior(z, :, :, 1))
-
-    itp = interpolate((lons, lats), elev, Gridded(Interpolations.Linear()))
-    itp_flat = extrapolate(itp, Interpolations.Flat())
-
-    return function (lon::Real, lat::Real)
-        return Float64(itp_flat(Float64(lon), Float64(lat)))
+    arch = architecture(grid)
+    z_max = arch isa GPU ? 0.0 : znode(base_g.Nz + 1, base_g, Face())
+    max_topo = maximum(topo_matrix)
+    if max_topo > z_max
+        @warn "Maximum bathymetry elevation ($(max_topo) m) exceeds surface " *
+              "height ($(z_max) m). Emerged land points present."
     end
+
+    arch = architecture(grid)
+    arch_topo = on_architecture(arch, topo_matrix)
+    immersed_grid = ImmersedBoundaryGrid(grid, GridFittedBottom(arch_topo))
+    return immersed_grid
 end
 
 """
-    etopo_bathymetry_field(lon_range, lat_range; resolution = 600, kwargs...) -> NamedTuple
+    is_in_bay_of_fundy(lon::Real, lat::Real) -> Bool
 
-Regional seabed topography over an arbitrary bounding box, sourced from `NumericalEarth.jl`'s
-ETOPO 2022 15-arcsec global relief model.
-
-This is the supported replacement for ad-hoc ETOPO/GEBCO download and hand-rolled
-regridding. `NumericalEarth` handles dataset download and caching, native-grid
-construction, and progressive interpolation passes; this wrapper only maps a bounding box
-onto a scratch `LatitudeLongitudeGrid` and returns plain arrays for downstream consumers
-(e.g. Voronoi tessellation, coastal classification) that do not operate on Oceananigans
-grids.
-
-# Inputs
-- `lon_range`: `(lon_min, lon_max)` in degrees East.
-- `lat_range`: `(lat_min, lat_max)` in degrees North.
-- `resolution`: Target grid resolution in metres per cell; converted to a grid dimension
-  from the box extents and clamped to a sane range.
-- `kwargs...`: Forwarded to [`regrid_bathymetry_from_etopo`](@ref) (`minimum_depth`,
-  `interpolation_passes`, `major_basins`, `cache`).
-
-# Outputs
-- `NamedTuple`: `(lon::Vector{Float64}, lat::Vector{Float64}, elevation::Matrix{Float64})`
-  with `elevation` indexed `[lon, lat]`, negative in the ocean and positive on land.
+Determine whether geographic coordinates `(lon, lat)` in degrees East and North fall
+within the hypertidal Bay of Fundy, Minas Basin, or Chignecto Bay exclusion zone.
 """
-function etopo_bathymetry_field(
-    lon_range::Tuple{<:Real, <:Real},
-    lat_range::Tuple{<:Real, <:Real};
-    resolution::Real = 600,
-    kwargs...
-)
-    lon_min, lon_max = Float64(lon_range[1]), Float64(lon_range[2])
-    lat_min, lat_max = Float64(lat_range[1]), Float64(lat_range[2])
-
-    # Approximate metres per degree at mid-latitude for the box, then size the grid.
-    lat_mid = 0.5 * (lat_min + lat_max)
-    m_per_deg = 111_320.0 * cosd(lat_mid)
-    n_lon = clamp(round(Int, abs(lon_max - lon_min) * m_per_deg / Float64(resolution)), 16, 21600)
-    n_lat = clamp(round(Int, abs(lat_max - lat_min) * m_per_deg / Float64(resolution)), 16, 10800)
-
-    scratch = LatitudeLongitudeGrid(
-        CPU(), Float32;
-        size = (n_lon, n_lat, 1),
-        longitude = (lon_min, lon_max),
-        latitude = (lat_min, lat_max),
-        z = (-1.0, 0.0)
-    )
-
-    z = regrid_bathymetry_from_etopo(scratch; kwargs...)
-    elevation = Array(interior(z, :, :, 1))
-
-    lons = collect(Float64, scratch.λᶜᵃᵃ)[scratch.Hx+1 : scratch.Hx+scratch.Nx]
-    lats = collect(Float64, scratch.φᵃᶜᵃ)[scratch.Hy+1 : scratch.Hy+scratch.Ny]
-
-    return (lon = lons, lat = lats, elevation = elevation)
-end
-
-"""
-    point_in_polygon(
-        x::Real,
-        y::Real,
-        poly_x::AbstractVector{<:Real},
-        poly_y::AbstractVector{<:Real}
-    ) -> Bool
-
-Determine whether 2D point `(x, y)` lies inside a closed polygon defined by vertex
-coordinate vectors `poly_x` and `poly_y` using the Jordan Curve (ray-casting) theorem.
-
-# Mathematical Formulation
-Casts a horizontal ray from \$(x, y)\$ in the positive \$+x\$ direction to \$+\\infty\$
-and counts crossings with all polygon edges \$( (x_i, y_i) \\to (x_j, y_j) )\$:
-```math
-\\text{crossing} \\iff ((y_i > y) \\neq (y_j > y)) \\land
-\\left( x < \\frac{(x_j - x_i)(y - y_i)}{y_j - y_i} + x_i \\right)
-```
-The point is inside if and only if the total intersection count is odd.
-
-# Inputs
-- `x::Real`: Point x-coordinate (longitude).
-- `y::Real`: Point y-coordinate (latitude).
-- `poly_x::AbstractVector{<:Real}`: Polygon vertex x-coordinates.
-- `poly_y::AbstractVector{<:Real}`: Polygon vertex y-coordinates.
-
-# Outputs
-- `Bool`: `true` if inside polygon, `false` otherwise.
-"""
-function point_in_polygon(
-    x::Real,
-    y::Real,
-    poly_x::AbstractVector{<:Real},
-    poly_y::AbstractVector{<:Real}
-)
-    n = length(poly_x)
-    if n < 3 || length(poly_y) != n
+@inline function is_in_bay_of_fundy(lon::Real, lat::Real)::Bool
+    if lat < 44.4 || lat > 46.0
         return false
     end
+    if lon < -67.3 || lon > -64.0
+        return false
+    end
+    if lat <= 44.8 && lon > -65.6
+        return false
+    end
+    if lat <= 45.1 && lon > -65.2
+        return false
+    end
+    if lat >= 45.7 && lon > -64.2
+        return false
+    end
+    return true
+end
 
-    inside = false
-    j = n
-    px = Float64(x)
-    py = Float64(y)
+"""
+    build_immersed_grid_from_real_data(
+        grid::LatitudeLongitudeGrid,
+        bathymetry_filepath::AbstractString;
+        varname::Union{Nothing, AbstractString} = nothing,
+        lon_var::Union{Nothing, AbstractString} = nothing,
+        lat_var::Union{Nothing, AbstractString} = nothing,
+        min_water_depth::Real = 10.0,
+        mask_bay_of_fundy::Bool = false
+    )
 
-    @inbounds for i in 1:n
-        xi, yi = Float64(poly_x[i]), Float64(poly_y[i])
-        xj, yj = Float64(poly_x[j]), Float64(poly_y[j])
+Construct an `ImmersedBoundaryGrid` by interpolating real-world bathymetry
+(e.g. from NOAA ETOPO, GEBCO) onto the target model grid coordinates.
+"""
+function build_immersed_grid_from_real_data(
+    grid::LatitudeLongitudeGrid,
+    bathymetry_filepath::AbstractString;
+    varname::Union{Nothing, AbstractString} = nothing,
+    lon_var::Union{Nothing, AbstractString} = nothing,
+    lat_var::Union{Nothing, AbstractString} = nothing,
+    min_water_depth::Real = 10.0,
+    mask_bay_of_fundy::Bool = false
+)
+    if !isfile(bathymetry_filepath)
+        error("Real bathymetry file not found: $(bathymetry_filepath)")
+    end
 
-        # Check horizontal ray intersection with segment (i, j)
-        if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)
-            inside = !inside
+    raw_elevation, raw_lon, raw_lat = NCDatasets.Dataset(bathymetry_filepath, "r") do ds
+        # Auto-detect elevation variable name
+        vname = if !isnothing(varname)
+            varname
+        elseif haskey(ds, "altitude")
+            "altitude"
+        elseif haskey(ds, "elevation")
+            "elevation"
+        elseif haskey(ds, "z")
+            "z"
+        elseif haskey(ds, "topo")
+            "topo"
+        else
+            error("Cannot auto-detect elevation variable. Keys in file: $(keys(ds))")
         end
-        j = i
+
+        # Auto-detect longitude
+        xname = if !isnothing(lon_var)
+            lon_var
+        elseif haskey(ds, "longitude")
+            "longitude"
+        elseif haskey(ds, "lon")
+            "lon"
+        elseif haskey(ds, "x")
+            "x"
+        else
+            error("Cannot auto-detect longitude variable. Keys in file: $(keys(ds))")
+        end
+
+        # Auto-detect latitude
+        yname = if !isnothing(lat_var)
+            lat_var
+        elseif haskey(ds, "latitude")
+            "latitude"
+        elseif haskey(ds, "lat")
+            "lat"
+        elseif haskey(ds, "y")
+            "y"
+        else
+            error("Cannot auto-detect latitude variable. Keys in file: $(keys(ds))")
+        end
+
+        raw_elev = Array{Float64}(ds[vname][:, :])
+        lons = collect(Float64, ds[xname][:])
+        lats = collect(Float64, ds[yname][:])
+
+        # Guarantee (n_lon, n_lat) layout
+        dim_names   = NCDatasets.dimnames(ds[vname])
+        lat_like    = ["lat", "latitude", "y", "nav_lat"]
+        needs_tp    = (length(dim_names) >= 1 &&
+                       lowercase(string(dim_names[1])) in lat_like)
+        elev = needs_tp ? permutedims(raw_elev, (2, 1)) : raw_elev
+
+        (elev, lons, lats)
     end
 
-    return inside
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    nx, ny, _ = size(base_g)
+    lon_min, lon_max = base_g.λᶠᵃᵃ[1], base_g.λᶠᵃᵃ[base_g.Nx + 1]
+    lat_min, lat_max = base_g.φᵃᶠᵃ[1], base_g.φᵃᶠᵃ[base_g.Ny + 1]
+
+    target_lons = range(lon_min, lon_max, length = nx)
+    target_lats = range(lat_min, lat_max, length = ny)
+
+    # Perform 2D bilinear regridding
+    regridded_topo = GeoData.Data.regrid_2d_field(raw_lon, raw_lat, raw_elevation,
+                                     target_lons, target_lats)
+
+    if mask_bay_of_fundy
+        n_masked = 0
+        for j in 1:ny, i in 1:nx
+            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
+                regridded_topo[i, j] = 0.0
+                n_masked += 1
+            end
+        end
+        @info "Bay of Fundy masking active: set $(n_masked) cells to solid land (0.0 m)."
+    end
+
+    # Condition bathymetry
+    h_floor = Float64(min_water_depth)
+    conditioned_topo = GeoData.Data.smooth_bathymetry(
+        regridded_topo,
+        passes = 4,
+        alpha = 0.5,
+        h_min = h_floor
+    )
+
+    if mask_bay_of_fundy
+        for j in 1:ny, i in 1:nx
+            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
+                conditioned_topo[i, j] = 0.0
+            end
+        end
+    end
+
+    return build_immersed_grid(grid, conditioned_topo)
 end
 
 """
-    buffer_distance_to_degrees(
-        buffer_km::Real,
-        ref_lat::Real = 44.5
-    ) -> Tuple{Float64, Float64}
+    extract_grid_coordinates(grid) -> NamedTuple
 
-Convert a linear physical buffer distance in kilometers \$d_{\\text{buf}}\$ into
-equivalent geographic longitude and latitude degree increments \$(\\Delta\\lambda, \\Delta\\phi)\$
-at a specified reference latitude \$\\phi_0\$.
-
-# Mathematical Formulation
-Using the spherical Earth model with mean radius \$R_{\\text{earth}} = 6371.0088\\text{ km}\$:
-```math
-\\Delta\\phi = \\frac{d_{\\text{buf}}}{R_{\\text{earth}}} \\times \\left(\\frac{180^\\circ}{\\pi}\\right)
-```
-```math
-\\Delta\\lambda = \\frac{d_{\\text{buf}}}{R_{\\text{earth}} \\cos(\\deg2rad(\\phi_0))} \\times \\left(\\frac{180^\\circ}{\\pi}\\right)
-```
-
-# Inputs
-- `buffer_km::Real`: Buffer distance in kilometers (e.g. 100.0 km).
-- `ref_lat::Real`: Reference latitude in degrees North (default 44.5°N).
-
-# Outputs
-- `Tuple{Float64, Float64}`: `(dlon, dlat)` degree increments.
-
-# References
-- Bowditch, N. (2002). *The American Practical Navigator*. National Imagery and Mapping Agency.
+Extract 1D cell-center spatial coordinates `(lons, lats, depths)` from an
+Oceananigans computational grid, returning geographic coordinates in **degrees**
+and the vertical coordinate in **metres**.
 """
-function buffer_distance_to_degrees(
-    buffer_km::Real,
-    ref_lat::Real = 44.5
-)
-    if buffer_km < 0.0
-        error("Buffer distance must be non-negative: $(buffer_km) km")
+function extract_grid_coordinates(grid)
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
+    nx, ny, nz = cpu_g.Nx, cpu_g.Ny, cpu_g.Nz
+
+    if !(cpu_g isa LatitudeLongitudeGrid)
+        error(
+            "extract_grid_coordinates requires a LatitudeLongitudeGrid (or an " *
+            "ImmersedBoundaryGrid wrapping one) to report geographic coordinates in " *
+            "degrees; received $(nameof(typeof(cpu_g))). Metric-distance grids must be " *
+            "converted to geographic coordinates before extraction."
+        )
     end
 
-    r_earth_km = 6371.0088
-    km_per_deg_lat = (π * r_earth_km) / 180.0 # ~111.195 km/deg
-    dlat = Float64(buffer_km) / km_per_deg_lat
+    # Geographic horizontal coordinates (degrees), halo region stripped (interior indices 1:nx, 1:ny).
+    lons = [Float64(cpu_g.λᶜᵃᵃ[i]) for i in 1:nx]
+    lats = [Float64(cpu_g.φᵃᶜᵃ[j]) for j in 1:ny]
 
-    # Bounded cosine scaling with 85° Web Mercator cutoff to prevent division by near-zero at high latitudes
-    cos_lat = cos(deg2rad(clamp(Float64(ref_lat), -85.0, 85.0)))
-    km_per_deg_lon = km_per_deg_lat * max(cosd(85.0), cos_lat)
-    dlon = Float64(buffer_km) / km_per_deg_lon
+    # Vertical coordinate (metres) is genuinely metric, so `znode` is appropriate.
+    depths = [Float64(Oceananigans.Grids.znode(k, cpu_g, Oceananigans.Grids.Center()))
+              for k in 1:nz]
 
-    return (dlon, dlat)
-end
-
-"""
-    expand_domain_with_buffer(
-        lon_range::Tuple{Real, Real},
-        lat_range::Tuple{Real, Real};
-        buffer_km::Real = 100.0
-    ) -> Tuple{Tuple{Float64, Float64}, Tuple{Float64, Float64}}
-
-Expand a geographic bounding box \$(\\lambda_{\\min}, \\lambda_{\\max}) \\times (\\phi_{\\min}, \\phi_{\\max})\$
-outward by a user-defined physical buffer distance (default 100.0 km).
-
-# Mathematical Formulation
-```math
-\\Omega_{\\text{buffered}} = [\\lambda_{\\min} - \\Delta\\lambda, \\; \\lambda_{\\max} + \\Delta\\lambda] \\times [\\phi_{\\min} - \\Delta\\phi, \\; \\phi_{\\max} + \\Delta\\phi]
-```
-
-# Inputs
-- `lon_range::Tuple{Real, Real}`: Input longitude bounds.
-- `lat_range::Tuple{Real, Real}`: Input latitude bounds.
-- `buffer_km::Real`: Buffer distance in kilometers (default 100.0 km).
-
-# Outputs
-- `Tuple{Tuple{Float64, Float64}, Tuple{Float64, Float64}}`: `(buffered_lon_range, buffered_lat_range)`
-"""
-function expand_domain_with_buffer(
-    lon_range::Tuple{Real, Real},
-    lat_range::Tuple{Real, Real};
-    buffer_km::Real = 100.0
-)
-    ref_lat = 0.5 * (Float64(lat_range[1]) + Float64(lat_range[2]))
-    dlon, dlat = buffer_distance_to_degrees(buffer_km, ref_lat)
-
-    buf_lon = (
-        max(-180.0, Float64(lon_range[1]) - dlon),
-        min(180.0, Float64(lon_range[2]) + dlon)
-    )
-    buf_lat = (
-        max(-90.0, Float64(lat_range[1]) - dlat),
-        min(90.0, Float64(lat_range[2]) + dlat)
-    )
-
-    return (buf_lon, buf_lat)
-end
-
-"""
-    get_strata_buffered_envelope(
-        polygons::AbstractVector{<:NamedTuple};
-        buffer_km::Real = 100.0
-    ) -> NamedTuple
-
-Compute the collective bounding envelope across a set of administrative stratum polygons
-(e.g., loaded CFAs) expanded by a user-defined buffer distance (default 100.0 km).
-
-# Inputs
-- `polygons::AbstractVector{<:NamedTuple}`: List of stratum polygons with `:lons, :lats`.
-- `buffer_km::Real`: Buffer distance in kilometers (default 100.0 km).
-
-# Outputs
-- `NamedTuple`: `(lon_range = (min_lon, max_lon), lat_range = (min_lat, max_lat), buffer_km = buffer_km, dlon = dlon, dlat = dlat)`
-"""
-function get_strata_buffered_envelope(
-    polygons::AbstractVector{<:NamedTuple};
-    buffer_km::Real = 100.0
-)
-    if isempty(polygons)
-        error("Cannot compute buffered envelope for empty polygon list.")
-    end
-
-    all_lons = Float64[]
-    all_lats = Float64[]
-
-    for poly in polygons
-        append!(all_lons, poly.lons)
-        append!(all_lats, poly.lats)
-    end
-
-    raw_lon = extrema(all_lons)
-    raw_lat = extrema(all_lats)
-
-    buf_lon, buf_lat = expand_domain_with_buffer(raw_lon, raw_lat, buffer_km = buffer_km)
-    dlon, dlat = buffer_distance_to_degrees(buffer_km, 0.5 * (raw_lat[1] + raw_lat[2]))
-
-    return (
-        lon_range = buf_lon,
-        lat_range = buf_lat,
-        raw_lon_range = raw_lon,
-        raw_lat_range = raw_lat,
-        buffer_km = Float64(buffer_km),
-        dlon = dlon,
-        dlat = dlat
-    )
+    return (lons = lons, lats = lats, depths = depths)
 end
 
 """
@@ -725,8 +365,8 @@ Scotian Shelf, Gulf of St. Lawrence, and northwestern Atlantic region.
 Covers the expanded simulation domain [-71, -53]°E / [40, 48.5]°N.
 
 Polygons are closed (first == last vertex) and listed clockwise as viewed
-from above (standard GIS convention for exterior rings). Used by
-`is_point_on_land` and `is_marine_water` for ocean masking.
+from above (standard GIS convention for exterior rings). Used as fallback
+when GeoData coastline is not available.
 """
 const REGIONAL_COASTLINE = [
     # 1. Nova Scotia Mainland (clockwise closed perimeter)
@@ -852,852 +492,43 @@ const REGIONAL_COASTLINE = [
 ]
 
 """
-    load_coastline_polygons(path::AbstractString = "inputs/coastline.dat") -> Vector{NamedTuple}
-
-Load high-resolution regional coastline polygons from a formatted `.dat` file, or
-return the default canonical `REGIONAL_COASTLINE` if the file is absent.
-
-# Inputs
-- `path::AbstractString`: Path to coastline definitions file (default `"inputs/coastline.dat"`).
-
-# Outputs
-- `Vector{NamedTuple}`: List of polygon objects containing `:name, :code, :lons, :lats`.
-"""
-function load_coastline_polygons(path::AbstractString = "inputs/coastline.dat")
-    if !isfile(path)
-        return REGIONAL_COASTLINE
-    end
-
-    polys = NamedTuple[]
-    cur_name = ""
-    cur_code = :unknown
-    cur_lons = Float64[]
-    cur_lats = Float64[]
-
-    lines = readlines(path)
-    for line in lines
-        trimmed = strip(line)
-        if isempty(trimmed) || startswith(trimmed, "#")
-            continue
-        end
-
-        if startswith(trimmed, ">")
-            if !isempty(cur_lons) && length(cur_lons) >= 3
-                push!(polys, (
-                    name = cur_name,
-                    code = cur_code,
-                    lons = copy(cur_lons),
-                    lats = copy(cur_lats)
-                ))
-            end
-            header = strip(trimmed[2:end])
-            parts = split(header, ",")
-            cur_name = strip(parts[1])
-            cur_code = length(parts) >= 2 ? Symbol(strip(parts[2])) : Symbol(lowercase(replace(cur_name, " " => "_")))
-            empty!(cur_lons)
-            empty!(cur_lats)
-            continue
-        end
-
-        # Vertex lines are "lon,lat", but whitespace is accepted too. The two writers and the
-        # reader have disagreed on this before: a space-separated file parsed as zero vertices,
-        # and `load_coastline_polygons` then returned `REGIONAL_COASTLINE` with no warning, so
-        # a whole-world coastline download was silently replaced by the legacy hand-drawn
-        # outline. Accepting both separators is cheap; the real fix is in the writer, and this
-        # is the belt to its braces.
-        parts = occursin(',', trimmed) ? split(trimmed, ",") : split(trimmed)
-        if length(parts) >= 2
-            p_lon = tryparse(Float64, strip(parts[1]))
-            p_lat = tryparse(Float64, strip(parts[2]))
-            if !isnothing(p_lon) && !isnothing(p_lat)
-                push!(cur_lons, p_lon)
-                push!(cur_lats, p_lat)
-            end
-        end
-    end
-
-    if !isempty(cur_lons) && length(cur_lons) >= 3
-        push!(polys, (
-            name = cur_name,
-            code = cur_code,
-            lons = copy(cur_lons),
-            lats = copy(cur_lats)
-        ))
-    end
-
-    if isempty(polys)
-        # Falling back to the legacy outline here is the one place this loader can quietly
-        # discard real data, so it says so out loud.
-        @warn "No coastline polygons could be read from $(path); falling back to the " *
-              "built-in regional outline. If $(path) was just downloaded, the file format " *
-              "does not match what `load_coastline_polygons` reads and the download is " *
-              "being discarded."
-        return REGIONAL_COASTLINE
-    end
-    return polys
-end
-
-"""
-    save_coastline_polygons(
-        path::AbstractString = "inputs/coastline.dat";
-        polygons::AbstractVector{<:NamedTuple} = REGIONAL_COASTLINE
-    )
-
-Save regional coastline multi-polygon definitions to a structured text file.
-
-# Inputs
-- `path::AbstractString`: Destination file path.
-- `polygons::AbstractVector{<:NamedTuple}`: List of coastline polygon NamedTuples.
-"""
-function save_coastline_polygons(
-    path::AbstractString = "inputs/coastline.dat";
-    polygons::AbstractVector{<:NamedTuple} = REGIONAL_COASTLINE
-)
-    mkpath(dirname(path))
-    open(path, "w") do io
-        println(io, "# Regional Coastline Multi-Polygon Boundaries for Scotian Shelf & Maritime Canada")
-        println(io, "# Format: > Name, Code followed by lon,lat pairs")
-        for poly in polygons
-            p_name = hasproperty(poly, :name) ? string(poly.name) : "Coastline"
-            p_code = hasproperty(poly, :code) ? string(poly.code) : "coastline"
-            println(io, "\n> $(p_name),$(p_code)")
-            for i in 1:length(poly.lons)
-                println(io, "$(poly.lons[i]),$(poly.lats[i])")
-            end
-        end
-    end
-    return path
-end
-
-"""
-    is_point_on_land(
-        lon::Real,
-        lat::Real;
-        coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
-    ) -> Bool
-
-Determine whether geographic coordinates `(lon, lat)` fall within any emergent
-terrestrial landmass polygon in the Maritime Canada region.
-
-# Mathematical Formulation
-Uses rapid axis-aligned bounding box (AABB) exclusion followed by Jordan Curve
-ray-casting point-in-polygon tests against each coastline polygon.
-
-# Inputs
-- `lon::Real`: Longitude coordinate in degrees East.
-- `lat::Real`: Latitude coordinate in degrees North.
-- `coastline`: Optional custom list of coastline polygons (defaults to loaded/canonical coastline).
-
-# Outputs
-- `Bool`: `true` if coordinates lie on land; `false` in marine waters.
-"""
-function is_point_on_land(
-    lon::Real,
-    lat::Real;
-    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
-)
-    x = Float64(lon)
-    y = Float64(lat)
-    polys = !isnothing(coastline) ? coastline : REGIONAL_COASTLINE
-
-    for poly in polys
-        min_x, max_x = extrema(poly.lons)
-        min_y, max_y = extrema(poly.lats)
-        # Fast bounding box check
-        if x >= min_x && x <= max_x && y >= min_y && y <= max_y
-            if point_in_polygon(x, y, poly.lons, poly.lats)
-                return true
-            end
-        end
-    end
-
-    return false
-end
-
-"""
-    is_marine_water(
-        lon::Real,
-        lat::Real;
-        bathymetry::Union{Function, NamedTuple, AbstractString, Nothing} = nothing,
-        min_seabed_depth::Real = 0.0,
-        coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
-    ) -> Bool
-
-Determine whether geographic coordinates \$(\\lambda, \\phi)\$ lie in active marine
-waters of depth at least `min_seabed_depth` meters, strictly excluding emergent land (\$z \\ge 0\$)
-and terrestrial landmasses via high-resolution coastline polygon boundaries.
-
-# Mathematical Formulation
-Given the seafloor elevation function \$z_{\\text{bed}}(\\lambda, \\phi)\$ and terrestrial
-landmass set \$\\mathcal{L}\$:
-```math
-\\text{is\\_marine}(\\lambda, \\phi) = \\begin{cases}
-\\text{true} & \\text{if } (\\lambda, \\phi) \\notin \\mathcal{L} \\land
-z_{\\text{bed}}(\\lambda, \\phi) \\le -\\max(0.0, h_{\\text{min}}) \\\\
-\\text{false} & \\text{if } (\\lambda, \\phi) \\in \\mathcal{L} \\lor
-z_{\\text{bed}}(\\lambda, \\phi) > -\\max(0.0, h_{\\text{min}})
-\\end{cases}
-```
-
-# Inputs
-- `lon::Real`: Longitude coordinate in degrees.
-- `lat::Real`: Latitude coordinate in degrees.
-- `bathymetry`: Elevation interpolator Function, `NamedTuple`, NetCDF file path, or `nothing`.
-- `min_seabed_depth::Real`: Minimum water depth in meters (default: 0.0 m, which enforces
-  the shoreline zero-datum \$z_{\\text{bed}} < 0\$).
-- `coastline`: Optional custom list of coastline land polygons.
-
-# Outputs
-- `Bool`: `true` if coordinates lie strictly in marine water; `false` on land.
-"""
-function is_marine_water(
-    lon::Real,
-    lat::Real;
-    bathymetry::Union{Function, NamedTuple, AbstractString, Nothing} = nothing,
-    min_seabed_depth::Real = 0.0,
-    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
-)
-    # 1. Strict coastline land exclusion
-    if is_point_on_land(lon, lat; coastline = coastline)
-        return false
-    end
-
-    # 2. Bathymetric depth constraint
-    bathy_fn = if isnothing(bathymetry)
-        def_path = "inputs/bathymetry_active.nc"
-        isfile(def_path) ? get_bathymetry_interpolator(def_path) : nothing
-    else
-        get_bathymetry_interpolator(bathymetry)
-    end
-
-    if isnothing(bathy_fn)
-        return true
-    end
-
-    z_bed = bathy_fn(Float64(lon), Float64(lat))
-    h_threshold = -max(0.0, Float64(min_seabed_depth))
-    return z_bed <= h_threshold
-end
-
-"""
-    extract_marine_cells(
-        bathymetry::Union{NamedTuple, AbstractString};
-        lon_range::Tuple{Real, Real} = (-180.0, 180.0),
-        lat_range::Tuple{Real, Real} = (-90.0, 90.0),
-        min_seabed_depth::Real = 0.0,
-        coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
+    get_strata_buffered_envelope(
+        polygons::AbstractVector{<:NamedTuple};
+        buffer_km::Real = 100.0
     ) -> NamedTuple
 
-Extract all discrete marine grid cell centers that lie in open water (\$z < 0\$),
-strictly outside terrestrial landmasses, and meet the minimum water depth requirement
-within the specified spatial bounding box.
-
-# Inputs
-- `bathymetry`: `NamedTuple` `(lon, lat, elevation)` or NetCDF file path `AbstractString`.
-- `lon_range::Tuple{Real, Real}`: Bounding box longitude limits.
-- `lat_range::Tuple{Real, Real}`: Bounding box latitude limits.
-- `min_seabed_depth::Real`: Minimum water depth in meters (default 0.0 m).
-- `coastline`: Optional coastline polygons list.
-
-# Outputs
-- `NamedTuple`: `(lons = Vector{Float64}, lats = Vector{Float64}, depths = Vector{Float64}, weights = Vector{Float64})`
+Compute the collective bounding envelope across a set of administrative stratum polygons
+(e.g., loaded CFAs) expanded by a user-defined buffer distance (default 100.0 km).
 """
-function extract_marine_cells(
-    bathymetry::Union{NamedTuple, AbstractString};
-    lon_range::Tuple{Real, Real} = (-180.0, 180.0),
-    lat_range::Tuple{Real, Real} = (-90.0, 90.0),
-    min_seabed_depth::Real = 0.0,
-    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
+function get_strata_buffered_envelope(
+    polygons::AbstractVector{<:NamedTuple};
+    buffer_km::Real = 100.0
 )
-    bathy_data = if bathymetry isa AbstractString
-        load_bathymetry_from_netcdf(bathymetry)
-    else
-        bathymetry
+    if isempty(polygons)
+        error("Cannot compute buffered envelope for empty polygon list.")
     end
 
-    lons = Float64.(bathy_data.lon)
-    lats = Float64.(bathy_data.lat)
-    elev = Float64.(bathy_data.elevation)
+    all_lons = Float64[]
+    all_lats = Float64[]
 
-    h_threshold = -max(0.0, Float64(min_seabed_depth))
-
-    marine_lons = Float64[]
-    marine_lats = Float64[]
-    marine_depths = Float64[]
-    marine_weights = Float64[]
-
-    n_lon = length(lons)
-    n_lat = length(lats)
-
-    for i in 1:n_lon
-        x = lons[i]
-        if !(lon_range[1] <= x <= lon_range[2])
-            continue
-        end
-        for j in 1:n_lat
-            y = lats[j]
-            if !(lat_range[1] <= y <= lat_range[2])
-                continue
-            end
-            z = elev[i, j]
-
-            # Point must not be on terrestrial land and depth must satisfy threshold
-            if z <= h_threshold && !is_point_on_land(x, y; coastline = coastline)
-                push!(marine_lons, x)
-                push!(marine_lats, y)
-                push!(marine_depths, z)
-                # Spherical grid cell surface area weight dA = R^2 cos(lat) dlon dlat
-                weight = cos(deg2rad(clamp(y, -89.9, 89.9)))
-                push!(marine_weights, weight)
-            end
-        end
+    for poly in polygons
+        append!(all_lons, poly.lons)
+        append!(all_lats, poly.lats)
     end
 
-    if isempty(marine_lons)
-        error(
-            "No marine water cells found with depth >= $(min_seabed_depth) m " *
-            "within lon $(lon_range) and lat $(lat_range). Domain is entirely land."
-        )
-    end
+    raw_lon = extrema(all_lons)
+    raw_lat = extrema(all_lats)
+
+    buf_lon, buf_lat = GeoData.Data.expand_domain_with_buffer(raw_lon, raw_lat, buffer_km = buffer_km)
+    dlon, dlat = GeoData.Data.buffer_distance_to_degrees(buffer_km, 0.5 * (raw_lat[1] + raw_lat[2]))
 
     return (
-        lons = marine_lons,
-        lats = marine_lats,
-        depths = marine_depths,
-        weights = marine_weights
+        lon_range = buf_lon,
+        lat_range = buf_lat,
+        raw_lon_range = raw_lon,
+        raw_lat_range = raw_lat,
+        buffer_km = Float64(buffer_km),
+        dlon = dlon,
+        dlat = dlat
     )
 end
-
-"""
-    sample_marine_coordinates(
-        n_particles::Int,
-        bathymetry::Union{NamedTuple, AbstractString};
-        lon_range::Tuple{Real, Real} = (-180.0, 180.0),
-        lat_range::Tuple{Real, Real} = (-90.0, 90.0),
-        min_seabed_depth::Real = 0.0,
-        coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
-        rng::AbstractRNG = Random.default_rng()
-    ) -> Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}}
-
-Sample \$N\$ continuous coordinates strictly within active marine cells (\$z_{\\text{bed}} < 0\$
-and \$z_{\\text{bed}} \\le -h_{\\text{min}}\$) with spherical area weighting, sub-cell jitter,
-and rigorous coastline land rejection.
-
-# Guarantees
-- 100% deterministic success in \$O(N)\$ time without rejection sampling stalls.
-- Exactly 0% probability of particles landing on emergent land or coastal terrain.
-
-# Inputs
-- `n_particles::Int`: Number of particle coordinates to sample.
-- `bathymetry`: `NamedTuple` or NetCDF file path.
-- `lon_range, lat_range`: Geographic bounding box.
-- `min_seabed_depth::Real`: Minimum seabed depth (default: 0.0 m).
-- `coastline`: Optional coastline polygons.
-- `rng::AbstractRNG`: Random number generator.
-
-# Outputs
-- `Tuple`: `(sampled_lons, sampled_lats, sampled_seabed_depths)`
-"""
-function sample_marine_coordinates(
-    n_particles::Int,
-    bathymetry::Union{NamedTuple, AbstractString};
-    lon_range::Tuple{Real, Real} = (-180.0, 180.0),
-    lat_range::Tuple{Real, Real} = (-90.0, 90.0),
-    min_seabed_depth::Real = 0.0,
-    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
-    rng::AbstractRNG = Random.default_rng()
-)
-    cells = extract_marine_cells(
-        bathymetry,
-        lon_range = lon_range,
-        lat_range = lat_range,
-        min_seabed_depth = min_seabed_depth,
-        coastline = coastline
-    )
-
-    bathy_data = if bathymetry isa AbstractString
-        load_bathymetry_from_netcdf(bathymetry)
-    else
-        bathymetry
-    end
-
-    lons_raw = Float64.(bathy_data.lon)
-    lats_raw = Float64.(bathy_data.lat)
-    dlon = length(lons_raw) > 1 ? abs(lons_raw[2] - lons_raw[1]) : 0.05
-    dlat = length(lats_raw) > 1 ? abs(lats_raw[2] - lats_raw[1]) : 0.05
-
-    bathy_interp = get_bathymetry_interpolator(bathymetry)
-    h_threshold = -max(0.0, Float64(min_seabed_depth))
-
-    total_weight = sum(cells.weights)
-    cum_weights = cumsum(cells.weights) ./ total_weight
-
-    sampled_lons = Vector{Float64}(undef, n_particles)
-    sampled_lats = Vector{Float64}(undef, n_particles)
-    sampled_zbed = Vector{Float64}(undef, n_particles)
-
-    for p in 1:n_particles
-        u = rand(rng, Float64)
-        idx = searchsortedfirst(cum_weights, u)
-        idx = clamp(idx, 1, length(cells.lons))
-
-        c_lon = cells.lons[idx]
-        c_lat = cells.lats[idx]
-
-        jitter_x = (rand(rng, Float64) - 0.5) * dlon * 0.95
-        jitter_y = (rand(rng, Float64) - 0.5) * dlat * 0.95
-        cand_x = c_lon + jitter_x
-        cand_y = c_lat + jitter_y
-
-        z_cand = bathy_interp(cand_x, cand_y)
-
-        # Enforce both bathymetric threshold and coastline land rejection
-        if z_cand > h_threshold || is_point_on_land(cand_x, cand_y; coastline = coastline)
-            cand_x = c_lon
-            cand_y = c_lat
-            z_cand = cells.depths[idx]
-        end
-
-        sampled_lons[p] = cand_x
-        sampled_lats[p] = cand_y
-        sampled_zbed[p] = z_cand
-    end
-
-    return (sampled_lons, sampled_lats, sampled_zbed)
-end
-
-"""
-    build_immersed_grid(
-        grid::LatitudeLongitudeGrid,
-        bathymetry::Union{AbstractMatrix, AbstractString};
-        varname::AbstractString = "elevation"
-    )
-
-Wrap a base `LatitudeLongitudeGrid` with an `ImmersedBoundaryGrid` using
-`GridFittedBottom` representing ocean seafloor topography.
-
-# Mathematical Formulation
-The immersed boundary isolates solid bottom cells from active fluid cells:
-```math
-\\chi(\\lambda, \\phi, z) = \\begin{cases}
-1 & \\text{if } z \\ge z_b(\\lambda, \\phi) \\quad (\\text{fluid}) \\\\
-0 & \\text{if } z < z_b(\\lambda, \\phi) \\quad (\\text{solid seafloor})
-\\end{cases}
-```
-
-# Inputs
-- `grid::LatitudeLongitudeGrid`: Base computational grid.
-- `bathymetry::Union{AbstractMatrix, AbstractString}`: 2D elevation array or
-  path to NetCDF file containing bathymetry.
-- `varname::AbstractString`: Elevation variable name if a NetCDF file path is passed.
-
-# Outputs
-- `ImmersedBoundaryGrid`: Oceananigans immersed boundary grid.
-
-# References
-- Verzicco, R. (2023). Immersed boundary methods for ocean modeling.
-  *Annual Review of Fluid Mechanics*, 55, 305-333. DOI: 10.1146/annurev-fluid-030322-040713
-- Ramadhan, A., et al. (2020). Oceananigans.jl: Fast and friendly geophysical
-  fluid dynamics on GPUs. *Journal of Open Source Software*, 5(53), 2018.
-"""
-function build_immersed_grid(
-    grid::LatitudeLongitudeGrid,
-    bathymetry::Union{AbstractMatrix, AbstractString};
-    varname::AbstractString = "elevation"
-)
-    topo_matrix::Matrix{Float64} = if bathymetry isa AbstractString
-        load_bathymetry_from_netcdf(bathymetry, varname).elevation
-    else
-        Matrix{Float64}(bathymetry)
-    end
-
-    nx, ny, _ = size(grid)
-    t_nx, t_ny = size(topo_matrix)
-
-    if (nx != t_nx) || (ny != t_ny)
-        error(
-            "Bathymetry dimensions ($(t_nx), $(t_ny)) do not match grid horizontal " *
-            "dimensions ($(nx), $(ny))."
-        )
-    end
-
-    # Check for topography exceeding surface
-    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    arch = architecture(grid)
-    z_max = arch isa GPU ? 0.0 : znode(base_g.Nz + 1, base_g, Face())
-    max_topo = maximum(topo_matrix)
-    if max_topo > z_max
-        @warn "Maximum bathymetry elevation ($(max_topo) m) exceeds surface " *
-              "height ($(z_max) m). Emerged land points present."
-    end
-
-    arch = architecture(grid)
-    arch_topo = on_architecture(arch, topo_matrix)
-    immersed_grid = ImmersedBoundaryGrid(grid, GridFittedBottom(arch_topo))
-    return immersed_grid
-end
-
-"""
-    smooth_bathymetry(
-        topo::AbstractMatrix{<:Real};
-        passes::Integer = 3,
-        alpha::Real = 0.5,
-        h_min::Real = 20.0
-    ) -> Matrix{Float64}
-
-Apply conservative 2D discrete Laplacian smoothing to bathymetric elevation data on wet
-cells, attenuating subgrid \$2\\Delta x\$ pinnacles and single-cell topographic cliffs
-arising from bilinear interpolation of high-resolution digital elevation models (ETOPO/GEBCO).
-Preserves emerged land points (\$z = 0.0\\text{ m}\$) and enforces the minimum water column
-depth floor \$h_{\\min}\$.
-
-# Mathematical Formulation
-For each smoothing iteration \$m = 1, \\dots, M\$ and every interior wet cell \$(i, j)\$ with
-seabed elevation \$Z_{i,j}^{(m)} \\le -h_{\\min}\$:
-```math
-Z_{i,j}^{(m+1)} = (1 - \\alpha) Z_{i,j}^{(m)} + \\frac{\\alpha}{N_{\\text{wet}}}
-                  \\sum_{(p,q) \\in \\mathcal{N}_{\\text{wet}}(i,j)} Z_{p,q}^{(m)}
-```
-where \$\\mathcal{N}_{\\text{wet}}(i,j) = \\{(i \\pm 1, j), (i, j \\pm 1) \\mid Z_{p,q}^{(m)} \\le -h_{\\min}\\}\$
-denotes the 4-connected wet neighborhood, and \$N_{\\text{wet}} = |\\mathcal{N}_{\\text{wet}}(i,j)| \\ge 2\$.
-If \$Z_{i,j}^{(m+1)} > -h_{\\min}\$, the depth floor \$Z_{i,j}^{(m+1)} = -h_{\\min}\$ is enforced.
-
-# Inputs
-- `topo::AbstractMatrix{<:Real}`: 2D array of seabed elevations in meters.
-- `passes::Integer`: Number of smoothing iterations (default 3).
-- `alpha::Real`: Smoothing weight in \$[0, 1]\$ (default 0.5).
-- `h_min::Real`: Minimum physical water depth floor in meters (default 20.0m).
-
-# Outputs
-- `Matrix{Float64}`: Smoothed elevation matrix matching the input horizontal dimensions.
-
-# References
-- Shapiro, R. (1970). Smoothing, filtering, and boundary effects.
-  *Reviews of Geophysics*, 8(2), 359-387.
-- Haidvogel, D. B., & Beckmann, A. (1999). *Numerical Ocean Circulation Modeling*.
-  Imperial College Press.
-"""
-function smooth_bathymetry(
-    topo::AbstractMatrix{<:Real};
-    passes::Integer = 3,
-    alpha::Real = 0.5,
-    h_min::Real = 20.0
-)::Matrix{Float64}
-    if passes < 0
-        error("smooth_bathymetry: passes must be non-negative, got passes = $(passes)")
-    end
-    if !(0.0 <= alpha <= 1.0)
-        error("smooth_bathymetry: alpha must be in [0, 1], got alpha = $(alpha)")
-    end
-    if h_min <= 0.0
-        error("smooth_bathymetry: h_min must be positive, got h_min = $(h_min)")
-    end
-
-    nx, ny = size(topo)
-    h_floor = Float64(h_min)
-    alpha_f = Float64(alpha)
-
-    # Initialize conditioned array: land >= 0 is 0.0, shallow wet is floored
-    h = Matrix{Float64}(undef, nx, ny)
-    for j in 1:ny, i in 1:nx
-        z = Float64(topo[i, j])
-        if z >= 0.0
-            h[i, j] = 0.0
-        elseif z > -h_floor
-            h[i, j] = -h_floor
-        else
-            h[i, j] = z
-        end
-    end
-
-    # Apply 2D discrete Laplacian smoothing iterations on wet cells
-    for _ in 1:passes
-        h_next = copy(h)
-        for j in 2:(ny - 1), i in 2:(nx - 1)
-            if h[i, j] <= -h_floor
-                sum_nb = 0.0
-                n_wet = 0
-                for (di, dj) in ((-1, 0), (1, 0), (0, -1), (0, 1))
-                    nb = h[i + di, j + dj]
-                    if nb <= -h_floor
-                        sum_nb += nb
-                        n_wet += 1
-                    end
-                end
-                if n_wet >= 2
-                    avg_nb = sum_nb / n_wet
-                    z_smoothed = (1.0 - alpha_f) * h[i, j] + alpha_f * avg_nb
-                    h_next[i, j] = z_smoothed > -h_floor ? -h_floor : z_smoothed
-                end
-            end
-        end
-        h = h_next
-    end
-
-    return h
-end
-
-
-"""
-    is_in_bay_of_fundy(lon::Real, lat::Real) -> Bool
-
-Determine whether geographic coordinates `(lon, lat)` in degrees East and North fall
-within the hypertidal Bay of Fundy, Minas Basin, or Chignecto Bay exclusion zone.
-
-# Mathematical & Geographic Formulation
-The Bay of Fundy is a semi-enclosed macro-tidal funnel characterized by near-resonant
-semi-diurnal tidal amplification (\$M_2\$ period \$\\approx 12.42\\text{ h}\$, natural basin
-period \$\\approx 13\\text{ h}\$, Greenberg 1979; Garrett 1972). In regional shelf
-simulations focused on offshore species (e.g. snow crab *Chionoecetes opilio*, which
-exclusively inhabit depths of 50 to 350 m and benthic temperatures below 6 °C), resolving
-active hydrodynamics in the hypertidal shallows creates severe vertical Courant number
-penalties (\$\\text{CFL}_z = |w| \\Delta t / \\Delta z_{\\min}\$) due to staircased immersed
-boundaries in 10-20 m water depth.
-
-The exclusion boundary isolates the embayment northwest of the Nova Scotia peninsula:
-```math
-\\mathcal{D}_{\\text{Fundy}} = \\left\\{ (\\lambda, \\phi) \\in [-67.3, -64.0] \\times [44.4, 46.0] \\mid 
-\\phi > 44.4, \\; \\lambda \\le \\Lambda_{\\text{east}}(\\phi) \\right\\}
-```
-where the eastern terrestrial constraint \$\\Lambda_{\\text{east}}(\\phi)\$ prevents intrusion
-onto the Atlantic South Shore of Nova Scotia (Mahone Bay, St. Margarets Bay) or the
-Northumberland Strait across the Isthmus of Chignecto:
-- \$\\Lambda_{\\text{east}}(\\phi) = -65.6^\\circ\\text{E}\$ for \$\\phi \\le 44.8^\\circ\\text{N}\$
-- \$\\Lambda_{\\text{east}}(\\phi) = -65.2^\\circ\\text{E}\$ for \$44.8^\\circ\\text{N} < \\phi \\le 45.1^\\circ\\text{N}\$
-- \$\\Lambda_{\\text{east}}(\\phi) = -64.2^\\circ\\text{E}\$ for \$\\phi \\ge 45.7^\\circ\\text{N}\$
-
-# Inputs
-- `lon::Real`: Longitude in degrees East (e.g., -65.5).
-- `lat::Real`: Latitude in degrees North (e.g., 45.2).
-
-# Outputs
-- `Bool`: `true` if coordinates lie inside the Bay of Fundy exclusion zone, `false` otherwise.
-
-# References
-- Garrett, C. (1972). Tidal resonance in the Bay of Fundy and Gulf of Maine.
-  *Nature*, 238(5365), 441-443.
-- Greenberg, D. A. (1979). A numerical model investigation of tidal phenomena in the Bay of
-  Fundy and Gulf of Maine. *Marine Geodesy*, 2(2), 161-187.
-"""
-@inline function is_in_bay_of_fundy(lon::Real, lat::Real)::Bool
-    if lat < 44.4 || lat > 46.0
-        return false
-    end
-    if lon < -67.3 || lon > -64.0
-        return false
-    end
-    if lat <= 44.8 && lon > -65.6
-        return false
-    end
-    if lat <= 45.1 && lon > -65.2
-        return false
-    end
-    if lat >= 45.7 && lon > -64.2
-        return false
-    end
-    return true
-end
-
-"""
-    build_immersed_grid_from_real_data(
-        grid::LatitudeLongitudeGrid,
-        bathymetry_filepath::AbstractString;
-        varname::Union{Nothing, AbstractString} = nothing,
-        lon_var::Union{Nothing, AbstractString} = nothing,
-        lat_var::Union{Nothing, AbstractString} = nothing,
-        min_water_depth::Real = 10.0,
-        mask_bay_of_fundy::Bool = false
-    )
-
-Construct an `ImmersedBoundaryGrid` by interpolating real-world bathymetry
-(e.g. from NOAA ETOPO, GEBCO) onto the target model grid coordinates.
-
-# Mathematical Formulation
-Extracts continuous coordinates \$\\lambda_{\\text{raw}}, \\phi_{\\text{raw}}\$ and
-seafloor elevations \$z_{\\text{raw}}\$, applies 2D bilinear regridding onto model
-target cells \$\\lambda_{\\text{grid}}, \\phi_{\\text{grid}}\$, applies regional masking
-if enabled, and constructs the immersed boundary.
-
-# Inputs
-- `grid::LatitudeLongitudeGrid`: Target Oceananigans computational grid.
-- `bathymetry_filepath::AbstractString`: Path to the downloaded real NetCDF bathymetry.
-- `varname::Union{Nothing, String}`: Elevation variable name (auto-detects if nothing).
-- `lon_var::Union{Nothing, String}`: Longitude variable name (auto-detects if nothing).
-- `lat_var::Union{Nothing, String}`: Latitude variable name (auto-detects if nothing).
-- `min_water_depth::Real`: Minimum depth floor in meters for wet coastal water columns (default 10.0m).
-- `mask_bay_of_fundy::Bool`: Mask Bay of Fundy shallows to solid land (0.0 m) to prevent
-  hypertidal resonance and small time steps (default false).
-
-# Outputs
-- `ImmersedBoundaryGrid`: Computational grid containing the interpolated real seafloor.
-
-# References
-- NOAA National Centers for Environmental Information. (2022). NOAA ETOPO 2022
-  15 Arc-Second Global Relief Model. NOAA NCEI. DOI: 10.25921/fd1h-fy81
-- GEBCO Compilation Group. (2023). GEBCO 2023 Grid.
-  DOI: 10.5285/f98b0f3b-9c64-d6f7-e053-6c86abc0f34e
-"""
-function build_immersed_grid_from_real_data(
-    grid::LatitudeLongitudeGrid,
-    bathymetry_filepath::AbstractString;
-    varname::Union{Nothing, AbstractString} = nothing,
-    lon_var::Union{Nothing, AbstractString} = nothing,
-    lat_var::Union{Nothing, AbstractString} = nothing,
-    min_water_depth::Real = 10.0,
-    mask_bay_of_fundy::Bool = false
-)
-    if !isfile(bathymetry_filepath)
-        error("Real bathymetry file not found: $(bathymetry_filepath)")
-    end
-
-    raw_elevation, raw_lon, raw_lat = NCDatasets.Dataset(bathymetry_filepath, "r") do ds
-        # Auto-detect elevation variable name
-        vname = if !isnothing(varname)
-            varname
-        elseif haskey(ds, "altitude")
-            "altitude"
-        elseif haskey(ds, "elevation")
-            "elevation"
-        elseif haskey(ds, "z")
-            "z"
-        elseif haskey(ds, "topo")
-            "topo"
-        else
-            error("Cannot auto-detect elevation variable. Keys in file: $(keys(ds))")
-        end
-
-        # Auto-detect longitude
-        xname = if !isnothing(lon_var)
-            lon_var
-        elseif haskey(ds, "longitude")
-            "longitude"
-        elseif haskey(ds, "lon")
-            "lon"
-        elseif haskey(ds, "x")
-            "x"
-        else
-            error("Cannot auto-detect longitude variable. Keys in file: $(keys(ds))")
-        end
-
-        # Auto-detect latitude
-        yname = if !isnothing(lat_var)
-            lat_var
-        elseif haskey(ds, "latitude")
-            "latitude"
-        elseif haskey(ds, "lat")
-            "lat"
-        elseif haskey(ds, "y")
-            "y"
-        else
-            error("Cannot auto-detect latitude variable. Keys in file: $(keys(ds))")
-        end
-
-        raw_elev = Array{Float64}(ds[vname][:, :])
-        lons = collect(Float64, ds[xname][:])
-        lats = collect(Float64, ds[yname][:])
-
-        # Guarantee (n_lon, n_lat) layout — same logic as load_bathymetry_from_netcdf.
-        dim_names   = NCDatasets.dimnames(ds[vname])
-        lat_like    = ["lat", "latitude", "y", "nav_lat"]
-        needs_tp    = (length(dim_names) >= 1 &&
-                       lowercase(string(dim_names[1])) in lat_like)
-        elev = needs_tp ? permutedims(raw_elev, (2, 1)) : raw_elev
-
-        (elev, lons, lats)
-    end
-
-    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    nx, ny, _ = size(base_g)
-    lon_min, lon_max = base_g.λᶠᵃᵃ[1], base_g.λᶠᵃᵃ[base_g.Nx + 1]
-    lat_min, lat_max = base_g.φᵃᶠᵃ[1], base_g.φᵃᶠᵃ[base_g.Ny + 1]
-
-    target_lons = range(lon_min, lon_max, length = nx)
-    target_lats = range(lat_min, lat_max, length = ny)
-
-    # Perform 2D bilinear regridding
-    regridded_topo = regrid_2d_field(raw_lon, raw_lat, raw_elevation,
-                                     target_lons, target_lats)
-
-    if mask_bay_of_fundy
-        n_masked = 0
-        for j in 1:ny, i in 1:nx
-            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
-                regridded_topo[i, j] = 0.0
-                n_masked += 1
-            end
-        end
-        @info "Bay of Fundy masking active: set $(n_masked) cells to solid land (0.0 m)."
-    end
-
-    # Condition bathymetry: level emerged land to 0.0, floor shallow wet cells,
-    # and apply conservative Laplacian smoothing on wet cells to eliminate subgrid 2Δx
-    # pinnacles and single-cell shelf-edge cliffs while preserving land masks
-    h_floor = Float64(min_water_depth)
-    conditioned_topo = smooth_bathymetry(
-        regridded_topo,
-        passes = 4,
-        alpha = 0.5,
-        h_min = h_floor
-    )
-
-    if mask_bay_of_fundy
-        for j in 1:ny, i in 1:nx
-            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
-                conditioned_topo[i, j] = 0.0
-            end
-        end
-    end
-
-    return build_immersed_grid(grid, conditioned_topo)
-end
-
-"""
-    extract_grid_coordinates(grid) -> NamedTuple
-
-Extract 1D cell-center spatial coordinates `(lons, lats, depths)` from an
-Oceananigans computational grid, returning geographic coordinates in **degrees**
-and the vertical coordinate in **metres**.
-
-# Notes
-Oceananigans distinguishes between *metric* coordinates (`xnode`, `ynode` — Cartesian
-components in metres) and *geographic* coordinates (longitude/latitude in degrees). For a
-`LatitudeLongitudeGrid` the horizontal grid vectors are stored directly in degrees, so the
-typed accessors `λᶜᵃᵃ` and `φᵃᶜᵃ` are used, with the halo region stripped using the grid's
-own `Hx`/`Hy` extents. The vertical coordinate is genuinely metric, so `znode` is correct
-for depth.
-
-Using `xnode`/`ynode` for the horizontal axes would silently return metres and corrupt
-downstream geospatial products (e.g. DuckDB archival, map axes, transect selection).
-
-# Inputs
-- `grid`: `LatitudeLongitudeGrid` or `ImmersedBoundaryGrid` wrapping one.
-
-# Outputs
-- `NamedTuple`: `(lons::Vector{Float64}, lats::Vector{Float64}, depths::Vector{Float64})`
-  with lengths `(Nx, Ny, Nz)`, halo excluded, ascending in each axis.
-"""
-function extract_grid_coordinates(grid)
-    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
-    nx, ny, nz = cpu_g.Nx, cpu_g.Ny, cpu_g.Nz
-
-    if !(cpu_g isa LatitudeLongitudeGrid)
-        error(
-            "extract_grid_coordinates requires a LatitudeLongitudeGrid (or an " *
-            "ImmersedBoundaryGrid wrapping one) to report geographic coordinates in " *
-            "degrees; received $(nameof(typeof(cpu_g))). Metric-distance grids must be " *
-            "converted to geographic coordinates before extraction."
-        )
-    end
-
-    # Geographic horizontal coordinates (degrees), halo region stripped (interior indices 1:nx, 1:ny).
-    lons = [Float64(cpu_g.λᶜᵃᵃ[i]) for i in 1:nx]
-    lats = [Float64(cpu_g.φᵃᶜᵃ[j]) for j in 1:ny]
-
-    # Vertical coordinate (metres) is genuinely metric, so `znode` is appropriate.
-    depths = [Float64(Oceananigans.Grids.znode(k, cpu_g, Oceananigans.Grids.Center()))
-              for k in 1:nz]
-
-    return (lons = lons, lats = lats, depths = depths)
-end
-

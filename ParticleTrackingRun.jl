@@ -110,7 +110,7 @@ Decoupled Hydrodynamics & Multi-Cohort Tracking:
   --checkpoint-interval=<val>
                           State checkpoint interval in seconds, hours (e.g. 6h), or days (e.g. 1d).
   --checkpoints-dir=<dir> Custom directory for storing restart checkpoints.
-  --run-id=<string>       Unique cohort run identifier for DuckDB persistence and figures.
+  --run-id=<string>       Unique cohort run identifier for Zarr persistence and figures.
 
 Tidal Forcing & External Datasets:
   --tides                 Enable astronomical tidal velocity forcing (requires TPXO9 solution).
@@ -133,13 +133,13 @@ Individual Segment Flags:
                          re-simulate. Use after changing a plotting function.
   --viz, --visualize      Generate CairoMakie spatial figures and interactive HTML map (Segment 8).
 
-DuckDB Analytical Storage & Model Averaging:
-  --duckdb                Enable DuckDB storage archiving (default: true).
-  --no-duckdb             Disable DuckDB storage archiving.
-  --db-path=<path>        Custom DuckDB database path (default: outputs/particle_tracking.duckdb).
-  --list-runs             Query and display all simulation runs archived in DuckDB.
-  --compare-scenarios     Query and display multi-scenario comparison metrics.
-  --model-average         Compute ensemble model-averaged connectivity and recruitment.
+Zarr Analytical Storage & Model Averaging:
+  --zarr                Enable Zarr storage archiving (default: true).
+  --no-zarr             Disable Zarr storage archiving.
+  --db-path=<path>      Custom Zarr storage path (default: outputs/particle_tracking.zarr).
+  --list-runs           Query and display all simulation runs archived in Zarr.
+  --compare-scenarios   Query and display multi-scenario comparison metrics.
+  --model-average       Compute ensemble model-averaged connectivity and recruitment.
 
 Centralized Configuration:
   --config=<path>         Path to centralized .toml file (default: inputs/ParticleTracking.toml).
@@ -150,17 +150,17 @@ Ecosystem & Species Configurations:
                           500 larvae, 60-day PLD, bottom release (0.5-3.0m off bed),
                           active ascent (10 mm/s to -10m), DVM, molting (T_base = -1.5°C;
                           65, 130, 200 DD), 100x100x20 grid, Scotian Shelf/slope domain,
-                          and persistence to outputs/snowcrab_tracking.duckdb.
+                          and persistence to outputs/snowcrab_tracking.zarr.
                           Additional CLI arguments override these defaults.
   --snowcrab              Alias for --snowcrab-settings.
   --snowcrab-mode         Alias for --snowcrab-settings.
   --tesselated            Snow crab configuration with depth-stratified Voronoi tessellation:
                           N=5000 units, 80% core (50-350m, 1.5km min res), 10% shallow (0-50m,
-                          5km min res), 10% deep (>350m, 10km min res) and DuckDB archiving.
+                          5km min res), 10% deep (>350m, 10km min res) and Zarr archiving.
   --real-5yr              Execute 5-Year physical hydrodynamic cycle scenario.
   --climatology-2yr       Execute 2-Year climatological average cycle scenario.
   --climatology-1.5yr     Execute 1.5-Year (18-Month) climatological cycle scenario.
-  --compare               Query DuckDB and display comparative scenario analytics.
+  --compare               Query Zarr and display comparative scenario analytics.
   --heat-flux=<val>       Summer atmospheric heat flux in W/m² (default: 50.0).
 
 Computational Architecture:
@@ -1236,8 +1236,7 @@ function run_segment_simulation(;
         target_cfl = opts.target_cfl,
         max_Δt = max_Δt,
         min_Δt = opts.min_dt_seconds,
-        output_dir = write_dir,
-        output_filename = write_filename,
+        output_path = joinpath(write_dir, write_filename),
         output_schedule = (opts.output_schedule_seconds > 0.0) ?
             opts.output_schedule_seconds : 21600.0,
         progress_schedule = 100,
@@ -1281,7 +1280,7 @@ function run_segment_simulation(;
                 nothing
             end
 
-            db = open_duckdb_storage(opts.duckdb_path)
+            db = open_storage(opts.zarr_path)
             try
                 target_run_id = !isempty(opts.run_id) ? opts.run_id :
                     "run_$(opts.scenario)_$(opts.projection_year)"
@@ -1293,12 +1292,12 @@ function run_segment_simulation(;
                     elevation = eta_data,
                     time_seconds = opts.sim_duration
                 )
-                println("Hydrodynamic fields for '$(target_run_id)' archived in DuckDB.")
+                println("Hydrodynamic fields for '$(target_run_id)' archived in Zarr.")
             finally
-                close_duckdb_storage(db)
+                close_storage(db)
             end
         catch err
-            @warn "Failed to archive hydrodynamic fields to DuckDB: $(err)"
+            @warn "Failed to archive hydrodynamic fields to Zarr: $(err)"
         end
     end
 
@@ -1579,11 +1578,11 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         end
     end
 
-    # Save trajectories directly into DuckDB
-    if opts.enable_duckdb
+    # Save trajectories directly into Zarr
+    if opts.enable_zarr
         try
-            println("Archiving trajectories to DuckDB -> $(opts.duckdb_path)...")
-            db = open_duckdb_storage(opts.duckdb_path)
+            println("Archiving trajectories to Zarr -> $(opts.zarr_path)...")
+            db = open_storage(opts.zarr_path)
             try
                 target_run_id = !isempty(opts.run_id) ? opts.run_id :
                     "run_$(opts.scenario)_$(opts.projection_year)"
@@ -1594,12 +1593,12 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
                     notes = "Hydrodynamic tracking run ($(opts.scenario), $(opts.projection_year))" *
                             (!isempty(opts.run_id) ? " [$(opts.run_id)]" : "")
                 )
-                println("Trajectories for '$(target_run_id)' successfully archived in DuckDB.")
+                println("Trajectories for '$(target_run_id)' successfully archived in Zarr.")
             finally
-                close_duckdb_storage(db)
+                close_storage(db)
             end
         catch err
-            @warn "Failed to archive trajectories to DuckDB: $(err)"
+            @warn "Failed to archive trajectories to Zarr: $(err)"
         end
     end
 
@@ -1752,11 +1751,11 @@ function run_segment_metrics(;
         config = active_config
     )
 
-    # 7. Archive simulation run, trajectories, metrics & connectivity in DuckDB
-    if opts.enable_duckdb
+# 7. Archive simulation run, trajectories, metrics & connectivity in Zarr
+    if opts.enable_zarr
         try
-            println("Archiving simulation run and metrics to DuckDB -> $(opts.duckdb_path)...")
-            db = open_duckdb_storage(opts.duckdb_path)
+            println("Archiving simulation run and metrics to Zarr -> $(opts.zarr_path)...")
+            db = open_storage(opts.zarr_path)
             try
                 target_run_id = !isempty(opts.run_id) ? opts.run_id :
                     "run_$(opts.scenario)_$(opts.projection_year)"
@@ -1787,36 +1786,37 @@ function run_segment_metrics(;
                 )
                 if opts.enable_voronoi && !isnothing(voronoi_res)
                     try
-                        DBInterface.execute(db, """
-                            CREATE TABLE IF NOT EXISTS voronoi_units (
-                                run_id VARCHAR,
-                                unit_id INTEGER,
-                                lon DOUBLE,
-                                lat DOUBLE,
-                                depth DOUBLE,
-                                stratum VARCHAR,
-                                area_km2 DOUBLE,
-                                settlement_count INTEGER,
-                                retention_index DOUBLE
-                            )
-                        """)
-                        v_t = voronoi_res.tessellation
-                        v_m = voronoi_res.metrics
-                        appender = DuckDB.Appender(db, "voronoi_units")
-                        for u in v_t.units
-                            s_cnt = u.id <= length(v_m.settlement_counts) ? v_m.settlement_counts[u.id] : 0
-                            r_idx = u.id <= length(v_m.retention_indices) ? v_m.retention_indices[u.id] : 0.0
-                            DuckDB.append(appender, target_run_id)
-                            DuckDB.append(appender, u.id)
-                            DuckDB.append(appender, u.lon)
-                            DuckDB.append(appender, u.lat)
-                            DuckDB.append(appender, u.depth)
-                            DuckDB.append(appender, string(u.stratum))
-                            DuckDB.append(appender, u.area_km2)
-                            DuckDB.append(appender, s_cnt)
-                            DuckDB.append(appender, r_idx)
-                            DuckDB.end_row(appender)
+                        # Zarr doesn't support raw SQL - use the storage API instead
+                        if !haskey(db["metrics"], target_run_id)
+                            Zarr.create_group(db["metrics"], target_run_id)
                         end
+                        mgroup = db["metrics"][target_run_id]
+                        for u in voronoi_res.units
+                            row_id = u.id
+                            Zarr.write(mgroup["unit_$(row_id)"], Dict(
+                                "run_id" => target_run_id,
+                                "unit_id" => u.id,
+                                "lon" => u.lon,
+                                "lat" => u.lat,
+                                "depth" => u.depth,
+                                "stratum" => string(u.stratum),
+                                "area_km2" => u.area_km2,
+                                "settlement_count" => u.settlement_count,
+                            ))
+                        end
+                        println("Archived $(length(voronoi_res.units)) Voronoi units to Zarr.")
+                    catch v_err
+                        @warn "Failed to archive Voronoi units to Zarr: $(v_err)"
+                    end
+                end
+                println("Zarr run '$(target_run_id)' successfully archived.")
+            finally
+                close_storage(db)
+            end
+        catch err
+            @warn "Failed to archive simulation run and metrics to Zarr: $(err)"
+        end
+    end
                         DuckDB.flush(appender)
                         DuckDB.close(appender)
                         println("Archived $(length(v_t.units)) Voronoi units to DuckDB table 'voronoi_units'.")
@@ -2001,15 +2001,15 @@ function load_run_trajectories(opts::HydrodynamicOptions)
                joinpath(opts.output_dir, "larval_trajectories.jld2")
 
     from_db = nothing
-    if opts.enable_duckdb && isfile(opts.duckdb_path)
-        db = open_duckdb_storage(opts.duckdb_path; read_only = true)
+    if opts.enable_zarr && isdir(opts.zarr_path)
+        db = open_storage(opts.zarr_path; read_only = true)
         try
-            println("Loading particle trajectories from DuckDB for run '$(target_run_id)'...")
+            println("Loading particle trajectories from Zarr for run '$(target_run_id)'...")
             from_db = load_trajectories_namedtuple(db, target_run_id)
         catch err
-            println("  DuckDB load failed ($(sprint(showerror, err))); trying the checkpoint.")
+            println("  Zarr load failed ($(sprint(showerror, err))); trying the checkpoint.")
         finally
-            close_duckdb_storage(db)
+            close_storage(db)
         end
     end
 
@@ -2151,15 +2151,15 @@ function run_segment_visualize(;
     fig8_path = joinpath(opts.output_dir, "hydrodynamic_advection.png")
     fig9_path = joinpath(opts.output_dir, "hydrodynamic_tracers.png")
     println("Rendering hydrodynamic advection velocity field -> $(fig8_path)...")
-    active_hydro = if opts.enable_duckdb && isfile(opts.duckdb_path)
+    active_hydro = if opts.enable_zarr && isdir(opts.zarr_path)
         try
-            db_h = open_duckdb_storage(opts.duckdb_path; read_only = true)
+            db_h = open_storage(opts.zarr_path; read_only = true)
             try
                 target_run_id = !isempty(opts.run_id) ? opts.run_id :
                     "run_$(opts.scenario)_$(opts.projection_year)"
                 load_hydrodynamic_field(db_h, target_run_id)
             finally
-                close_duckdb_storage(db_h)
+                close_storage(db_h)
             end
         catch
             nothing
@@ -2292,11 +2292,11 @@ function run_segment_visualize(;
         end
     end
 
-    # 9. Query Archived Scenarios from DuckDB for Cross-Scenario Comparison & Multi-Layer Interactive Map
+    # 9. Query Archived Scenarios from Zarr for Cross-Scenario Comparison & Multi-Layer Interactive Map
     scenarios_bundle = Dict{String, Any}()
-    if opts.enable_duckdb && isfile(opts.duckdb_path)
+    if opts.enable_zarr && isdir(opts.zarr_path)
         try
-            db = open_duckdb_storage(opts.duckdb_path; read_only = true)
+            db = open_storage(opts.zarr_path; read_only = true)
             try
                 runs_df = list_simulation_runs(db)
                 for r in eachrow(runs_df)
@@ -2317,7 +2317,7 @@ function run_segment_visualize(;
                     end
                 end
             finally
-                close_duckdb_storage(db)
+                close_storage(db)
             end
         catch
         end
@@ -2608,8 +2608,8 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
             viz_res = (animation = anim_file,)
         end
 
-        if opts.enable_duckdb
-            close_all_duckdb_storage!()
+        if opts.enable_zarr
+            close_all_storage!()
         end
         println("=================================================================")
         return (
@@ -2667,16 +2667,16 @@ end
 Query and display all simulation runs currently archived in DuckDB.
 """
 function run_cli_list_runs(; opts::HydrodynamicOptions = HydrodynamicOptions())
-    if !isfile(opts.duckdb_path)
-        println("No DuckDB database found at: $(opts.duckdb_path)")
+    if !isdir(opts.zarr_path)
+        println("No Zarr storage found at: $(opts.zarr_path)")
         return
     end
     println("\n=================================================================")
-    println(" Archived Simulation Runs in DuckDB: $(opts.duckdb_path)")
+    println(" Archived Simulation Runs in Zarr: $(opts.zarr_path)")
     println("=================================================================")
-    db = open_duckdb_storage(opts.duckdb_path; read_only = true)
+    db = open_storage(opts.zarr_path; read_only = true)
     df = list_simulation_runs(db)
-    close_duckdb_storage(db)
+    close_storage(db)
 
     if nrow(df) == 0
         println("No simulation runs archived in database yet.")
@@ -2700,19 +2700,19 @@ end
 """
     run_cli_compare_scenarios(; opts::HydrodynamicOptions)
 
-Query and print comparative metrics across archived climate scenarios in DuckDB.
+Query and print comparative metrics across archived climate scenarios in Zarr.
 """
 function run_cli_compare_scenarios(; opts::HydrodynamicOptions = HydrodynamicOptions())
-    if !isfile(opts.duckdb_path)
-        println("No DuckDB database found at: $(opts.duckdb_path)")
+    if !isdir(opts.zarr_path)
+        println("No Zarr storage found at: $(opts.zarr_path)")
         return
     end
     println("\n=================================================================")
-    println(" Multi-Scenario Comparative Analysis from DuckDB")
+    println(" Multi-Scenario Comparative Analysis from Zarr")
     println("=================================================================")
-    db = open_duckdb_storage(opts.duckdb_path; read_only = true)
+    db = open_storage(opts.zarr_path; read_only = true)
     df = compare_scenarios(db)
-    close_duckdb_storage(db)
+    close_storage(db)
 
     if nrow(df) == 0
         println("No simulation data available for scenario comparison.")
@@ -2737,18 +2737,18 @@ end
 Compute and display ensemble model-averaged demographic connectivity and recruitment.
 """
 function run_cli_model_average(; opts::HydrodynamicOptions = HydrodynamicOptions())
-    if !isfile(opts.duckdb_path)
-        println("No DuckDB database found at: $(opts.duckdb_path)")
+    if !isdir(opts.zarr_path)
+        println("No Zarr storage found at: $(opts.zarr_path)")
         return
     end
     println("\n=================================================================")
     println(" Multi-Scenario Ensemble Model Averaging")
     println("=================================================================")
-    db = open_duckdb_storage(opts.duckdb_path; read_only = true)
+    db = open_storage(opts.zarr_path; read_only = true)
     runs_df = list_simulation_runs(db)
 
     if nrow(runs_df) == 0
-        close_duckdb_storage(db)
+        close_storage(db)
         println("No simulation data available for model averaging.")
         return
     end
@@ -2756,7 +2756,7 @@ function run_cli_model_average(; opts::HydrodynamicOptions = HydrodynamicOptions
     scens = unique(runs_df.scenario)
     println("Averaging across $(length(scens)) scenario models: $(join(scens, ", "))")
     ens = compute_ensemble_model_average(db, scens)
-    close_duckdb_storage(db)
+    close_storage(db)
 
     println("\nEnsemble Weighted Settlement Success: $(round(ens.mean_recruitment_rate * 100, digits=2))%")
     println("Ensemble Weighted Mean PLD:          $(round(ens.mean_pld_days, digits=1)) days")

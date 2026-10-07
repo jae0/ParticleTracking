@@ -1166,7 +1166,7 @@ free surface elevation, and bathymetry) at specific depths and times.
 This is the central data extraction utility that handles multiple input formats:
 - Oceananigans model instances (live or serialized)
 - JLD2 simulation output files (timeseries groups with snapshot keys)
-- DuckDB analytical database connections (with optional run_id filter)
+- Zarr analytical storage connections (with optional run_id filter)
 - NamedTuple or Dict with pre-extracted fields
 - `nothing` (generates synthetic test data)
 
@@ -1195,7 +1195,7 @@ This is the central data extraction utility that handles multiple input formats:
   ```
 
 # Inputs
-- `hydro_input`: Oceananigans model, JLD2 file path, DuckDB connection, NamedTuple, Dict, or `nothing`.
+- `hydro_input`: Oceananigans model, JLD2 file path, Zarr storage connection, NamedTuple, Dict, or `nothing`.
 - `depth`: Optional continuous depth in meters (e.g. `-25.0` or `25.0`). Uses nearest depth level.
 - `depth_level`: Optional vertical level index (1-indexed, overrides `depth`).
 - `time_seconds`: Optional simulation time in seconds (selects nearest snapshot).
@@ -1204,7 +1204,7 @@ This is the central data extraction utility that handles multiple input formats:
 - `domain_lat`: Latitudinal bounds `(min_lat, max_lat)` for synthetic fallback (default: embedding domain).
 - `grid_size`: Horizontal grid dimension `(nx, ny)` for synthetic fallback.
 - `target_depths`: Depth coordinates in meters (default `[-2.5, -25.0, -50.0, -100.0]`).
-- `run_id`: Optional DuckDB simulation run identifier for multi-run queries.
+- `run_id`: Optional Zarr simulation run identifier for multi-run queries.
 
 # Outputs
 - `NamedTuple` containing:
@@ -1520,8 +1520,8 @@ function extract_hydrodynamic_dataset(
         )
     end
 
-    # 2. DuckDB Database Connection
-    if !isnothing(hydro_input) && (hydro_input isa DuckDB.DB)
+    # 2. Zarr Storage Connection
+    if !isnothing(hydro_input) && (hydro_input isa Zarr.ZGroup)
         r_id = !isnothing(run_id) ? String(run_id) : begin
             runs_df = list_simulation_runs(hydro_input)
             nrow(runs_df) > 0 ? String(first(runs_df.run_id)) : "run_baseline_2025"
@@ -1880,7 +1880,7 @@ Flow orientation angle:
 ```
 
 # Inputs
-- `hydrodynamics`: Model instance, JLD2 path, DuckDB database, or NamedTuple.
+- `hydrodynamics`: Model instance, JLD2 path, Zarr storage, or NamedTuple.
 - `depth`: Target continuous depth in meters (e.g. `-25.0` or `25.0`).
 - `depth_level`: Vertical discrete index (default: 1).
 - `time_seconds`: Timestamp in seconds.
@@ -2007,7 +2007,7 @@ at a specific depth and time.
 - **Haline Tracer Distribution**: \$S(x, y, z_k, t_m)\$ [PSU].
 
 # Inputs
-- `hydrodynamics`: Model, JLD2 file, DuckDB database, or NamedTuple.
+- `hydrodynamics`: Model, JLD2 file, Zarr storage, or NamedTuple.
 - `depth`: Target depth in meters (e.g. `-50.0`).
 - `depth_level`: Vertical index (default: 1).
 - `time_seconds`: Timestamp in seconds.
@@ -2104,7 +2104,7 @@ Vertical salinity gradient (halocline strength):
 ```
 
 # Inputs
-- `hydrodynamics`: Model, JLD2 file, DuckDB database, or NamedTuple.
+- `hydrodynamics`: Model, JLD2 file, Zarr storage, or NamedTuple.
 - `depth`: Depth in meters (default: surface).
 - `depth_level`: Vertical level index.
 - `time_seconds`: Simulation time in seconds.
@@ -2243,7 +2243,7 @@ Ri = \\\\\\\\\\\\\\frac{N^2}{\\left(\\\\\\\\\\\\\\frac{\\\\\\\\\\\\\\partial u}{
 ```
 
 # Inputs
-- `hydrodynamics`: Model instance, JLD2 file, DuckDB database, or NamedTuple.
+- `hydrodynamics`: Model instance, JLD2 file, Zarr storage, or NamedTuple.
 - `depth`: Depth in meters.
 - `depth_level`: Vertical level index.
 - `time_seconds`: Timestamp in seconds.
@@ -2399,7 +2399,7 @@ transect line for any active hydrodynamic field (temperature, salinity, stratifi
 advection currents, turbulent diffusion) with seafloor bathymetry masking.
 
 # Inputs
-- `hydrodynamics`: Hydrodynamic model instance, JLD2 file, DuckDB database, or NamedTuple
+- `hydrodynamics`: Hydrodynamic model instance, JLD2 file, Zarr storage, or NamedTuple
                    containing (lons, lats, depths, bathymetry, u, v, w, temperature, salinity,
                    elevation, diffusion, viscosity, speed).
 - `variable`: Variable symbol to plot. Options:
@@ -2596,7 +2596,7 @@ Plot temporal evolution of any hydrodynamic parameter at a specified geographica
 across multiple depth levels throughout the simulation horizon.
 
 # Inputs
-- `hydrodynamics`: Model instance, JLD2 file, DuckDB database, or NamedTuple.
+- `hydrodynamics`: Model instance, JLD2 file, Zarr storage, or NamedTuple.
 - `station`: Optional `(lon, lat)` coordinate tuple for the station.
 - `lon, lat`: Mooring / station coordinates (used if `station = nothing`).
 - `depths`: Vector of depth levels in meters.
@@ -2700,7 +2700,7 @@ Flexible unified renderer for 2D spatial distribution of any hydrodynamic variab
 - `:elevation`: Sea surface height (cm).
 
 # Inputs
-- `hydrodynamics`: Model, JLD2 file, DuckDB database, or NamedTuple.
+- `hydrodynamics`: Model, JLD2 file, Zarr storage, or NamedTuple.
 - `variable`: Symbol indicating field to render.
 - `depth`: Depth in meters.
 - `depth_level`: Vertical level index.
@@ -4798,7 +4798,7 @@ t_m = t_0 + m \\cdot \\Delta t_{\\text{frame}}, \\quad
 ```
 
 # Inputs
-- `hydrodynamics`: JLD2 file path, DuckDB database connection, Oceananigans Model instance,
+- `hydrodynamics`: JLD2 file path, Zarr storage connection, Oceananigans Model instance,
   or NamedTuple.
 - `variable`: Target diagnostic variable to animate. Options:
   `:speed` / `:advection` (horizontal current speed |u_h|),
@@ -5077,7 +5077,7 @@ Render a synchronized 4-panel hydrodynamic simulation dashboard animation:
 4. Panel (2, 2): Free sea surface height elevation \$\\eta(x, y)\$ tidal waves.
 
 # Inputs
-- `hydrodynamics`: Model instance, JLD2 file, DuckDB database, or NamedTuple.
+- `hydrodynamics`: Model instance, JLD2 file, Zarr storage, or NamedTuple.
 - `depth`: Target depth in meters (default: -2.5 m).
 - `depth_level`: Vertical discrete index (default: 1).
 - `time_indices`: Optional explicit vector of snapshot indices.
@@ -5333,7 +5333,7 @@ Panels:
 6. Particle trajectories with stage coloration (if trajectories provided)
 
 # Inputs
-- `hydrodynamics`: JLD2 file, DuckDB, model instance, or NamedTuple from `extract_hydrodynamic_dataset`
+- `hydrodynamics`: JLD2 file, Zarr storage, model instance, or NamedTuple from `extract_hydrodynamic_dataset`
 - `trajectories`: Optional Lagrangian tracking output from `track_larval_cohort`
 - `bathymetry`: Optional bathymetry NamedTuple for background contours
 - `connectivity`: Optional connectivity matrix from `compute_empirical_connectivity`

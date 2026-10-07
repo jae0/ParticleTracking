@@ -264,12 +264,10 @@ mortality_cold_sensitivity = 0.01
 [storage]
 # All output lands under work/opendata/, and the realized configuration is copied there
 # as resolved_config.toml for provenance.
-output_dir = "work/opendata"
-output_filename = "opendata.jld2"
+output_path = "work/opendata/opendata.jld2"
+storage_backend = "zarr"
 output_schedule_seconds = 21600.0
 checkpoint_fields = ["u", "v", "w", "T", "S", "η"]
-enable_duckdb = true
-duckdb_path = "work/opendata/opendata.duckdb"
 enable_checkpoint = true
 checkpoint_prefix = "opendata_checkpoint"
 checkpoint_schedule_seconds = 21600.0

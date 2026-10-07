@@ -846,15 +846,15 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test res_dispatch == html_dispatch
     end
 
-    @testset "14. DuckDB Storage, Multi-Scenario Querying & Ensemble Model Averaging" begin
-        test_db_path = "outputs/test_particle_tracking.duckdb"
-        if isfile(test_db_path)
-            rm(test_db_path, force = true)
+    @testset "14. Zarr Storage, Multi-Scenario Querying & Ensemble Model Averaging" begin
+        test_db_path = "outputs/test_particle_tracking.zarr"
+        if isdir(test_db_path)
+            rm(test_db_path, force = true, recursive = true)
         end
 
-        # 1. Initialize DuckDB storage and verify schema
-        db = open_duckdb_storage(test_db_path)
-        @test isfile(test_db_path)
+        # 1. Initialize Zarr storage and verify schema
+        db = open_storage(test_db_path)
+        @test isdir(test_db_path)
 
         # 2. Generate and save synthetic runs across 3 climate scenarios
         rng = MersenneTwister(42)
@@ -1031,7 +1031,7 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test occursin("layer-hydro-advection", html_str)
 
         # Clean up database connection
-        close_duckdb_storage(db)
+        close_storage(db)
     end
 
     @testset "15. Centralized Configuration File Management & Scenario Metadata" begin
@@ -1083,12 +1083,12 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         cfg_reloaded = load_configuration(test_save_path)
         @test cfg_reloaded["biology"]["n_particles"] == 42
 
-        # 5. Test archiving configuration into DuckDB and reloading it
-        test_db_path = "outputs/test_config_meta.duckdb"
-        if isfile(test_db_path)
-            rm(test_db_path, force = true)
+        # 5. Test archiving configuration into Zarr and reloading it
+        test_db_path = "outputs/test_config_meta.zarr"
+        if isdir(test_db_path)
+            rm(test_db_path, force = true, recursive = true)
         end
-        db = open_duckdb_storage(test_db_path)
+        db = open_storage(test_db_path)
         rng = MersenneTwister(42)
         larvae = initialize_larval_particles(5, rng = rng)
         trajs = track_larval_cohort(
@@ -1113,7 +1113,7 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test cfg_loaded["biology"]["n_particles"] == 42
         @test cfg_loaded["climate"]["scenario"] == "ssp585"
 
-        close_duckdb_storage(db)
+        close_storage(db)
 
         # 6. Test NetCDF and JLD2 configuration attribute persistence
         nc_test = "outputs/test_config_meta.nc"

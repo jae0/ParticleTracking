@@ -1162,8 +1162,7 @@ function setup_hydrodynamic_simulation(
     min_Δt::Real = 0.1,
     progress_schedule::Union{Real, Int} = 20,
     enable_output::Bool = true,
-    output_dir::AbstractString = "outputs",
-    output_filename::AbstractString = "nova_scotia_hydrodynamics.jld2",
+    output_path::AbstractString = joinpath("outputs", "nova_scotia_hydrodynamics.jld2"),
     output_schedule::Union{Real, Int} = 100,
     include_diagnostics::Bool = true,
     overwrite_existing::Union{Nothing, Bool} = nothing,
@@ -1176,12 +1175,12 @@ function setup_hydrodynamic_simulation(
     watchdog::Bool = true,
     divergence_velocity_limit::Real = 20.0
 )
-    mkpath(output_dir)
-    full_output_path = joinpath(output_dir, output_filename)
+    mkpath(dirname(output_path))
+    full_output_path = output_path
 
     # Resolve checkpoint directory
     cp_dir = if isnothing(checkpoint_dir) || isempty(checkpoint_dir)
-        joinpath(output_dir, "checkpoints")
+        joinpath(dirname(output_path), "checkpoints")
     else
         String(checkpoint_dir)
     end

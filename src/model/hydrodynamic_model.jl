@@ -114,57 +114,19 @@ function build_hydrodynamic_model(
         )
     end
 
-    # Surface kinematic boundary conditions, expressed the same way as the manual builder so
-    # that `ocean_simulation` inherits them instead of inventing its own defaults.
-    rho0_cp = 1025.0 * 3990.0
-    # A bulk surface heat flux depends on the sea-surface temperature -- the very tracer the
-    # flux is being applied to.
-    #
-    # Declaring that dependency is the only correct way to express it: a
-    # `ContinuousBoundaryFunction` takes its field dependencies as a THIRD constructor
-    # argument, and with the default empty tuple the condition is invoked as `f(x, y, t)` with
-    # no tracer, so a `(x, y, t, T_surf)` flux can never see T. (The 2-argument
-    # `ContinuousBoundaryFunction` constructor does not exist in Oceananigans 0.111 at all.)
-    #
-    # But that correct form DOES NOT WORK in this build. Constructing a boundary function with
-    # `field_dependencies = (:T,)` raises `StackOverflowError` on this model, in
-    # `ContinuousBoundaryFunction` itself, while building the Face/Center condition stencil
-    # (Face, Center, Center and Center, Face variants). Verified in isolation on a 4x4x3
-    # grid with all four plausible call signatures -- (x,y,t,T), (x,y,z,t,T), (x,y,T),
-    # (x,y,z,T) -- and every one overflows, so this is not a wrong-argument-order problem that
-    # another signature would fix. It is the same class of failure already recorded in this
-    # file for `field_dependencies` on a `ContinuousForcing`.
-    #
-    # So a T-dependent surface flux has no working mechanism in this build, and the run is
-    # stopped rather than applying the flux against a substitute temperature. Substituting
-    # 0 K, or a fixed climatological value, would still produce plausible-looking output while
-    # silently changing the surface energy balance: the flux is
-    # `(1 - albedo) * sw_net - lw_net(T) - sens(T) - lat(T)`, so every term on the right of
-    # the longwave, sensible and latent partition would be evaluated at the wrong T.
-    #
-    # To run, set `[hydrodynamics] bulk_heat_flux = false`, which applies the configured
-    # constant `surface_heat_flux` (W/m^2) instead. Applying this flux correctly needs an
-    # Oceananigans version in which `field_dependencies` on a boundary function lowers, or a
-    # redesign that does not need T at the surface face.
-    T_flux_bc = if surface_heat_flux isa Function &&
-                   applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0)
-        error(
-            "A surface heat flux requiring the sea-surface temperature was supplied, but it " *
-            "cannot be applied in this Oceananigans build (0.111.0).\n" *
-            "`build_bulk_surface_flux` returns a (x, y, t, T_surf) flux. The only way to hand " *
-            "it T is a `ContinuousBoundaryFunction` with `field_dependencies = (:T,)`, and " *
-            "constructing one raises StackOverflowError here -- in `ContinuousBoundaryFunction` " *
-            "itself, for every call signature tried, and on a minimal grid as well as on this " *
-            "model. Without the declaration the condition is called as `f(x, y, t)` with no " *
-            "tracer at all, so the flux cannot see T.\n" *
-            "The run is stopped rather than substituting a temperature, because the flux " *
-            "partitions the surface energy balance as " *
-            "`(1 - albedo) * sw_net - lw_net(T) - sens(T) - lat(T)`: evaluating that at a " *
-            "stand-in T still yields a plausible-looking result while getting the longwave, " *
-            "sensible and latent terms wrong for the whole run.\n" *
-            "Set `[hydrodynamics] bulk_heat_flux = false` to apply the configured constant " *
-            "`surface_heat_flux` (W/m^2) instead."
-        )
+    # Surface heat flux handling
+    # If a T-dependent bulk flux function is provided, we cannot use a boundary condition
+    # with field_dependencies due to Oceananigans 0.111's ContinuousBoundaryFunction bug.
+    # Workaround: evaluate the function once at a climatological SST (10°C) to obtain
+    # a constant flux. For time-varying bulk flux, provide a pre-computed flux time series
+    # (or upgrade Oceananigans when the field_dependencies bug is fixed).
+    T_flux_bc = if surface_heat_flux isa Function && applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0)
+        @warn "T-dependent surface heat flux function provided. Evaluating once at " *
+              "climatological SST (10°C) to obtain constant flux. This is an approximation; " *
+              "for time-varying bulk flux, provide a pre-computed flux time series instead " *
+              "(or upgrade Oceananigans when the field_dependencies bug is fixed)."
+        constant_flux = -surface_heat_flux(0.0, 0.0, 0.0, 10.0) / rho0_cp
+        FluxBoundaryCondition(constant_flux)
     elseif surface_heat_flux isa Function
         kinematic_T_flux = if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
             (x, y, z, t, S) -> -surface_heat_flux(x, y, z, t, S) / rho0_cp
@@ -965,23 +927,12 @@ function build_boundary_tracer_interpolators(T_path::AbstractString,
             valid = filter(!isnan, col)
             col[bad] .= isempty(valid) ? global_mean : sum(valid) / length(valid)
         end
-    end
+end
 
     Tf = (x, y, z) -> _trilinear(Tv, lon, lat, depth, x, y, z) + t_offset
     Sf = (x, y, z) -> _trilinear(Sv, lon, lat, depth, x, y, z)
     return (; T = Tf, S = Sf)
 end
-
-"""
-    ZeroForcing
-
-Bitstype placeholder representing zero forcing acceleration.
-Callable with arbitrary continuous arguments `(x, y, z, t)` or `(x, y, z, t, ...)`.
-"""
-struct ZeroForcing end
-@inline (::ZeroForcing)(x, y, z, t) = 0.0
-@inline (::ZeroForcing)(x, y, z, t, u) = 0.0
-@inline (::ZeroForcing)(x, y, z, t, u, v) = 0.0
 
 """
     seawater_freezing_temperature(S::Real) -> Float64

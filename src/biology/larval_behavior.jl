@@ -1914,7 +1914,7 @@ end
 
 Normalize and validate a Lagrangian trajectory dataset to guarantee uniform array
 dimensions, consistent canonical Symbol types for stages and statuses, and complete
-fields required for DuckDB storage, spatial analysis, and interactive visualization.
+fields required for Zarr storage, spatial analysis, and interactive visualization.
 
 # Canonical Types & Array Specifications
 - `lons::Matrix{Float64}`: 2D array of longitudes `(n_particles, n_times)`.
