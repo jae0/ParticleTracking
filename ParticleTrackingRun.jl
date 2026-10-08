@@ -900,13 +900,14 @@ end
     elseif hydro_src in (:glorys12v1, :glorys_climatology, :copernicus, :cmesms)
         # Try to fetch from Copernicus Marine with dataset fallback chain
         copernicus_file = joinpath(opts.input_dir, "copernicus_ts.nc")
+        start_yr = hasproperty(opts, :start_year) ? opts.start_year : opts.projection_year
         try
             println("Fetching Copernicus Marine hydrography (trying GLOPHY-2 → GLO12 → GLORYS12 → NRT)...")
             fetch_copernicus_hydrography_with_fallback(
                 lon_range = opts.domain_lon,
                 lat_range = opts.domain_lat,
-                start_date = "$(opts.start_year)-01-01",
-                end_date = "$(opts.start_year)-12-31",
+                start_date = "$(start_yr)-01-01",
+                end_date = "$(start_yr)-12-31",
                 output_path = copernicus_file,
                 verbose = true
             )

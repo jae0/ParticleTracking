@@ -43,7 +43,7 @@ version = "1.0.0"
 coastline_source = "natural_earth_10m"  # Land outline at full detail, public domain
 bathy_source = "etopo2022"      # Sea floor map, NOAA, free
 wind_source = "open_meteo"      # Real weather via a free website; "era5" is the same thing
-hydrography_source = "glorys12v1"        # "woa23", Monthly average temperature and salt, NOAA, free
+hydrography_source = "woa23"            # Monthly average temperature and salt, NOAA, free
 wind_time_iso = "2020-06-01T00:00:00Z"   # Which moment of 2020 to take the weather from
 
 [climate]

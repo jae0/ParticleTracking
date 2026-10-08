@@ -1445,7 +1445,7 @@ function setup_hydrodynamic_simulation(
             outputs_dict,
             filename = full_output_path,
             schedule = out_sched,
-            overwrite_existing = resolved_overwrite
+            overwrite_files = resolved_overwrite
         )
         sim.output_writers[:fields] = writer
 
@@ -1475,7 +1475,7 @@ function setup_hydrodynamic_simulation(
             schedule = cp_sched,
             dir = cp_dir,
             prefix = resolved_cp_prefix,
-            overwrite_existing = true,
+            overwrite_files = true,
             cleanup = cleanup_checkpoints
         )
         sim.output_writers[:checkpointer] = checkpointer
