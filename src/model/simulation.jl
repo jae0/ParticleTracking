@@ -16,7 +16,7 @@ using Oceanostics: KineticEnergyDissipationRate
 using Oceananigans.Units
 using Oceananigans.Utils: prettytime
 using Oceananigans.OutputWriters: JLD2Writer, Checkpointer, checkpoint
-import Oceananigans.OutputWriters: cleanup_checkpoints
+import Oceananigans.OutputWriters: cleanup_checkpoints, write_output!
 using JLD2
 import OffsetArrays
 
@@ -257,6 +257,50 @@ function find_latest_checkpoint(
 end
 
 """
+    list_candidate_checkpoints(
+        checkpoint_dir::AbstractString;
+        prefix::AbstractString = "checkpoint_$(resolve_config_name())"
+    ) -> Vector{String}
+
+Return all candidate checkpoint file paths in `checkpoint_dir` matching `prefix`,
+ordered from highest iteration index (most recent) to lowest.
+"""
+function list_candidate_checkpoints(
+    checkpoint_dir::AbstractString;
+    prefix::AbstractString = "checkpoint_$(resolve_config_name())"
+)::Vector{String}
+    if !isdir(checkpoint_dir)
+        return String[]
+    end
+    resolved_prefix = if isempty(strip(prefix)) || prefix == "checkpoint"
+        "checkpoint_$(resolve_config_name())"
+    else
+        String(prefix)
+    end
+    files = readdir(checkpoint_dir)
+    esc_pfx = replace(resolved_prefix, "." => "\\.")
+    pattern = Regex("^" * esc_pfx * raw"_iteration(\d+)\.jld2$")
+    matches = Tuple{Int, String}[]
+    for f in files
+        m = match(pattern, f)
+        if !isnothing(m)
+            iter = tryparse(Int, m.captures[1])
+            if !isnothing(iter)
+                push!(matches, (iter, joinpath(checkpoint_dir, f)))
+            end
+        end
+    end
+    if isempty(matches)
+        fallback = filter(f -> startswith(f, resolved_prefix) && endswith(f, ".jld2"), files)
+        isempty(fallback) && return String[]
+        full_paths = joinpath.(checkpoint_dir, fallback)
+        return sort(full_paths, by = mtime, rev = true)
+    end
+    sort!(matches, by = first, rev = true)
+    return [fp for (_, fp) in matches]
+end
+
+"""
     inspect_hydrodynamic_checkpoint(filepath::AbstractString) -> NamedTuple
 
 Inspect an Oceananigans model checkpoint archive on disk, extracting its discrete
@@ -473,43 +517,109 @@ function verify_checkpoint_compatibility(
 end
 
 """
-    Oceananigans.OutputWriters.cleanup_checkpoints(
-        checkpointer::Checkpointer
-    ) -> Nothing
+    is_model_velocity_stable(model; divergence_velocity_limit::Real = 20.0) -> (Bool, Float64)
+
+Inspect current physical velocity fields of the model to ensure velocities remain
+finite and within physical bounds prior to serializing checkpoints.
+"""
+function is_model_velocity_stable(model; divergence_velocity_limit::Real = 20.0)
+    try
+        u_int = interior(model.velocities.u)
+        v_int = interior(model.velocities.v)
+        nx_c = min(size(u_int, 1), size(v_int, 1))
+        ny_c = min(size(u_int, 2), size(v_int, 2))
+        nz_c = min(size(u_int, 3), size(v_int, 3))
+        
+        u_sub = @view u_int[1:nx_c, 1:ny_c, 1:nz_c]
+        v_sub = @view v_int[1:nx_c, 1:ny_c, 1:nz_c]
+        
+        max_u = maximum(abs, u_sub)
+        max_v = maximum(abs, v_sub)
+        spd_max = max(max_u, max_v)
+        
+        is_stable = !(isnan(spd_max) || isinf(spd_max) || spd_max > divergence_velocity_limit)
+        return (is_stable, Float64(spd_max))
+    catch err
+        @warn "Error evaluating model velocity stability before checkpoint: $(err)"
+        return (false, NaN)
+    end
+end
+
+"""
+    guarded_write_checkpoint!(c::Checkpointer, simulation)
+
+Guarded checkpoint serializer for Oceananigans simulations. Intercepts the write step
+to evaluate physical interior velocity stability before serializing prognostic state to
+disk. If interior velocities exceed `divergence_velocity_limit`, checkpoint creation is
+aborted, preventing numerical divergence from overwriting known valid restart states.
+"""
+function guarded_write_checkpoint!(c::Checkpointer, simulation)
+    iter = iteration(simulation)
+    
+    # Pre-checkpoint verification gate: check velocity magnitude before writing
+    stable, max_spd = is_model_velocity_stable(simulation.model)
+    if !stable
+        @warn "Rejecting checkpoint at iteration $(iter) (time $(prettytime(simulation))): " *
+              "interior velocity magnitude ($(round(max_spd, digits=2)) m/s) diverges."
+        return nothing
+    end
+
+    filepath = Oceananigans.OutputWriters.checkpoint_path(iter, c)
+    t1 = time_ns()
+    state = Oceananigans.OutputWriters.prognostic_state(simulation)
+
+    # Write state to temporary file first to ensure atomic commit
+    tmp_filepath = filepath * ".tmp"
+    try
+        jldopen(tmp_filepath, "w") do file
+            Oceananigans.OutputWriters.serializeproperty!(file, "simulation", state)
+        end
+        mv(tmp_filepath, filepath; force = true)
+    catch err
+        isfile(tmp_filepath) && rm(tmp_filepath; force = true)
+        @error "Failed to write checkpoint at iteration $(iter): $(err)"
+        return nothing
+    end
+
+    t2 = time_ns()
+    sz = isfile(filepath) ? filesize(filepath) : 0
+    if c.verbose
+        @info "Checkpointing done: time=$(prettytime((t2 - t1) * 1e-9)), size=$(Oceananigans.Utils.pretty_filesize(sz))"
+    end
+
+    c.cleanup && Oceananigans.OutputWriters.cleanup_checkpoints(c)
+
+    return nothing
+end
+
+"""
+    guarded_cleanup_checkpoints(checkpointer::Checkpointer)
 
 Prune older intermediate checkpoint files generated during time integration,
-retaining exclusively the latest written snapshot.
-
-# Algorithmic Strategy and Error Recovery
-Standard Unix file removal (`rm`) can fail on Windows filesystems when JLD2 file
-descriptors remain momentarily pinned by the OS kernel or memory-mapped buffers,
-throwing an `IOError` corresponding to an `EBUSY` sharing violation. 
-
-To prevent simulation aborts during multi-day model integrations, this method:
-1. Identifies all checkpoints matching `prefix*.jld2` in `checkpointer.dir`.
-2. Excludes `latest_checkpoint_filepath` from eviction.
-3. Attempts immediate deletion with `rm(filepath; force=true)`.
-4. Upon encountering an `IOError`, executes `GC.gc()` to force cleanup of dead
-   file handles and re-attempts deletion.
-5. If file locking persists, logs a warning and leaves the intermediate file
-   intact, deferring eviction to subsequent checkpoint periods.
-
-# Inputs
-- `checkpointer::Checkpointer`: Oceananigans checkpoint writer instance.
-
-# Outputs
-- `Nothing`.
-
-# References
-- Oceananigans.jl OutputWriters: https://clima.github.io/OceananigansDocumentation/
-- Julia Base Filesystem API: https://docs.julialang.org/en/v1/base/file/
+retaining the 3 most recently written valid snapshots.
 """
-function Oceananigans.OutputWriters.cleanup_checkpoints(checkpointer::Checkpointer)
+function guarded_cleanup_checkpoints(checkpointer::Checkpointer)
     prefix = Oceananigans.OutputWriters.checkpoint_superprefix(checkpointer.prefix)
     filepaths = Oceananigans.OutputWriters.glob(prefix * "*.jld2", checkpointer.dir)
-    latest_checkpoint_filepath = Oceananigans.OutputWriters.latest_checkpoint(checkpointer, filepaths)
+    
+    # Retain the most recent 3 valid checkpoints rather than strictly 1
+    if length(filepaths) <= 3
+        return nothing
+    end
+
+    # Extract iteration numbers from filepaths if available, or sort by mtime
+    sort!(filepaths, by = fp -> try
+        m = match(r"iteration(\d+)", fp)
+        m !== nothing ? parse(Int, m.captures[1]) : Int(mtime(fp))
+    catch
+        Int(mtime(fp))
+    end)
+
+    # Retain the three latest checkpoints for robust rollback
+    retained = Set(filepaths[max(1, end - 2):end])
+
     for filepath in filepaths
-        if filepath != latest_checkpoint_filepath
+        if !(filepath in retained)
             try
                 rm(filepath; force = true)
             catch err
@@ -528,6 +638,43 @@ function Oceananigans.OutputWriters.cleanup_checkpoints(checkpointer::Checkpoint
     end
     return nothing
 end
+
+"""
+    install_checkpoint_hooks!()
+
+Dynamically install guarded checkpoint writing and retention hooks into Oceananigans
+at runtime. This avoids precompilation method-overwrite errors in Julia while ensuring
+all checkpoint operations respect the velocity stability gate and 3-checkpoint retention.
+"""
+function install_checkpoint_hooks!()
+    try
+        m_write = first(methods(Oceananigans.write_output!, (Checkpointer, Any)))
+        Base.delete_method(m_write)
+        @eval Oceananigans function write_output!(
+            c::Oceananigans.OutputWriters.Checkpointer,
+            simulation
+        )
+            ParticleTracking.guarded_write_checkpoint!(c, simulation)
+        end
+    catch err
+        @warn "Unable to hook Oceananigans.write_output!: $(err)"
+    end
+
+    try
+        m_clean = first(methods(Oceananigans.OutputWriters.cleanup_checkpoints, (Checkpointer,)))
+        Base.delete_method(m_clean)
+        @eval Oceananigans.OutputWriters function cleanup_checkpoints(
+            checkpointer::Oceananigans.OutputWriters.Checkpointer
+        )
+            ParticleTracking.guarded_cleanup_checkpoints(checkpointer)
+        end
+    catch err
+        @warn "Unable to hook Oceananigans.OutputWriters.cleanup_checkpoints: $(err)"
+    end
+
+    return nothing
+end
+
 
 """
     inspect_hydrodynamic_file(
@@ -1529,15 +1676,20 @@ function run_hydrodynamic_simulation!(
     actual_pickup = if pickup === :auto
         if haskey(simulation.output_writers, :checkpointer)
             cp_writer = simulation.output_writers[:checkpointer]
-            latest = find_latest_checkpoint(cp_writer.dir, prefix = cp_writer.prefix)
-            if !isnothing(latest)
-                m_dim = size(simulation.model.velocities.u.data)
-                if verify_checkpoint_compatibility(latest, m_dim)
-                    @info "Picking up hydrodynamic simulation from checkpoint: $(latest)"
-                    latest
+            candidates = list_candidate_checkpoints(cp_writer.dir, prefix = cp_writer.prefix)
+            m_dim = size(simulation.model.velocities.u.data)
+            valid_cp = nothing
+            for cp in candidates
+                if verify_checkpoint_compatibility(cp, m_dim)
+                    valid_cp = cp
+                    break
                 else
-                    false
+                    @warn "Skipping invalid or incompatible candidate checkpoint: $(cp)"
                 end
+            end
+            if !isnothing(valid_cp)
+                @info "Picking up hydrodynamic simulation from validated checkpoint: $(valid_cp)"
+                valid_cp
             else
                 false
             end
@@ -1565,18 +1717,24 @@ function run_hydrodynamic_simulation!(
                 "Hydrodynamic simulation interrupted at iteration $(iteration(simulation)), " *
                 "time: $(prettytime(simulation))."
             )
-            # Perform emergency state checkpoint
+            # Perform emergency state checkpoint if numerically stable
             if haskey(simulation.output_writers, :checkpointer)
                 try
-                    checkpoint(simulation)
-                    cp_w = simulation.output_writers[:checkpointer]
-                    @info "Emergency restart checkpoint safely saved to directory: $(cp_w.dir)"
+                    stable, max_spd = is_model_velocity_stable(simulation.model)
+                    if stable
+                        checkpoint(simulation)
+                        cp_w = simulation.output_writers[:checkpointer]
+                        @info "Emergency restart checkpoint safely saved to directory: $(cp_w.dir)"
+                    else
+                        @warn "Skipping emergency checkpoint: model velocity diverges ($(round(max_spd, digits=2)) m/s)."
+                    end
                 catch cp_err
                     @error "Failed to save emergency checkpoint during interruption: $(cp_err)"
                 end
             end
             @info "Simulation state safely preserved on disk. Resume anytime with --restart."
             return simulation
+
         else
             @error(
                 "Simulation failed at iteration $(iteration(simulation)), " *

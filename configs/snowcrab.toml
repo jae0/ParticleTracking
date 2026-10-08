@@ -212,21 +212,21 @@ bbl_mixing_closure = "tke"          # Benthic boundary layer turbulent kinetic e
 
 [hydrodynamics]
 # Multi-year climatological simulation (2 years = 17,520 hours)
-sim_duration_hours = 2880.0           # 120 days
+sim_duration_hours = 17520           # 2 yrs days
 sim_dt_seconds = 60.0               # Initial time step (seconds); adaptive limiter adjusts
                                      # dynamically using layer-resolved vertical Courant numbers.
 adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
-target_cfl = 0.70                   # Target advective CFL (0.70 is stable for 3D WENO5)
-target_wave_cfl = 0.70              # Target wave CFL
-max_dt_seconds = 300.0              # Maximum time step ceiling (seconds)
+target_cfl = 0.50                   # Target advective CFL (0.70 is stable for 3D WENO5)
+target_wave_cfl = 0.50              # Target wave CFL
+max_dt_seconds = 360.0              # Maximum time step ceiling (seconds)
 min_dt_seconds = 1.0                # Minimum allowable time step floor (seconds)
 coriolis_latitude = 44.5            # Reference Coriolis latitude (°N)
-divergence_velocity_limit = 20.0    # Stability watchdog threshold (m/s)
+divergence_velocity_limit = 10.0    # Stability watchdog threshold (m/s)
 surface_heat_flux = 50.0            # Summer net surface heat flux (W/m²)
 turbulence_closure = "nemotke"      # ClimaOcean NEMO-TKE vertical turbulence closure
 enable_sea_ice = true               # Thermodynamic seawater freezing and frazil diagnostics
 enable_oxygen = true                # Dissolved oxygen (O2) prognostic tracer
-output_schedule_seconds = 21600.0   # Field serialization cadence (every 6 hours)
+output_schedule_seconds = 14400.0   # Field serialization cadence (every 4 hours)
 hydro_model_file = "hydrodynamics_snowcrab_climatology_2yr.jld2"
 enable_checkpoint = true            # Enable periodic prognostic state serialization
 
@@ -342,11 +342,11 @@ mortality_cold_sensitivity = 0.01   # Cold excess mortality sensitivity (day^-1 
 # resolved_config.toml for provenance.
 output_path = "work/snowcrab/snowcrab.jld2"
 storage_backend = "zarr"
-output_schedule_seconds = 21600.0   # Field output frequency (every 6 hours)
+output_schedule_seconds = 14400.0   # Field output frequency (every 4 hours)
 checkpoint_fields = ["u", "v", "w", "T", "S", "η"]
 enable_checkpoint = true            # Enable state checkpointing
 checkpoint_prefix = "snowcrab_checkpoint"
-checkpoint_schedule_seconds = 21600.0
+checkpoint_schedule_seconds = 14400.0
 checkpoint_dir = "work/snowcrab/checkpoints"  # Checkpoint directory
 cleanup_checkpoints = true          # Retain only latest checkpoint on disk
 auto_restart = true                 # Automatically resume from checkpoint

@@ -322,4 +322,8 @@ export
     plot_interactive_trajectories_map,
     plot_multi_panel_dashboard
 
+function __init__()
+    install_checkpoint_hooks!()
+end
+
 end # module ParticleTracking

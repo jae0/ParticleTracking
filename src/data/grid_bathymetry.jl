@@ -144,7 +144,11 @@ function build_immersed_grid(
     varname::AbstractString = "elevation"
 )
     topo_matrix::Matrix{Float64} = if bathymetry isa AbstractString
-        Matrix{Float64}(GeoData.Data.load_bathymetry_geodata(bathymetry).elevation.data)
+        ds = GeoData.Data.load_bathymetry_geodata(bathymetry)
+        e_key = haskey(ds.variables, varname) ? varname :
+                findfirst(k -> k in ("elevation", "altitude", "z", "topo", "bedrock_altitude"), keys(ds.variables))
+        isnothing(e_key) && error("No elevation variable found in $(bathymetry). Available: $(keys(ds.variables))")
+        Matrix{Float64}(ds.variables[e_key].data)
     else
         Matrix{Float64}(bathymetry)
     end
@@ -197,6 +201,19 @@ within the hypertidal Bay of Fundy, Minas Basin, or Chignecto Bay exclusion zone
         return false
     end
     return true
+end
+
+"""
+    load_bathymetry_from_netcdf(filepath::AbstractString, varname::AbstractString = "elevation")
+
+Load bathymetry data from a NetCDF file, returning a NamedTuple `(elevation, lon, lat)`.
+Guarantees consistent `(n_lon, n_lat)` matrix ordering and Float64 vectors.
+"""
+function load_bathymetry_from_netcdf(
+    filepath::AbstractString,
+    varname::AbstractString = "elevation"
+)::NamedTuple{(:elevation, :lon, :lat), Tuple{Matrix{Float64}, Vector{Float64}, Vector{Float64}}}
+    return load_regional_bathymetry(filepath = filepath)
 end
 
 """
