@@ -296,8 +296,8 @@ To guarantee end-to-end scientific reproducibility, interoperability, and scalab
 1. **Centralized Configuration System (`inputs/ParticleTracking.config`)**:
    All physical, biological, numerical, and I/O parameters are declared in a standardized, sectioned configuration file (`[domain]`, `[grid]`, `[data]`, `[tides]`, `[climate]`, `[hydrodynamics]`, `[biology]`, `[dvm]`, `[molting_and_settlement]`, `[storage]`, `[hardware]`, `[visualization]`, `[paths]`). The runtime options struct `HydrodynamicOptions` is dynamically mapped to and from configuration dictionaries.
 
-2. **DuckDB Embedded Analytical Storage Engine**:
-   Simulation runs, full 4D Lagrangian trajectory time series, cohort recruitment metrics, and demographic connectivity matrices are persisted directly into an embedded [DuckDB](https://duckdb.org/) relational database (`outputs/particle_tracking.duckdb`). Relational tables include:
+2. **GeoData Analytical Storage Engine (Zarr & GeoParquet)**:
+   Simulation runs, full 4D Lagrangian trajectory time series, cohort recruitment metrics, and demographic connectivity matrices are persisted directly into high-performance array and columnar storage via GeoData (`outputs/particle_tracking.zarr`). Storage groups and datasets include:
    - `simulation_runs`: Run metadata, climate scenario ID, projection year, numerical parameters, and complete TOML configuration payloads (`config_toml`);
    - `particle_trajectories`: High-frequency positions $(\lambda, \phi, z)$, in-situ temperatures, cumulative degree-days, survival probabilities, and developmental stages;
    - `recruitment_metrics`: Cohort-level summary metrics ($R_{\text{settle}}$, mean PLD, mean dispersal distance);
@@ -469,3 +469,59 @@ This study provides the first comprehensive biophysical particle tracking model 
 - **Visser, A. W.** (1997). Using random walk models of particle dispersion in heterogeneous turbulent media: The issue of the non-linear advection. *Continental Shelf Research*, 17(10), 1251–1267. DOI: [10.1016/S0278-4343(97)00004-4](https://doi.org/10.1016/S0278-4343(97)00004-4)
 - **Wu, J.** (1982). Wind-stress coefficients over sea surface from breeze to hurricane. *Journal of Geophysical Research: Oceans*, 87(C12), 9704–9706. DOI: [10.1029/JC087iC12p09704](https://doi.org/10.1029/JC087iC12p09704)
 - **Zhang, H.-M., Bates, J. J., & Reynolds, R. W.** (2006). Assessment of composite global sampling: Sea surface wind speed. *Geophysical Research Letters*, 33(17), L17714. DOI: [10.1029/2006GL027086](https://doi.org/10.1029/2006GL027086)
+
+
+## Appendix
+ 
+An analytical and empirical review of the parameterizations copied into `MovementAnalysis/todo.md` is provided below, comparing them against the established snow crab (*Chionoecetes opilio*) biological literature (e.g., Sainte-Marie et al. 1999, Lovrich et al. 1995, Incze et al. 1987, Kuhn & Choi 2011, Dionne et al. 2003, Epifanio & Cohen 2016):
+
+---
+
+### 1. Thermal Degree-Days & Ontogeny
+
+| Parameter / Feature | Modeled Value | Empirical / Biological Benchmark | Assessment |
+| :--- | :--- | :--- | :--- |
+| **Base temperature ($T_0$)** | $-1.5^\circ\text{C}$ (or $0.0^\circ\text{C}$) | $-1.5^\circ\text{C}$ (Kuhn & Choi 2011, Sainte-Marie 1999) | **Correct & Sensible.** Sub-zero embryonic and larval development occurs down to freezing in the Cold Intermediate Layer (CIL). Using $T_0 = -1.5^\circ\text{C}$ avoids truncation artifacts in the $-1^\circ\text{C} \le T \le 0^\circ\text{C}$ window. |
+| **Zoea I $\to$ Zoea II** | $65\text{ DD}$ | $\sim 50\text{--}70\text{ DD}$ | **Consistent.** At $4^\circ\text{C}$ ($5.5^\circ\text{C}$ above $T_0$), this predicts $\sim 12\text{ days}$; at $1.5^\circ\text{C}$ ($3.0^\circ\text{C}$ above $T_0$), $\sim 21\text{ days}$. Matches Webb et al. (2007) and Incze et al. (1987). |
+| **Zoea II $\to$ Megalopa** | $130\text{ DD}$ cumulative ($\Delta = 65\text{ DD}$) | $\sim 120\text{--}150\text{ DD}$ cumulative | **Consistent.** Predicts similar or slightly longer duration than Zoea I. |
+| **Megalopa $\to$ Settle** | $200\text{ DD}$ cumulative ($\Delta = 70\text{ DD}$) | $\sim 190\text{--}230\text{ DD}$ cumulative | **Consistent.** Total pelagic larval duration (PLD) over average Scotian Shelf summer surface/CIL profiles ($\sim 2\text{--}4^\circ\text{C}$) equates to $\sim 45\text{--}65\text{ days}$, closely aligning with observed spring hatch (April/May) to summer settlement (July/August). |
+| **Dispersal & Traits** | Lognormal CDF schedule + fixed quantile $u_{\text{dev}}$ | Individual variability in moulting | **Robust.** Fixes the historical bug where resampling per timestep caused reverse ontogeny or flickering competence. |
+
+---
+
+### 2. Vertical & Horizontal Movement Dynamics
+
+| Process | Parameter / Setting | Empirical / Physical Literature | Assessment |
+| :--- | :--- | :--- | :--- |
+| **Active Ascent** | $w_{\text{ascent}} \le 10\text{ mm/s}$ ($0.010\text{ m/s}$), target $-10\text{ m}$ | Crab zoea upward swimming speeds: $5\text{--}15\text{ mm/s}$ (Forward 1988, Epifanio 2016) | **Sensible.** For a $150\text{ m}$ water column, ascent takes $\approx 4\text{ hours}$, rapidly placing newly hatched larvae into the euphotic layer during early spring. |
+| **DVM: Zoea I & II** | Night: $-10\text{ m}$ / $-8\text{ m}$<br>Day: $-50\text{ m}$ / $-55\text{ m}$ | Plankton surveys in Baie Sainte-Marguerite & Bering Sea (Lovrich et al. 1995, Incze et al. 1987) | **Accurate.** Early zoeae track the warm surface layer at night for feeding/development and descend below the thermocline into the upper CIL during the day to avoid visual predators. |
+| **DVM: Megalopa** | Night: $-60\text{ m}$<br>Day: $-120\text{ m}$ | Lovrich et al. (1995) | **Accurate.** Megalopae become semi-benthic, seeking deep shelf depressions and nursery habitat. |
+| **Swimming Speeds** | $w_{\max} \approx 5\text{ mm/s}$ ($0.005\text{ m/s}$) | Zoea swimming: $3\text{--}8\text{ mm/s}$; Megalopa: $10\text{--}20\text{ mm/s}$ | **Sensible.** Migration over $\Delta z = 40\text{ m}$ takes $\sim 2.2\text{ hours}$, easily completed during twilight transitions. |
+| **Passive Sinking** | Zoea I: $-0.5\text{ mm/s}$<br>Zoea II: $-1.0\text{ mm/s}$<br>Megalopa: $-2.5\text{ mm/s}$ | Body excess density ($\Delta \rho \approx 15\text{--}25\text{ kg/m}^3$) + gravitational settling (Sulkin 1984) | **Physically Sound.** Sinking speeds increase with larval carapace mass and calcification. |
+| **Logarithmic BBL** | $h_{\text{bbl}} = 10\text{ m}, z_0 = 1\text{ mm}$ | Law of the wall for shelf boundary layers | **Standard.** Accurately prevents high slip velocities near the seabed. |
+| **Stokes Drift** | Exponential decay with depth ($d_{\text{decay}} \sim 10\text{ m}$) | Phillips (1977), Kenyon (1969) | **Physically Sound.** Confined to the upper $10\text{--}20\text{ m}$, affecting larvae only during nighttime surface occupation. |
+| **Visser (1997) Drift** | Vertical pseudo-drift $d\kappa_v/dz$ | Visser (1997) *MEPS* | **Necessary.** Prevents numerical particle trapping inside sharp pycnoclines. |
+| **Coastline Normal Slip** | Tangential projection along local shoreline normal $\mathbf{n}$ | Hydrodynamic boundary condition | **Robust.** Resolves the issue of acute coastal embayment trapping. |
+
+---
+
+### 3. Mortality Formulation
+
+| Component | Setting in Code | Empirical Benchmark | Notes / Discrepancies |
+| :--- | :--- | :--- | :--- |
+| **Base Rate ($M_0$)** | $0.02\text{--}0.03\text{ day}^{-1}$ | Pelagic larval mortality: $0.02\text{--}0.08\text{ day}^{-1}$ (Rumrill 1990) | **Sensible.** Over a 50-day PLD at base temperature, $S = \exp(-0.02 \times 50) \approx 37\%$, providing realistic baseline recruitment before thermal stress and advective losses. |
+| **Thermal Thresholds** | $T_{\text{warm,crit}} = 7.0^\circ\text{C}$<br>$T_{\text{cold,crit}} = -1.5^\circ\text{C}$ | Sub-lethal stress at $\ge 7^\circ\text{C}$; lethal at $\sim 9\text{--}10^\circ\text{C}$ (Kuhn & Choi 2011) | **Accurate.** Note: the text in `todo.md` mentions *"stress above $10^\circ\text{C}$"*, whereas the actual code in [`larval_thermal_mortality_rate`](file:///c:/home/jae/projects/ParticleTracking/src/biology/larval_behavior.jl#L2255) uses $T_{\text{warm,crit}} = 7.0^\circ\text{C}$. The $7.0^\circ\text{C}$ threshold in code is biologically better supported than $10^\circ\text{C}$ because snow crab larvae show elevated mortality and metabolic distress well before $10^\circ\text{C}$. |
+| **Individual Frailty** | Lognormal frailty multiplier (mean 1.0, CV = `cv_mortality`) | Proportional hazards / unobserved heterogeneity | **Theoretically Sound.** Preserves population mean while avoiding instantaneous mass extinction. |
+
+---
+
+### 4. Benthic Nursery Settlement (HSI)
+
+| Criteria | Parameterization | Scotian Shelf / St. Lawrence Field Observations | Assessment |
+| :--- | :--- | :--- | :--- |
+| **Depth Bounds** | Acceptable: $-250\text{ m}$ to $-50\text{ m}$<br>Optimal: $-180\text{ m}$ to $-80\text{ m}$ | Dionne et al. (2003), Sainte-Marie et al. (1999), Choi & Zisserson (2012) | **Accurate.** Snow crab instars and juveniles on the Scotian Shelf concentrate in middle shelf basins and banks between 80 m and 180 m. Waters $<50\text{ m}$ are subject to storm wave disturbance and summer warming; depths $>250\text{ m}$ encounter warm Slope Water. |
+| **Bottom Temp** | Acceptable: $-1.0^\circ\text{C}$ to $6.0^\circ\text{C}$<br>Optimal: $0.5^\circ\text{C}$ to $3.5^\circ\text{C}$ | Tremblay (1997), DFO Snow Crab Survey Reports | **Accurate.** $0.5^\circ\text{C}$ to $3.5^\circ\text{C}$ defines the core CIL nursery footprint. Temperatures $>6^\circ\text{C}$ are inhospitable to early juvenile instars. |
+| **Beta Perturbation** | `draw_beta_index` on log-odds / Beta concentration | Bounded stochastic index $\in [0, 1]$ | **Correct.** Avoids clipping artifacts that artificially suppress mean settlement rates. |
+
+---
+ 

@@ -37,8 +37,8 @@ Originally parameterized for the **Scotian Shelf snow crab (*Chionoecetes opilio
      - Taylor Dispersion Empirical Velocity & Turbulent Diffusivity Fields
                                 │
                                 ▼
-  5. Multi-Layer NetCDF / JLD2 / DuckDB Analytical Engine
-     - Embedded Columnar DuckDB Database (Outputs/particle_tracking.duckdb)
+  5. Multi-Layer NetCDF / JLD2 / GeoData Analytical Engine
+     - GeoData Analytical Storage (outputs/particle_tracking.zarr)
      - Multi-Scenario Intercomparison & Bayesian / Ensemble Model Averaging
                                 │
                                 ▼
@@ -64,7 +64,7 @@ ParticleTracking/
 │   ├── cfa4x.dat                     # CFA 4X boundary polygon vertices
 │   ├── cfanorth.dat                  # CFA North (20-22) boundary polygon vertices
 │   └── cfasouth.dat                  # CFA South (23-24) boundary polygon vertices
-├── outputs/                          # Generated NetCDF, JLD2, DuckDB & figures
+├── outputs/                          # Generated NetCDF, JLD2, Zarr & figures
 ├── docs/
 │   └── ParticleTracking_user_guide.md # Comprehensive technical manual (this document)
 ├── src/
@@ -81,7 +81,7 @@ ParticleTracking/
 │   ├── larval_behavior.jl            # DVM swimming, BBL shear, sinking, drift, tracking
 │   ├── empirical_analysis.jl         # Taylor dispersion, CFA polygons & connectivity
 │   ├── voronoi_tessellation.jl       # Depth-stratified Voronoi areal units & demographic matrices
-│   ├── storage_duckdb.jl             # DuckDB analytical backend & ensemble averaging
+│   ├── larval_storage.jl             # GeoData analytical storage backend & ensemble averaging
 │   └── visualization.jl              # CairoMakie plots, video animations & Leaflet map
 ├── test/
 │   └── runtests.jl                   # Comprehensive 17-testset unit test suite (618 unit tests)
@@ -106,7 +106,7 @@ ParticleTracking/
 | [`src/larval_behavior.jl`](file:///c:/home/jae/projects/ParticleTracking/src/larval_behavior.jl)       | DVM swimming, BBL shear, sinking, drift, tracking             | `initialize_larval_particles`, `larval_ascent_velocity`, `diel_vertical_migration_velocity`, `superpose_tidal_velocity`, `bbl_velocity_factor`, `larval_passive_sinking_velocity`, `update_larval_stage`, `evaluate_settlement_suitability`, `larval_transport_step`, `track_larval_cohort`, `canonicalize_trajectories`                  |
 | [`src/empirical_analysis.jl`](file:///c:/home/jae/projects/ParticleTracking/src/empirical_analysis.jl) | Taylor dispersion, CFA polygons, recruitment connectivity     | `estimate_empirical_movement`, `compute_gridded_recruitment_metrics`, `compute_gridded_thermal_metrics`, `point_in_polygon`, `load_cfa_polygons`, `compute_empirical_connectivity`, `connectivity_transitions`, `export_larval_dispersal_netcdf`, `export_larval_dispersal_jld2`                                     |
 | [`src/voronoi_tessellation.jl`](file:///c:/home/jae/projects/ParticleTracking/src/voronoi_tessellation.jl) | Depth-stratified Voronoi areal units & demographic matrices | `VoronoiUnit`, `VoronoiTessellation`, `generate_depth_stratified_voronoi_units`, `find_voronoi_cell`, `find_voronoi_cells`, `compute_tesselated_connectivity_matrix`                                                                                                                                                      |
-| [`src/storage_duckdb.jl`](file:///c:/home/jae/projects/ParticleTracking/src/storage_duckdb.jl)         | DuckDB analytical backend & ensemble averaging                | `open_duckdb_storage`, `close_duckdb_storage`, `save_simulation_run!`, `load_run_configuration`, `list_simulation_runs`, `load_trajectories_df`, `load_connectivity_matrix`, `compare_scenarios`, `compute_ensemble_model_average`                                                                                         |
+| [`src/analysis/larval_storage.jl`](file:///c:/home/jae/projects/ParticleTracking/src/analysis/larval_storage.jl)         | GeoData analytical backend & ensemble averaging                | `open_storage`, `close_storage`, `save_simulation_run!`, `load_run_configuration`, `list_simulation_runs`, `load_trajectories_df`, `load_connectivity_matrix`, `compare_scenarios`, `compute_ensemble_model_average`                                                                                         |
 | [`src/visualization.jl`](file:///c:/home/jae/projects/ParticleTracking/src/visualization.jl)           | CairoMakie figures, spatiotemporal video animations & Leaflet dashboard | `plot_particle_trajectories`, `plot_dvm_depth_profiles`, `plot_larval_dispersal_density`, `plot_empirical_movement_field`, `plot_connectivity_matrix`, `plot_thermal_exposure_map`, `plot_recruitment_summary`, `plot_climate_scenario_comparison`, `plot_hydrodynamic_field`, `plot_hydrodynamic_advection`, `plot_hydrodynamic_tracers`, `plot_hydrodynamic_stratification`, `plot_hydrodynamic_diffusion`, `plot_hydrodynamic_section`, `plot_hydrodynamic_timeseries`, `animate_hydrodynamic_field`, `animate_hydrodynamic_dashboard`, `export_interactive_tracks_html`, `plot_interactive_trajectories_map` |
 
 ---
@@ -400,8 +400,8 @@ settlement_max_depth = -50.0        # Nursery minimum depth limit (meters)
 settlement_max_temp = 6.0           # Maximum benthic temperature for settlement (°C)
 
 [storage]
-enable_duckdb = true                # Persist all simulation runs into DuckDB
-duckdb_path = "outputs/particle_tracking.duckdb" # DuckDB file path
+storage_backend = "zarr"            # Storage backend ("zarr" or "geoparquet")
+zarr_path = "outputs/particle_tracking.zarr" # Zarr analytical storage path
 
 [hardware]
 use_gpu = false                     # NVIDIA CUDA GPU hardware acceleration
@@ -1163,9 +1163,9 @@ julia --project=. ParticleTrackingRun.jl \
 
 ---
 
-## 12. DuckDB Analytical Storage, Scenario Management & Ensemble Model Averaging
+## 12. GeoData Analytical Storage, Scenario Management & Ensemble Model Averaging
 
-Similar to the BSTM modeling framework, `ParticleTracking.jl` includes a high-performance **DuckDB** analytical storage backend (`src/storage_duckdb.jl`) for persisting multi-scenario simulation runs, millions of trajectory steps, demographic transition matrices, and gridded dispersal fields into a single relational database (`outputs/particle_tracking.duckdb`).
+Similar to the BSTM modeling framework, `ParticleTracking.jl` includes a high-performance **GeoData** analytical storage backend (`src/analysis/larval_storage.jl`) for persisting multi-scenario simulation runs, millions of trajectory steps, demographic transition matrices, and gridded dispersal fields into a single relational database (`outputs/particle_tracking.zarr`).
 
 ### Database Relational Schema
 1. **`simulation_runs`**: Metadata for each run (scenario name, projection year, $N_{\text{particles}}$, duration, time step, physical & biological options, seed, timestamps).
@@ -1180,8 +1180,8 @@ Similar to the BSTM modeling framework, `ParticleTracking.jl` includes a high-pe
 ```julia
 using ParticleTracking
 
-# Open DuckDB analytical database connection
-db = open_duckdb_storage("outputs/particle_tracking.duckdb")
+# Open GeoData analytical storage connection
+db = open_storage("outputs/particle_tracking.zarr")
 
 # 1. Query table of all simulation runs
 runs_df = list_simulation_runs(db; scenario = "ssp245")
@@ -1204,7 +1204,7 @@ ens = compute_ensemble_model_average(
 println("Ensemble mean connectivity matrix: ", ens.mean_connectivity)
 println("Ensemble connectivity uncertainty (std): ", ens.std_connectivity)
 
-close_duckdb_storage(db)
+close_storage(db)
 ```
 
 ---
@@ -1228,7 +1228,7 @@ configuration file at [`inputs/ParticleTracking.config`](file:///c:/home/jae/pro
 - `[dvm]`: Stage-specific Diel Vertical Migration daytime/nighttime target depths and swimming speeds.
 - `[molting_and_settlement]`: Degree-day thresholds ($150, 310, 510\text{ DD}$), thermal mortality
   parameters, and benthic nursery suitability windows ($-250\text{ m} \le z \le -50\text{ m}$, $T \le 6^\circ\text{C}$).
-- `[storage]`: DuckDB analytical database persistence and checkpointing.
+- `[storage]`: GeoData analytical storage persistence and checkpointing.
 - `[hardware]`: NVIDIA CUDA GPU hardware acceleration and automatic CPU fallback.
 - `[visualization]`: Interactive HTML5 Leaflet map export, spatiotemporal hydrodynamic animations (MP4/GIF), diagnostic field variable selection, continuous depth targeting, framerate control, larval particle overlays, and custom output file destination paths.
 - `[paths]`: File system directories (`inputs`, `outputs`) and pseudorandom seed.
@@ -1301,7 +1301,7 @@ differential equations for discrete individuals):
          │                             │                             │
          ▼                             ▼                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 3. Unified Relational DuckDB Storage (outputs/particle_tracking.duckdb)      │
+│ 3. Unified GeoData Analytical Storage (outputs/particle_tracking.zarr)      │
 │    save_simulation_run!(db, "cohort_spring_benthic", opts; ...)             │
 │    save_simulation_run!(db, "cohort_peak_ascent15", opts; ...)              │
 │    save_simulation_run!(db, "cohort_late_surface", opts; ...)               │
@@ -1321,7 +1321,7 @@ simulated and tagged without re-running the hydrodynamic model.
 
 This workflow demonstrates how to load an existing hydrodynamic JLD2 checkpoint, instantiate
 a fast 4D flow interpolator, loop across multiple larval cohorts with different hatch dates
-and ascent parameters, persist each into DuckDB with unique tags, and perform cross-cohort
+and ascent parameters, persist each into GeoData analytical storage with unique tags, and perform cross-cohort
 comparative analytics.
 
 ```julia
@@ -1330,9 +1330,9 @@ using Random
 using Dates
 using Statistics
 
-# Step 1: Open DuckDB analytical database
-db_path = "outputs/particle_tracking.duckdb"
-db = open_duckdb_storage(db_path)
+# Step 1: Open GeoData analytical storage
+db_path = "outputs/particle_tracking.zarr"
+db = open_storage(db_path)
 
 # Step 2: Ingest 4D flow field from completed hydrodynamic simulation
 flow_checkpoint = "outputs/simulation_flow.jld2"
@@ -1488,7 +1488,7 @@ for cfg in cohort_configs
         lat_bins = range(42.0, 47.0, length = 25)
     )
 
-    # Tag and persist run into DuckDB with custom run_id and metadata
+    # Tag and persist run into GeoData analytical storage with custom run_id and metadata
     cohort_opts = HydrodynamicOptions(
         scenario = base_opts.scenario,
         projection_year = base_opts.projection_year,
@@ -1525,7 +1525,7 @@ for cfg in cohort_configs
         notes = cfg.notes
     )
 
-    println("    Archived $(cfg.tag) in DuckDB with $(cfg.n_particles) particles.")
+    println("    Archived $(cfg.tag) in Zarr storage with $(cfg.n_particles) particles.")
 end
 
 # Step 5: Post-hoc comparative analytics across all tagged cohorts
@@ -1559,7 +1559,7 @@ display(round.(ens.mean_connectivity, digits = 3))
 println("\nEnsemble Uncertainty (Standard Deviation):")
 display(round.(ens.std_connectivity, digits = 3))
 
-close_duckdb_storage(db)
+close_storage(db)
 println("\nMulti-cohort batching and analysis complete.")
 ```
 
@@ -1588,7 +1588,7 @@ julia --project=. ParticleTrackingRun.jl \
 
 #### Step 2: Run Lagrangian Tracking for Cohort A (Spring Benthic Release)
 Track larvae using the existing flow checkpoint without re-running hydrodynamics,
-archiving results to DuckDB under a dedicated tag:
+archiving results to Zarr storage under a dedicated tag:
 
 ```bash
 # Run Lagrangian tracking & analytics for Cohort A
@@ -1602,8 +1602,8 @@ julia --project=. ParticleTrackingRun.jl \
     --ascent-speed=0.010 \
     --ascent-target=-10.0 \
     --seed=101 \
-    --duckdb \
-    --db-path=outputs/particle_tracking.duckdb
+    --zarr \
+    --db-path=outputs/particle_tracking.zarr
 ```
 
 #### Step 3: Run Lagrangian Tracking for Cohort B (Summer Surface Control)
@@ -1620,22 +1620,22 @@ julia --project=. ParticleTrackingRun.jl \
     --release-mode=surface \
     --no-ascent \
     --seed=202 \
-    --duckdb \
-    --db-path=outputs/particle_tracking.duckdb
+    --zarr \
+    --db-path=outputs/particle_tracking.zarr
 ```
 
 #### Step 4: Query Database and Compare Cohorts
 Inspect the archived cohorts and compare metrics without launching any simulations:
 
 ```bash
-# List all completed runs in DuckDB
-julia --project=. ParticleTrackingRun.jl --list-runs --db-path=outputs/particle_tracking.duckdb
+# List all completed runs in Zarr storage
+julia --project=. ParticleTrackingRun.jl --list-runs --db-path=outputs/particle_tracking.zarr
 
 # Output side-by-side recruitment and connectivity metrics
-julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=outputs/particle_tracking.duckdb
+julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=outputs/particle_tracking.zarr
 
 # Compute weighted ensemble model average
-julia --project=. ParticleTrackingRun.jl --model-average --db-path=outputs/particle_tracking.duckdb
+julia --project=. ParticleTrackingRun.jl --model-average --db-path=outputs/particle_tracking.zarr
 
 ```
 
@@ -1649,8 +1649,8 @@ via the `--snowcrab-settings` flag (shorthand: `--snowcrab`). Passing `--snowcra
 pre-configures all snow crab calibrated parameters (500 larvae, 60-day PLD, bottom boundary release
 with active vertical ascent, -600 m to 0 m shelf-slope domain, hyperbolic tangent stretched vertical
 coordinates with 8–12 m epipelagic surface resolution, NumericalEarth ERA5 atmospheric forcing and
-GLORYS12V1 boundary sponge layers, -1.5°C base molting temperature, and DuckDB target database
-`outputs/snowcrab_tracking.duckdb`), while any additional CLI arguments override those defaults.
+GLORYS12V1 boundary sponge layers, -1.5°C base molting temperature, and Zarr target storage
+`outputs/snowcrab_tracking.zarr`), while any additional CLI arguments override those defaults.
 
 For programmatic Julia scripting, the exported function `SnowCrabRunOptions(; kwargs...)` returns
 a calibrated `HydrodynamicOptions` instance with identical parameters.
@@ -1673,7 +1673,7 @@ julia --project=. ParticleTrackingRun.jl --snowcrab-settings --real-5yr --hydro-
 
 #### Step 2: Multi-Cohort Lagrangian Tracking Reusing Hydrodynamics (`--track-only`)
 Instantly load the pre-computed flow fields from `--hydro-model` and track cohorts with
-different biological parameters (which override the snow crab defaults), tagging each in DuckDB:
+different biological parameters (which override the snow crab defaults), tagging each in Zarr storage:
 
 ```bash
 # Track Cohort 1: Spring benthic release with active ascent (~10 mm/s)
@@ -1690,7 +1690,7 @@ julia --project=. ParticleTrackingRun.jl --snowcrab-settings --track-only --hydr
 ```
 
 #### Step 3: Comparative Analytics Across Cohorts
-Query DuckDB and generate side-by-side demographic and recruitment summaries:
+Query analytical storage and generate side-by-side demographic and recruitment summaries:
 
 ```bash
 julia --project=. ParticleTrackingRun.jl --compare
@@ -1733,7 +1733,7 @@ The test sets cover:
 11. CairoMakie spatial figures, vertical profiles, and diagnostics rendering.
 12. GPU architecture detection and automatic CPU fallback.
 13. Standalone interactive HTML5 Leaflet dashboard generation.
-14. DuckDB analytical database storage, multi-scenario querying, and ensemble averaging.
+14. GeoData analytical storage, multi-scenario querying, and ensemble averaging.
 15. Centralized TOML configuration parsing, validation, and scenario metadata.
 16. Coastline geometry, 0% land seeding, and CFA polygon intersection.
 17. Enhanced physical and biophysical processes (bottom release, active ascent, surface heat flux).

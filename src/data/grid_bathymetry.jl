@@ -144,7 +144,7 @@ function build_immersed_grid(
     varname::AbstractString = "elevation"
 )
     topo_matrix::Matrix{Float64} = if bathymetry isa AbstractString
-        GeoData.Data.load_bathymetry_geodata(bathymetry).elevation
+        Matrix{Float64}(GeoData.Data.load_bathymetry_geodata(bathymetry).elevation.data)
     else
         Matrix{Float64}(bathymetry)
     end
@@ -532,3 +532,44 @@ function get_strata_buffered_envelope(
         dlat = dlat
     )
 end
+
+"""
+    point_in_polygon(x::Real, y::Real, poly_lons::AbstractVector, poly_lats::AbstractVector) -> Bool
+
+Determine whether point (x, y) is inside polygon (poly_lons, poly_lats).
+Delegates to GeoData.
+"""
+function point_in_polygon(x::Real, y::Real, poly_lons::AbstractVector, poly_lats::AbstractVector)::Bool
+    return GeoData.Data.point_in_polygon(x, y, poly_lons, poly_lats)
+end
+
+"""
+    is_point_on_land(lon::Real, lat::Real; coastline = nothing) -> Bool
+
+Determine whether geographic point (lon, lat) falls on land.
+Delegates to `GeoData.is_point_on_land_geodata`.
+"""
+function is_point_on_land(lon::Real, lat::Real; coastline = nothing)::Bool
+    if !isnothing(coastline)
+        return GeoData.is_point_on_land_geodata(lon, lat; coastline = coastline)
+    elseif isfile("inputs/coastline.parquet")
+        return GeoData.is_point_on_land_geodata(lon, lat; coastline_file = "inputs/coastline.parquet")
+    else
+        return GeoData.is_point_on_land_geodata(lon, lat; coastline = REGIONAL_COASTLINE)
+    end
+end
+
+"""
+    load_coastline_polygons(; coastline_path = nothing)
+
+Load canonical coastline polygons. Delegates to `GeoData.load_coastline_polygons_geodata`
+with fallback to `REGIONAL_COASTLINE`.
+"""
+function load_coastline_polygons(; coastline_path = nothing)
+    path = isnothing(coastline_path) ? "inputs/coastline.parquet" : coastline_path
+    if isfile(path)
+        return GeoData.load_coastline_polygons_geodata(path)
+    else
+        return REGIONAL_COASTLINE
+    end
+end

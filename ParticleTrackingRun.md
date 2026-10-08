@@ -71,7 +71,7 @@ segments. Each may be run alone, or as a complete pipeline via `--all`.
 | `--hydro-only` | Flag | — | Run Segments 1–5 only; save flow fields to `--hydro-model` |
 | `--track-only` | Flag | — | Run Segments 6–8 only; read flow fields from `--hydro-model` |
 | `--reuse-hydro` | Flag | — | Reuse existing `--hydro-model` if complete; otherwise integrate |
-| `--run-id=<string>` | String | `run_<scenario>_<year>` | Cohort identifier for DuckDB persistence and figure naming |
+| `--run-id=<string>` | String | `run_<scenario>_<year>` | Cohort identifier for Zarr/GeoData persistence and figure naming |
 | `--restart` | Flag | `true` | Resume from the latest checkpoint if an incomplete run exists |
 | `--no-restart`, `--force-new` | Flag | — | Ignore existing checkpoints and restart from $t=0$ |
 | `--checkpoint` | Flag | `true` | Enable prognostic state checkpointing |
@@ -93,13 +93,13 @@ segments. Each may be run alone, or as a complete pipeline via `--all`.
 The runner has no `--snowcrab*`, `--real-5yr`, or `--climatology-2yr` flags; select a
 scenario by pointing `--config` at the corresponding TOML file.
 
-### DuckDB Analytics
+### Analytical Storage (GeoData / Zarr)
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--duckdb` | Flag | `true` | Enable DuckDB archiving |
-| `--no-duckdb` | Flag | — | Disable DuckDB archiving |
-| `--db-path=<path>` | String | `outputs/particle_tracking.duckdb` | DuckDB database path |
+| `--zarr`, `--storage` | Flag | `true` | Enable analytical storage archiving |
+| `--no-zarr`, `--no-storage` | Flag | — | Disable analytical storage archiving |
+| `--zarr-path=<path>`, `--storage-path=<path>` | String | `outputs/particle_tracking.zarr` | Analytical storage directory path |
 | `--list-runs` | Flag | — | Print all archived simulation runs |
 | `--compare-scenarios` | Flag | — | Print multi-scenario comparative analytics |
 | `--model-average` | Flag | — | Compute ensemble model-averaged connectivity and recruitment |
@@ -255,7 +255,7 @@ schema (`src/config_schema.jl`) via **Configurations.jl**. Files are located by
 | `[biology]` | Cohort size, tracking duration, diffusivity, release, ascent |
 | `[dvm]` | Stage-specific diel vertical migration depths |
 | `[molting_and_settlement]` | Degree-day thresholds, settlement criteria, mortality |
-| `[storage]` | Output filename, DuckDB path, checkpoint cadence and directory |
+| `[storage]` | Output filename, Zarr/GeoData storage path, checkpoint cadence and directory |
 | `[hardware]` | GPU preference and CPU fallback |
 | `[visualization]` | Interactive map toggle and figure title |
 | `[paths]` | `output_dir`, `input_dir`, RNG `seed` |
@@ -275,7 +275,7 @@ Two distinct spatial scales are used and are declared separately in the TOML:
 `[paths] output_dir` is the single source of truth for all generated artefacts. Within it:
 
 - `output_filename` — hydrodynamic field archive (`.jld2`)
-- `duckdb_path` — analytical database
+- `zarr_path` — analytical storage directory (GeoData/Zarr)
 - `checkpoint_dir` — restart checkpoint archive
 
 Set `checkpoint_dir = ""` to inherit `<output_dir>/checkpoints` automatically.
@@ -322,7 +322,7 @@ julia --project=. ParticleTrackingRun.jl \
     --run-id=cohort_control --release-mode=surface --no-ascent --seed=303
 
 # 5. Compare all cohorts
-julia --project=. ParticleTrackingRun.jl --compare-scenarios --db-path=work/snowcrab/snowcrab.duckdb
+julia --project=. ParticleTrackingRun.jl --compare-scenarios --zarr-path=work/snowcrab/snowcrab.zarr
 ```
 
 ---
@@ -417,7 +417,7 @@ julia --project=. ParticleTrackingRun.jl --config=work/snowcrab/snowcrab.toml --
 - **$N \times N$ connectivity matrix** $P_{ij}$ across Voronoi units
 - **$3 \times 3$ macro-strata matrix** (shallow ↔ core ↔ deep)
 - **GeoJSON polygons** — `<output_dir>/voronoi_units.geojson`
-- **DuckDB table** `voronoi_units` — coordinates, stratum, depth, area, settlement density
+- **GeoData dataset** `voronoi_units` — coordinates, stratum, depth, area, settlement density
 - **Figure** `<output_dir>/voronoi_tessellation.png` — stratum-coloured cells with settlement density
 
 ---

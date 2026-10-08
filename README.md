@@ -5,7 +5,7 @@
 [![Julia](https://img.shields.io/badge/Julia-1.13-blue.svg)](https://julialang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Backend: Oceananigans.jl](https://img.shields.io/badge/Physics-Oceananigans.jl-informational.svg)](https://github.com/CliMA/Oceananigans.jl)
-[![Storage: DuckDB](https://img.shields.io/badge/Storage-DuckDB-yellow.svg)](https://duckdb.org)
+[![Storage: GeoData / Zarr](https://img.shields.io/badge/Storage-GeoData%20%2F%20Zarr-yellow.svg)](https://github.com/JuliaIO/Zarr.jl)
 [![Visualization: CairoMakie](https://img.shields.io/badge/Visualization-Makie-purple.svg)](https://makie.juliaplots.org)
 
 > Developed and verified on Julia 1.13. Oceananigans currently targets Julia 1.12; it emits a
@@ -46,10 +46,10 @@ Individual-Based Lagrangian Tracking (Euler–Maruyama SDE)
   └── Three persistent per-larva traits: developmental rate, vigour, settlement readiness
                    │
                    ▼
-Demographic Connectivity & Analytics — DuckDB
+Demographic Connectivity & Analytics — GeoData
   ├── CFA polygon boundary classification (ray casting)
   ├── Survival-weighted connectivity matrices (P_ij = Σ S_p / N_released)
-  ├── Embedded DuckDB storage, scenario SQL queries & ensemble averaging
+  ├── GeoData Zarr & GeoParquet storage, scenario queries & ensemble averaging
   └── CairoMakie figures, time–depth diagnostics & a self-contained Leaflet HTML map
 ```
 
@@ -111,7 +111,7 @@ julia --project=. ParticleTrackingRun.jl --track-only --config=configs/snowcrab.
 Segment flags: `--data`, `--grid`, `--model`, `--climate`, `--sim`, `--track`, `--metrics`, `--viz`.
 
 Useful modifiers: `--gpu` / `--cpu`, `--quick`, `--no-tides`, `--no-obc`, `--no-molting`,
-`--animate-hydro`, `--interactive`, `--no-duckdb`, `--force-new`, `--restart`, `--allow-analytical-fallback`.
+`--animate-hydro`, `--interactive`, `--no-storage`, `--force-new`, `--restart`, `--allow-analytical-fallback`.
 
 Run `julia --project=. ParticleTrackingRun.jl --help` for the full list, or see
 **[CLI & Workflow Guide](ParticleTrackingRun.md)**.
@@ -217,7 +217,7 @@ src/
 test/runtests.jl         445 tests in 21 testsets
 configs/                 default.toml, snowcrab.toml, opendata.toml
 inputs/                  cached downloaded data
-work/                    per-run output (DuckDB, hydrodynamics archive, figures)
+work/                    per-run output (Zarr storage, hydrodynamics archive, figures)
 ```
 
 ---

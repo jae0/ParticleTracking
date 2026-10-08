@@ -40,13 +40,14 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 TaylorSeries = "6aa5eb33-94cf-58f4-a9d0-e4b2c4fc25ea"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 WorldOceanAtlasTools = "04f20302-f1b9-11e8-29d9-7d841cb0a64a"
+Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
 
 [sources]
-GeoData = {path = "C:\\Users\\Nathalie\\projects\\GeoData"}
+GeoData = {path = "..\\GeoData"}
 
 [compat]
 OceanGrids = "0.4.7"
-Oceananigans = "0.113.5"
+Oceananigans = "0.111, 0.113"
 WorldOceanAtlasTools = "0.6.5"
 
 [extras]

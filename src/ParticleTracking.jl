@@ -46,11 +46,11 @@ using
    TaylorSeries,
    Interpolations,
    NumericalEarth,
-   ClimaOcean,
    Distributions,
    GeoData
 
 # Local manifest module that re-exports GeoData's manifest framework
+include("data/manifest.jl")
 using .Manifest
 
 using Oceananigans.Units
@@ -75,7 +75,6 @@ using Oceananigans
 # ============================================================================
 include("model/numerical_earth.jl")
 include("config/configuration.jl")
-include("data/manifest.jl")
 include("data/open_data.jl")
 include("utils/architecture.jl")
 include("data/grid_bathymetry.jl")
@@ -133,6 +132,9 @@ export
      fetch_surface_winds,
      fetch_bathymetry,
      fetch_open_meteo_surface_winds,
+     fetch_copernicus_physics_subset,
+     fetch_copernicus_hydrography_with_fallback,
+     fetch_copernicus_surface_winds,
      fetch_natural_earth_coastline,
      read_wind_stress,
      build_bulk_surface_flux,
@@ -289,6 +291,7 @@ export
     load_larval_hydrodynamic_fields,
     compare_larval_scenarios,
     compute_larval_ensemble_model_average,
+    geopublish_lakehouse!,
 
     # Visualization, interactive maps & scenario comparison
     plot_particle_trajectories,

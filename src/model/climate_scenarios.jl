@@ -19,7 +19,6 @@ dataset reader.
 
 using Oceananigans
 using Dates
-using ClimaOcean
 using NumericalEarth
 using Interpolations: interpolate, extrapolate, Gridded, Linear
 using Oceananigans.OutputReaders: FieldTimeSeries

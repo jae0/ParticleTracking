@@ -1018,6 +1018,9 @@ shoreline boundary dynamics with alongshore tangential slip.
 - `is_ascending::Bool`: Whether larva is currently in directed vertical ascent phase (default false).
 - `ascent_speed::Real`: Upward swimming speed during ascent in \$m s^{-1}\$ (default 0.010 m/s).
 - `surface_target::Real`: Target epipelagic depth for ascent in meters (default -10.0 m).
+- `u_stokes::Real`: Surface zonal Stokes drift velocity in \$m s^{-1}\$ (default 0.0 m/s).
+- `v_stokes::Real`: Surface meridional Stokes drift velocity in \$m s^{-1}\$ (default 0.0 m/s).
+- `stokes_decay_depth::Real`: Depth e-folding scale for Stokes drift decay in meters (default 10.0 m).
 - `rng::AbstractRNG`: Random number generator.
 
 # Outputs
@@ -1054,6 +1057,9 @@ function larval_transport_step(
     is_ascending::Bool = false,
     ascent_speed::Real = 0.010,
     surface_target::Real = -10.0,
+    u_stokes::Real = 0.0,
+    v_stokes::Real = 0.0,
+    stokes_decay_depth::Real = 10.0,
     max_current_speed::Union{Nothing, Real} = 3.0,
     rng::AbstractRNG = Random.default_rng()
 )
@@ -1083,8 +1089,12 @@ function larval_transport_step(
 
     # 1. Logarithmic Bottom Boundary Layer (BBL) velocity attenuation (law of the wall)
     f_bbl = enable_bbl ? bbl_velocity_factor(z, z_bottom, h_bbl = h_bbl, z0 = z0) : 1.0
-    u_eff = u * f_bbl
-    v_eff = v * f_bbl
+
+    # Wave-induced Stokes drift with exponential surface attenuation: u_s(z) = u_s0 * exp(2kz)
+    f_stokes = (u_stokes != 0.0 || v_stokes != 0.0) ? exp(max(-20.0, z / max(1.0, stokes_decay_depth))) : 0.0
+
+    u_eff = u * f_bbl + u_stokes * f_stokes
+    v_eff = v * f_bbl + v_stokes * f_stokes
 
     # 2. Vertical swimming and passive gravitational settling
     w_swim = diel_vertical_migration_velocity(
@@ -1137,23 +1147,70 @@ function larval_transport_step(
     z_new = clamp(z_new, z_bottom, z_surface)
 
     # Land boundary condition: absorbing shoreline with alongshore tangential slip.
-    # Larvae that step onto land test orthogonal alongshore displacement components.
-    # If both components are blocked by land, the particle is absorbed at its previous
-    # marine coordinate (x, y). Reversing displacement vectors offshore is unphysical.
+    # When a larva steps onto land, we estimate the local land-sea boundary gradient,
+    # decompose the displacement into normal and tangential components, and project along
+    # the tangential alongshore direction. If oblique slip is still blocked, we bisect
+    # the displacement along the tangent, falling back to absorbing at (x, y) if fully trapped.
     if is_lat_lon && is_point_on_land(x_new, y_new, coastline = coastline)
-        # Attempt alongshore tangential slip
-        x_zonal = x + dx_meters * deg_per_meter_lon
-        y_merid = y + dy_meters * deg_per_meter_lat
-        if !is_point_on_land(x_zonal, y, coastline = coastline)
-            x_new = x_zonal
-            y_new = Float64(y)
-        elseif !is_point_on_land(x, y_merid, coastline = coastline)
-            x_new = Float64(x)
-            y_new = y_merid
-        else
-            # Both alongshore candidates on land: absorb at previous valid marine location
-            x_new = Float64(x)
-            y_new = Float64(y)
+        # Probe local land occupancy around the candidate point to estimate land normal
+        δ_lon = deg_per_meter_lon * max(100.0, abs(dx_meters) * 0.1)
+        δ_lat = deg_per_meter_lat * max(100.0, abs(dy_meters) * 0.1)
+
+        land_e = is_point_on_land(x_new + δ_lon, y_new, coastline = coastline) ? 1.0 : 0.0
+        land_w = is_point_on_land(x_new - δ_lon, y_new, coastline = coastline) ? 1.0 : 0.0
+        land_n = is_point_on_land(x_new, y_new + δ_lat, coastline = coastline) ? 1.0 : 0.0
+        land_s = is_point_on_land(x_new, y_new - δ_lat, coastline = coastline) ? 1.0 : 0.0
+
+        grad_x = (land_e - land_w) / max(1e-6, 2.0 * δ_lon)
+        grad_y = (land_n - land_s) / max(1e-6, 2.0 * δ_lat)
+        grad_norm = hypot(grad_x, grad_y)
+
+        slip_found = false
+        if grad_norm > 1e-9
+            # Unit outward normal pointing into land
+            nx = grad_x / grad_norm
+            ny = grad_y / grad_norm
+
+            # Candidate alongshore tangent vector (orthogonal to land normal)
+            tx = -ny
+            ty = nx
+
+            # Project displacement onto alongshore tangent
+            proj = dx_meters * deg_per_meter_lon * tx + dy_meters * deg_per_meter_lat * ty
+            cand_x = x + proj * tx
+            cand_y = y + proj * ty
+
+            if !is_point_on_land(cand_x, cand_y, coastline = coastline)
+                x_new = cand_x
+                y_new = cand_y
+                slip_found = true
+            else
+                # Bisect along tangent
+                cand_half_x = x + 0.5 * proj * tx
+                cand_half_y = y + 0.5 * proj * ty
+                if !is_point_on_land(cand_half_x, cand_half_y, coastline = coastline)
+                    x_new = cand_half_x
+                    y_new = cand_half_y
+                    slip_found = true
+                end
+            end
+        end
+
+        # Fallback to orthogonal axis-aligned slip if gradient projection was blocked
+        if !slip_found
+            x_zonal = x + dx_meters * deg_per_meter_lon
+            y_merid = y + dy_meters * deg_per_meter_lat
+            if !is_point_on_land(x_zonal, y, coastline = coastline)
+                x_new = x_zonal
+                y_new = Float64(y)
+            elseif !is_point_on_land(x, y_merid, coastline = coastline)
+                x_new = Float64(x)
+                y_new = y_merid
+            else
+                # Both alongshore candidates on land: absorb at previous valid marine location
+                x_new = Float64(x)
+                y_new = Float64(y)
+            end
         end
     end
 
@@ -1515,6 +1572,8 @@ function track_larval_cohort(
     cv_molt::Real = 0.0,
     cv_mortality::Real = 0.0,
     cv_settlement::Real = 0.0,
+    stokes_fn::Union{Nothing, Function} = nothing,
+    stokes_decay_depth::Real = 10.0,
     rng::AbstractRNG = Random.default_rng()
 )
     n_particles = length(larvae.lon)
@@ -1778,7 +1837,15 @@ function track_larval_cohort(
 
             is_ascending = enable_initial_ascent && !ascent_complete[p]
 
-            # Step Lagrangian transport with BBL shear, sinking, and diffusive drift
+            # Stokes drift from surface waves if wave forcing is active
+            u_stk, v_stk = if !isnothing(stokes_fn)
+                stk_val = stokes_fn(cur_lon, cur_lat, t_current)
+                (Float64(stk_val[1]), Float64(stk_val[2]))
+            else
+                (0.0, 0.0)
+            end
+
+            # Step Lagrangian transport with BBL shear, sinking, wave Stokes drift, and diffusive drift
             new_lon, new_lat, new_depth = larval_transport_step(
                 cur_lon, cur_lat, cur_depth,
                 u, v, w, κ_h, local_kv, dt,
@@ -1798,6 +1865,9 @@ function track_larval_cohort(
                 is_ascending = is_ascending,
                 ascent_speed = ascent_speed,
                 surface_target = ascent_target_depth,
+                u_stokes = u_stk,
+                v_stokes = v_stk,
+                stokes_decay_depth = stokes_decay_depth,
                 rng = rng
             )
 

@@ -281,9 +281,7 @@ using
     CairoMakie,
     NCDatasets,
     Downloads,
-    DuckDB,
     DataFrames,
-    DBInterface,
     Dates,
     Statistics,
     LinearAlgebra,
@@ -369,32 +367,43 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
         )
     end
 
-    bathy_file = joinpath(opts.input_dir, "bathymetry_active.nc")
-    wind_file  = joinpath(opts.input_dir, "wind_active.nc")
+    bathy_nc   = joinpath(opts.input_dir, "bathymetry_active.nc")
+    bathy_zarr = joinpath(opts.input_dir, "bathymetry_active.zarr")
+    wind_nc    = joinpath(opts.input_dir, "wind_active.nc")
+    wind_zarr  = joinpath(opts.input_dir, "wind_active.zarr")
+
+    bathy_file = isfile(bathy_nc) ? bathy_nc : (isdir(bathy_zarr) ? bathy_zarr : bathy_nc)
+    wind_file  = isfile(wind_nc)  ? wind_nc  : (isdir(wind_zarr) ? wind_zarr : wind_nc)
 
     # Data acquisition always reads observed products. There is no "synthetic mode": the product
     # is named directly by `[data] bathy_source` / `wind_source` in the TOML, and a failed
     # download aborts the run rather than substituting an analytic field, because a run must
     # never claim a dataset-forced state it did not read.
-    if !isfile(bathy_file)
+    if !isfile(bathy_file) && !isdir(bathy_file)
         println("Retrieving bathymetry ($(opts.bathy_source))...")
         # One named source, no mirror swap, no analytic substitute. `fetch_bathymetry` stops
         # with a message listing the sources this project can actually retrieve.
-        fetch_bathymetry(opts.bathy_source; lon_range = opts.domain_lon,
-                         lat_range = opts.domain_lat, output_path = bathy_file)
+        bathy_res = fetch_bathymetry(opts.bathy_source; lon_range = opts.domain_lon,
+                                     lat_range = opts.domain_lat, output_path = bathy_file)
+        if bathy_res isa AbstractString && (isfile(bathy_res) || isdir(bathy_res))
+            bathy_file = bathy_res
+        end
     else
-        println("Using existing real bathymetry file: $bathy_file")
+        println("Using existing real bathymetry file/store: $bathy_file")
     end
 
-    if !isfile(wind_file)
+    if !isfile(wind_file) && !isdir(wind_file)
         println("Retrieving surface winds ($(opts.wind_source)) for $(opts.wind_time_iso)...")
         # One named source, no mirror swap, no synthetic substitute. `fetch_surface_winds`
         # stops with a message listing the sources this project can actually retrieve.
-        fetch_surface_winds(opts.wind_source; lon_range = opts.domain_lon,
-                            lat_range = opts.domain_lat, time_iso = opts.wind_time_iso,
-                            output_path = wind_file)
+        wind_res = fetch_surface_winds(opts.wind_source; lon_range = opts.domain_lon,
+                                       lat_range = opts.domain_lat, time_iso = opts.wind_time_iso,
+                                       output_path = wind_file)
+        if wind_res isa AbstractString && (isfile(wind_res) || isdir(wind_res))
+            wind_file = wind_res
+        end
     else
-        println("Using existing real surface winds file: $wind_file")
+        println("Using existing real surface winds file/store: $wind_file")
     end
 
     if opts.enable_tides
@@ -447,11 +456,14 @@ function run_segment_grid(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     bathy_file::Union{Nothing, String} = nothing
 )
+    bathy_nc   = joinpath(opts.input_dir, "bathymetry_active.nc")
+    bathy_zarr = joinpath(opts.input_dir, "bathymetry_active.zarr")
     target_bathy = isnothing(bathy_file) ?
-                   joinpath(opts.input_dir, "bathymetry_active.nc") : bathy_file
+                   (isfile(bathy_nc) ? bathy_nc : (isdir(bathy_zarr) ? bathy_zarr : bathy_nc)) :
+                   bathy_file
 
-    if !isfile(target_bathy)
-        println("Bathymetry file missing. Running Segment 1 data generation...")
+    if !isfile(target_bathy) && !isdir(target_bathy)
+        println("Bathymetry file/store missing. Running Segment 1 data generation...")
         data_res = run_segment_data(opts = opts)
         target_bathy = data_res.bathy_file
     end
@@ -684,7 +696,7 @@ to the study domain would put the interpolation's edge exactly on the sponge.
 function fetch_boundary_tracers(source::Symbol, opts)
     return fetch_boundary_hydrography(source;
         lon_range = opts.embedding_lon, lat_range = opts.embedding_lat,
-        input_dir = joinpath(pwd(), "inputs"),
+        input_dir = opts.input_dir,
         month = opts.hydrography_month)
 end
 
@@ -841,26 +853,34 @@ end
         t_nc = joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc")
         s_nc = joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.nc")
         o_nc = joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.nc")
+        t_zarr = joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.zarr")
+        s_zarr = joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.zarr")
+        o_zarr = joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.zarr")
 
-        if !isfile(t_nc) || !isfile(s_nc)
-            println("Fetching WOA23 climatology (keyless NOAA NCEI THREDDS)...")
-            # Request the study box: that is the grid extent, so no regridding extrapolation
-            # is needed at the edges. `woa23_regridded_tracers` clamps in depth regardless,
-            # since the model domain routinely extends below the deepest WOA level used.
-            fetch_open_woa_climatology(
+        t_file = isfile(t_nc) ? t_nc : (isdir(t_zarr) ? t_zarr : "")
+        s_file = isfile(s_nc) ? s_nc : (isdir(s_zarr) ? s_zarr : "")
+        o_file = isfile(o_nc) ? o_nc : (isdir(o_zarr) ? o_zarr : "")
+
+        if isempty(t_file) || isempty(s_file)
+            println("Fetching WOA23 climatology via GeoData...")
+            woa_res = fetch_open_woa_climatology(
                 lon_range = opts.domain_lon,
                 lat_range = opts.domain_lat,
                 month = opts.hydrography_month,
                 output_dir = opts.input_dir
             )
+            # Recheck paths after GeoData acquisition
+            t_file = isfile(t_nc) ? t_nc : (isdir(t_zarr) ? t_zarr : "")
+            s_file = isfile(s_nc) ? s_nc : (isdir(s_zarr) ? s_zarr : "")
+            o_file = isfile(o_nc) ? o_nc : (isdir(o_zarr) ? o_zarr : "")
         end
 
-        if isfile(t_nc) && isfile(s_nc)
+        if !isempty(t_file) && !isempty(s_file)
             println("Applying WOA23 climatological hydrography " *
-                    "(month=$(opts.hydrography_month == 0 ? "annual" : opts.hydrography_month))...")
+                    "(month=$(opts.hydrography_month == 0 ? "annual" : opts.hydrography_month), source=$(basename(t_file)))...")
             woa = woa23_regridded_tracers(
-                model.grid, t_nc, s_nc;
-                oxygen_file = isfile(o_nc) ? o_nc : nothing
+                model.grid, t_file, s_file;
+                oxygen_file = !isempty(o_file) ? o_file : nothing
             )
             # Separate `set!` calls: Oceananigans has no NamedTuple form of `set!`, and the
             # closures are only accepted as keyword values for the tracer fields.
@@ -872,8 +892,8 @@ end
         else
             error(
                 "hydrography_source = \"woa23\" but WOA23 files are missing from " *
-                "$(opts.input_dir) (expected $(basename(t_nc)) and $(basename(s_nc))). " *
-                "Download them with `fetch_open_woa_climatology` or check network access to www.ncei.noaa.gov. " *
+                "$(opts.input_dir) (expected NetCDF or Zarr format for temperature and salinity). " *
+                "Download them via GeoData or check network access to NOAA NCEI. " *
                 "To use the analytic profile instead, set [data] hydrography_source = \"synthetic\" in your config."
             )
         end
@@ -1262,10 +1282,10 @@ function run_segment_simulation(;
         println("Simulation paused/interrupted at $(prettytime(sim.model.clock.time)); state saved to checkpoints.")
     end
 
-    # Archive hydrodynamic snapshot fields to DuckDB
-    if opts.enable_duckdb
+    # Archive hydrodynamic snapshot fields to analytical storage (Zarr)
+    if opts.enable_zarr
         try
-            println("Archiving hydrodynamic flow fields to DuckDB -> $(opts.duckdb_path)...")
+            println("Archiving hydrodynamic flow fields to analytical storage -> $(opts.zarr_path)...")
             coords = extract_grid_coordinates(target_model.grid)
             glon, glat, gdepth = coords.lons, coords.lats, coords.depths
             u_data = Array(interior(target_model.velocities.u))
@@ -1817,21 +1837,6 @@ function run_segment_metrics(;
             @warn "Failed to archive simulation run and metrics to Zarr: $(err)"
         end
     end
-                        DuckDB.flush(appender)
-                        DuckDB.close(appender)
-                        println("Archived $(length(v_t.units)) Voronoi units to DuckDB table 'voronoi_units'.")
-                    catch v_err
-                        @warn "Failed to archive Voronoi units to DuckDB: $(v_err)"
-                    end
-                end
-                println("DuckDB run '$(target_run_id)' successfully archived.")
-            finally
-                close_duckdb_storage(db)
-            end
-        catch err
-            @warn "Failed to archive simulation run and metrics to DuckDB: $(err)"
-        end
-    end
 
     return (
         empirical_movement = emp_mov,
@@ -1841,7 +1846,7 @@ function run_segment_metrics(;
         voronoi = voronoi_res,
         netcdf_path = nc_export_path,
         jld2_path = jld_export_path,
-        duckdb_path = opts.enable_duckdb ? opts.duckdb_path : nothing
+        storage_path = opts.enable_zarr ? opts.zarr_path : nothing
     )
 end
 
@@ -1941,7 +1946,7 @@ end
     _complete_stage_diagnostics(trajs::NamedTuple, opts) -> NamedTuple
 
 Add `molt_schedule` and `cohort_molt_fraction` to a trajectory set that lacks them, such as one
-read back from DuckDB, which stores per-particle rows only.
+read back from Zarr/GeoData storage, which stores per-particle rows only.
 
 Both are deterministic functions of the run configuration and the stored degree-days, so they
 are recomputed rather than approximated:
@@ -1982,10 +1987,10 @@ end
 Load the trajectory set of the configured run for Segments 7 and 8.
 
 Sources, in order:
-1. DuckDB (`opts.duckdb_path`, run id `opts.run_id` or `run_<scenario>_<year>`). If the JLD2
+1. Analytical storage (`opts.zarr_path`, run id `opts.run_id` or `run_<scenario>_<year>`). If the JLD2
    checkpoint describes the same cohort (equal `ids` and `times`), the checkpoint is used
    instead, because it also holds `stage_survival`, `ascent_duration` and the true
-   `settlement_age`, none of which DuckDB stores.
+   `settlement_age`, none of which analytical storage stores.
 2. The JLD2 checkpoint `larval_trajectories[_<run_id>].jld2`.
 3. Neither present: Segment 6 is run.
 
@@ -2638,9 +2643,9 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
     println("\n=================================================================")
     println(" Complete Workflow Pipeline Successfully Finished in $(t_elapsed) s")
     println(" Outputs written to: $(opts.output_dir)/")
-    if opts.enable_duckdb
-        println(" DuckDB analytical storage: $(opts.duckdb_path)")
-        close_all_duckdb_storage!()
+    if opts.enable_zarr
+        println(" Analytical storage (Zarr): $(opts.zarr_path)")
+        close_all_storage!()
     end
     println("=================================================================")
 
@@ -2658,13 +2663,13 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DuckDB Analytics CLI Helpers
+# Analytical Storage CLI Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
     run_cli_list_runs(; opts::HydrodynamicOptions)
 
-Query and display all simulation runs currently archived in DuckDB.
+Query and display all simulation runs currently archived in Zarr.
 """
 function run_cli_list_runs(; opts::HydrodynamicOptions = HydrodynamicOptions())
     if !isdir(opts.zarr_path)
@@ -2888,8 +2893,8 @@ function main(args = ARGS)
     asc_target = base_opts.ascent_target_depth
     enable_dvm = base_opts.enable_dvm
     enable_molting = base_opts.enable_molting
-    enable_duckdb = base_opts.enable_duckdb
-    db_path = base_opts.duckdb_path
+    enable_zarr = base_opts.enable_zarr
+    zarr_path = base_opts.zarr_path
     use_gpu = base_opts.use_gpu
     fallback_cpu = base_opts.fallback_to_cpu
     interactive = base_opts.interactive_map
@@ -3001,10 +3006,10 @@ function main(args = ARGS)
     elseif "--no-anim-overlay-particles" in args
         anim_overlay_parts = false
     end
-    if "--duckdb" in args
-        enable_duckdb = true
-    elseif "--no-duckdb" in args
-        enable_duckdb = false
+    if "--storage" in args || "--zarr" in args
+        enable_zarr = true
+    elseif "--no-storage" in args || "--no-zarr" in args
+        enable_zarr = false
     end
     if "--tides" in args
         enable_tides = true
@@ -3122,8 +3127,8 @@ function main(args = ARGS)
             output_dir = String(split(a, "=")[2])
         elseif startswith(a, "--input-dir=")
             input_dir = String(split(a, "=")[2])
-        elseif startswith(a, "--db-path=")
-            db_path = String(split(a, "=")[2])
+        elseif startswith(a, "--zarr-path=") || startswith(a, "--storage-path=") || startswith(a, "--db-path=")
+            zarr_path = String(split(a, "=")[2])
         elseif startswith(a, "--lon=")
             parts = split(split(a, "=")[2], ",")
             lon_range = (parse(Float64, parts[1]), parse(Float64, parts[2]))
@@ -3319,8 +3324,8 @@ function main(args = ARGS)
         use_gpu = use_gpu,
         fallback_to_cpu = fallback_cpu,
         interactive_map = interactive,
-        enable_duckdb = enable_duckdb,
-        duckdb_path = db_path,
+        enable_zarr = enable_zarr,
+        zarr_path = zarr_path,
         config_file = config_file,
         output_dir = output_dir,
         input_dir = input_dir,
@@ -3420,7 +3425,7 @@ function main(args = ARGS)
         return
     end
 
-    # DuckDB standalone query flags
+    # Analytical storage standalone query flags
     if "--list-runs" in args
         run_cli_list_runs(opts = opts)
         return
@@ -3516,8 +3521,8 @@ function main(args = ARGS)
             render_hydrodynamic_animation_if_requested(opts, s_res.jld2_output_path)
         end
 
-        if opts.enable_duckdb
-            close_all_duckdb_storage!()
+        if opts.enable_zarr
+            close_all_storage!()
         end
         return
     end
@@ -3536,8 +3541,8 @@ function main(args = ARGS)
         run_segment_metrics(opts = opts, trajectories = t_res.trajectories)
         run_segment_visualize(opts = opts, trajectories = t_res.trajectories)
         println("\nLarval tracking, metrics, and visualizations completed successfully.")
-        if opts.enable_duckdb
-            close_all_duckdb_storage!()
+        if opts.enable_zarr
+            close_all_storage!()
         end
         return
     end

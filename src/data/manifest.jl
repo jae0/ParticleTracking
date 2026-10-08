@@ -11,6 +11,6 @@ module Manifest
 using ..GeoData.Data.GeoDataManifest
 
 # Re-export all public functions from GeoDataManifest
-export DataSource, fetch_input, input_dir, file_digest, data_provenance, data_source, describe_data_sources
+export DATA_SOURCES, DataSource, fetch_input, input_dir, file_digest, data_provenance, data_source, describe_data_sources
 
 end # module Manifest

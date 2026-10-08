@@ -12,12 +12,11 @@ using Oceananigans.Units
 # so it is deliberately not imported here.
 using Oceananigans.BoundaryConditions: ContinuousBoundaryFunction
 using Oceananigans.Forcings: ContinuousForcing, MultipleForcings, Relaxation
-using ClimaOcean
 using Dates
 using NCDatasets
 using Interpolations
 using Interpolations: interpolate, BSpline, Linear
-import NumericalEarth: ocean_simulation, GLORYSDaily, GLORYSMonthly, WOAMonthly, WOAAnnual, BoundingBox
+import NumericalEarth: ocean_simulation, GLORYSDaily, GLORYSMonthly, WOAMonthly, WOAAnnual, BoundingBox, Metadatum
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 
 # Import domain constants
@@ -91,6 +90,7 @@ function build_hydrodynamic_model(
     lon_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
     lat_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
     boundary_tracers::Union{Nothing, NamedTuple} = nothing,
+    boundary_velocities::Union{Nothing, NamedTuple} = nothing,
     mask_bay_of_fundy::Bool = false,
     active_boundaries = (:east, :south, :west)
 )
@@ -114,19 +114,17 @@ function build_hydrodynamic_model(
         )
     end
 
-    # Surface heat flux handling
-    # If a T-dependent bulk flux function is provided, we cannot use a boundary condition
-    # with field_dependencies due to Oceananigans 0.111's ContinuousBoundaryFunction bug.
-    # Workaround: evaluate the function once at a climatological SST (10°C) to obtain
-    # a constant flux. For time-varying bulk flux, provide a pre-computed flux time series
-    # (or upgrade Oceananigans when the field_dependencies bug is fixed).
+    # Conversion factor from W/m^2 to kinematic heat flux (m*K/s): Q / (rho0 * cp)
+    # Using reference density rho0 = 1025.0 kg/m^3 and specific heat cp = 3991.0 J/(kg*K)
+    rho0_cp = 1025.0 * 3991.0
+
+    # Surface heat flux boundary condition
+    # When a temperature-dependent flux function is supplied, e.g. f(x, y, t, T),
+    # construct a FluxBoundaryCondition with `field_dependencies = :T` which evaluates
+    # dynamically on both CPU and GPU.
     T_flux_bc = if surface_heat_flux isa Function && applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0)
-        @warn "T-dependent surface heat flux function provided. Evaluating once at " *
-              "climatological SST (10°C) to obtain constant flux. This is an approximation; " *
-              "for time-varying bulk flux, provide a pre-computed flux time series instead " *
-              "(or upgrade Oceananigans when the field_dependencies bug is fixed)."
-        constant_flux = -surface_heat_flux(0.0, 0.0, 0.0, 10.0) / rho0_cp
-        FluxBoundaryCondition(constant_flux)
+        kinematic_flux_T = (x, y, t, T) -> -surface_heat_flux(x, y, t, T) / rho0_cp
+        FluxBoundaryCondition(kinematic_flux_T, field_dependencies = :T)
     elseif surface_heat_flux isa Function
         kinematic_T_flux = if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
             (x, y, z, t, S) -> -surface_heat_flux(x, y, z, t, S) / rho0_cp
@@ -221,10 +219,37 @@ function build_hydrodynamic_model(
             x, y, lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
             act_e, act_w, act_n, act_s
         )
-        # `ExponentialInflow` is the reference upstream profile; it is `isbits`, so capturing it
-        # in these closures keeps the forcing lowerable into a kernel.
-        u_target = (x, y, z, t) -> Float64(sponge_relaxation.u_ref(x, y, z, t))
-        v_target = (x, y, z, t) -> Float64(sponge_relaxation.v_ref(x, y, z, t))
+        # If real boundary velocities (e.g. from GLORYS) are supplied, use them directly as targets.
+        # Otherwise, fall back to the analytical ExponentialInflow reference profile.
+        u_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :u)
+            u_val = boundary_velocities.u
+            if u_val isa Function
+                (x, y, z, t) -> Float64(u_val(x, y, z, t))
+            elseif u_val isa AbstractField
+                u_val
+            else
+                ufld = XFaceField(grid)
+                set!(ufld, (x, y, z) -> Float64(u_val(x, y, -z)))
+                ufld
+            end
+        else
+            (x, y, z, t) -> Float64(sponge_relaxation.u_ref(x, y, z, t))
+        end
+
+        v_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :v)
+            v_val = boundary_velocities.v
+            if v_val isa Function
+                (x, y, z, t) -> Float64(v_val(x, y, z, t))
+            elseif v_val isa AbstractField
+                v_val
+            else
+                vfld = YFaceField(grid)
+                set!(vfld, (x, y, z) -> Float64(v_val(x, y, -z)))
+                vfld
+            end
+        else
+            (x, y, z, t) -> Float64(sponge_relaxation.v_ref(x, y, z, t))
+        end
 
         u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_target)
         v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_target)
@@ -263,9 +288,9 @@ function build_hydrodynamic_model(
 
         composed_forcing = (; u = u_forcing, v = v_forcing)
     else
-        # No sponge. The same relaxation, with a mask of 1 everywhere: there is no lateral
-        # relaxation to compose with, so the tidal term stands alone.
-        composed_forcing = (; u = ZeroForcing(), v = ZeroForcing())
+        # No sponge. If tidal forcing is present, relax toward the prescribed tide;
+        # otherwise composed_forcing is empty.
+        composed_forcing = NamedTuple()
         if !isnothing(u_tide_val)
             composed_forcing = merge(composed_forcing,
                 (; u = Relaxation(rate = tidal_relax_rate, mask = tidal_mask,
@@ -399,7 +424,7 @@ function apply_reanalysis_initial_conditions!(
         haskey(tracer_names, v) || continue
         field = tracer_names[v]
         hasproperty(model.tracers, field) || continue
-        push!(assignments, field => ClimaOcean.Metadatum(
+        push!(assignments, field => Metadatum(
             v; date = date, dataset = dataset))
     end
     isempty(assignments) && return model

@@ -275,6 +275,10 @@ struct HydrodynamicOptions
      output_schedule_seconds  :: Float64
      output_path              :: AbstractString
      storage_backend          :: String
+     enable_zarr              :: Bool
+     zarr_path                :: String
+     output_dir               :: String
+     input_dir                :: String
     checkpoint_dir           :: String
     checkpoint_cleanup       :: Bool
     auto_restart             :: Bool
@@ -462,6 +466,8 @@ function HydrodynamicOptions(;
     interactive_map       :: Bool = true,
     enable_zarr         :: Bool = true,
     zarr_path           :: AbstractString = joinpath("outputs", "particle_tracking.zarr"),
+    output_path         :: AbstractString = joinpath("outputs", "particle_tracking.jld2"),
+    storage_backend     :: AbstractString = "zarr",
     config_file           :: AbstractString = find_default_config_path(),
     output_dir            :: AbstractString = "outputs",
     input_dir             :: AbstractString = "inputs",
@@ -589,6 +595,7 @@ function HydrodynamicOptions(;
         interactive_map,
         String(config_file),
         seed,
+        String(hydro_model_file),
         hydro_only,
         track_only,
         reuse_hydro,
@@ -596,15 +603,19 @@ function HydrodynamicOptions(;
         resolved_cp_prefix,
         Float64(checkpoint_schedule),
         Float64(output_schedule_seconds),
+        String(output_path),
+        String(storage_backend),
+        enable_zarr,
+        String(zarr_path),
+        String(output_dir),
+        String(input_dir),
         String(checkpoint_dir),
         checkpoint_cleanup,
         auto_restart,
         String(run_id),
         vertical_stretching_mode,
         Int(nz_above),
-         String(output_path),
-         String(storage_backend),
-         Float64(vertical_break_depth),
+        Float64(vertical_break_depth),
         String(vertical_grid_file),
         Float64[Float64(d) for d in vertical_depths],
         Float64(resolution_scale),
@@ -1025,6 +1036,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
      anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
      output_path = String(get_val("storage", "output_path", joinpath("outputs", "particle_tracking.jld2")))
+     zarr_path   = String(get_val("storage", "zarr_path", joinpath("outputs", "particle_tracking.zarr")))
      storage_backend = String(get_val("storage", "storage_backend", "zarr"))
      
      enable_checkpoint = Bool(get_val("storage", "enable_checkpoint", true))
@@ -1040,7 +1052,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
      # `resolved_config.toml` and `data_provenance.json` exist to expose. The cost is disk --
      # a dataset is fetched once per scenario rather than once per machine -- and that is the
      # intended trade, because it makes each scenario a self-contained, shareable directory.
-     input_dir  = joinpath(dirname(output_path), "inputs")
+     output_dir = dirname(output_path)
+     input_dir  = joinpath(output_dir, "inputs")
      seed       = Int(get_val("paths", "seed", 42))
 
      hydro_file = String(get_val("hydrodynamics", "hydro_model_file", ""))
@@ -1209,6 +1222,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         fallback_to_cpu = fallback_cpu,
          interactive_map = interactive,
         zarr_path = zarr_path,
+        output_path = output_path,
+        storage_backend = storage_backend,
         output_dir = output_dir,
         input_dir = input_dir,
         seed = seed,

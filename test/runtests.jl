@@ -846,15 +846,16 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test res_dispatch == html_dispatch
     end
 
-    @testset "14. Zarr Storage, Multi-Scenario Querying & Ensemble Model Averaging" begin
-        test_db_path = "outputs/test_particle_tracking.zarr"
-        if isdir(test_db_path)
-            rm(test_db_path, force = true, recursive = true)
+    @testset "14. Multi-Scenario Querying, Connectivity & Ensemble Model Averaging" begin
+        test_db_path = "outputs/test_particle_tracking.parquet"
+        if isfile(test_db_path)
+            rm(test_db_path, force = true)
         end
+        runs_pq = "outputs/runs.parquet"
+        isfile(runs_pq) && rm(runs_pq, force = true)
 
-        # 1. Initialize Zarr storage and verify schema
+        # 1. Initialize analytical storage
         db = open_storage(test_db_path)
-        @test isdir(test_db_path)
 
         # 2. Generate and save synthetic runs across 3 climate scenarios
         rng = MersenneTwister(42)
@@ -1030,8 +1031,17 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test occursin("layer-density", html_str)
         @test occursin("layer-hydro-advection", html_str)
 
-        # Clean up database connection
+        # Clean up database connection and test artifacts
         close_storage(db)
+        rm(test_db_path, force = true)
+        rm(runs_pq, force = true)
+        rm(multi_html_path, force = true)
+        for sc in scenarios_to_test
+            rid = "test_run_$(sc.name)_$(sc.year)"
+            rm("outputs/trajectories_$(rid).parquet", force = true)
+            rm("outputs/connectivity_$(rid).parquet", force = true)
+            rm("outputs/gridded_dispersal_$(rid).parquet", force = true)
+        end
     end
 
     @testset "15. Centralized Configuration File Management & Scenario Metadata" begin
@@ -1083,11 +1093,14 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         cfg_reloaded = load_configuration(test_save_path)
         @test cfg_reloaded["biology"]["n_particles"] == 42
 
-        # 5. Test archiving configuration into Zarr and reloading it
-        test_db_path = "outputs/test_config_meta.zarr"
-        if isdir(test_db_path)
-            rm(test_db_path, force = true, recursive = true)
+        # 5. Test archiving configuration into analytical storage and reloading it
+        test_db_path = "outputs/test_config_meta.parquet"
+        if isfile(test_db_path)
+            rm(test_db_path, force = true)
         end
+        runs_pq = "outputs/runs.parquet"
+        isfile(runs_pq) && rm(runs_pq, force = true)
+
         db = open_storage(test_db_path)
         rng = MersenneTwister(42)
         larvae = initialize_larval_particles(5, rng = rng)
@@ -1102,8 +1115,8 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         run_id = "test_config_run"
         save_simulation_run!(db, run_id, opts; trajectories = trajs, config = cfg_out)
 
-        # Query metadata table directly
-        df_run = DataFrame(DBInterface.execute(db, "SELECT config_toml FROM simulation_runs WHERE run_id = '$(run_id)';"))
+        # Query metadata directly via list_simulation_runs
+        df_run = list_simulation_runs(db)
         @test nrow(df_run) == 1
         @test !ismissing(df_run.config_toml[1])
         @test occursin("ssp585", df_run.config_toml[1])
@@ -1114,6 +1127,9 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test cfg_loaded["climate"]["scenario"] == "ssp585"
 
         close_storage(db)
+        rm(test_db_path, force = true)
+        rm(runs_pq, force = true)
+        rm("outputs/trajectories_$(run_id).parquet", force = true)
 
         # 6. Test NetCDF and JLD2 configuration attribute persistence
         nc_test = "outputs/test_config_meta.nc"
@@ -1123,6 +1139,7 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
             @test haskey(ds.attrib, "configuration")
             @test occursin("ssp585", ds.attrib["configuration"])
         end
+        rm(nc_test, force = true)
 
         jld_test = "outputs/test_config_meta.jld2"
         export_larval_dispersal_jld2(jld_test, trajectories = trajs, config = cfg_out)
@@ -1130,6 +1147,8 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         jld_data = JLD2.load(jld_test)
         @test haskey(jld_data, "configuration")
         @test jld_data["configuration"]["biology"]["n_particles"] == 42
+        rm(jld_test, force = true)
+        rm(test_save_path, force = true)
     end
 
     @testset "16. Coastline Geometry, 0% Land Seeding & CFA Intersection" begin
@@ -1465,6 +1484,49 @@ cp(joinpath(@__DIR__, "..", "configs", "default.toml"), SUITE_CONFIG_PATH, force
         @test size(conn_demo.matrix, 1) == length(conn_demo.strata_names)
         @test all(conn_demo.matrix .>= 0.0)
         @test all(conn_demo.matrix .<= 1.0)
+
+        # -------------------------------------------------------------
+        # 8. Wave Stokes Drift Coupling & Coastline Normal Slip
+        # -------------------------------------------------------------
+        # Stokes drift test: surface particle (z=0) advected in quiescent water (u=v=w=0)
+        rng_stk = MersenneTwister(42)
+        step_stk_surf = larval_transport_step(
+            -63.0, 44.0, 0.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 100.0,
+            u_stokes = 0.05,
+            v_stokes = 0.0,
+            stokes_decay_depth = 10.0,
+            is_lat_lon = false,
+            rng = rng_stk
+        )
+        @test step_stk_surf[1] ≈ -63.0 + 0.05 * 100.0
+
+        # Stokes drift depth decay: deep particle (z=-50m) experiences negligible wave drift
+        step_stk_deep = larval_transport_step(
+            -63.0, 44.0, -50.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 100.0,
+            u_stokes = 0.05,
+            v_stokes = 0.0,
+            stokes_decay_depth = 10.0,
+            is_lat_lon = false,
+            rng = rng_stk
+        )
+        @test step_stk_deep[1] ≈ -63.0 atol = 0.05
+
+        # Coastline normal slip test: marine particle stepping toward land never lands on terra firma
+        halifax_marine_x = -63.50
+        halifax_marine_y = 44.55 # Marine offshore of Halifax
+        @test is_point_on_land(halifax_marine_x, halifax_marine_y) == false
+        step_coast = larval_transport_step(
+            halifax_marine_x, halifax_marine_y, -10.0,
+            -0.5, 0.5, 0.0, # Strong velocity directed toward land (NW into Halifax)
+            0.0, 0.0, 600.0,
+            is_lat_lon = true,
+            rng = MersenneTwister(99)
+        )
+        @test is_point_on_land(step_coast[1], step_coast[2]) == false
     end
 
     @testset "18. Hydrodynamic Field & Dashboard Animation" begin
