@@ -122,16 +122,8 @@ function open_storage(
         storage_path = endswith(output_path, ".zarr") ? String(output_path) :
             (endswith(output_path, ".jld2") ?
              replace(output_path, r"\.jld2$" => ".zarr") : output_path * ".zarr")
-        if read_only
-            return Zarr.zopen(storage_path, "r")
-        else
-            if isdir(storage_path) && isfile(joinpath(storage_path, ".zgroup"))
-                return Zarr.zopen(storage_path, "w")
-            else
-                mkpath(storage_path)
-                return Zarr.zgroup(storage_path)
-            end
-        end
+        st = GeoData.open_geostorage(storage_path; backend = :zarr, read_only = read_only)
+        return st.handle
     elseif backend == "geoparquet"
         storage_path = endswith(output_path, ".parquet") ? String(output_path) :
             (endswith(output_path, ".jld2") ?
